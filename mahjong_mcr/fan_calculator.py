@@ -23,6 +23,7 @@ from .tile import (
     is_honor,
     is_numbered_suit,
     is_numbered_suit_quick,
+    is_pack_melded,
     is_reversible,
     is_terminal,
     is_terminal_or_honor,
@@ -173,6 +174,7 @@ FAN_VALUE_TABLE = [
     2, 2, 2, 2, 2, 2, 2, 2, 2, 2,
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1,
+    5,
 ]
 
 
@@ -524,54 +526,257 @@ def _calculate_3_of_4_chows(tile0: int, tile1: int, tile2: int, tile_extra: int,
     return False
 
 
-def _calculate_2_of_4_chows(tile0: int, tile1: int, tile2: int, tile3: int, fan_table: List[int]) -> None:
-    all_fans = [
-        _get_2_chows_fan_unordered(tile0, tile1),
-        _get_2_chows_fan_unordered(tile0, tile2),
-        _get_2_chows_fan_unordered(tile0, tile3),
-        _get_2_chows_fan_unordered(tile1, tile2),
-        _get_2_chows_fan_unordered(tile1, tile3),
-        _get_2_chows_fan_unordered(tile2, tile3),
-    ]
-    _exclusionary_rule(all_fans, 6, 2, fan_table)
-
-
-def _calculate_2_of_3_chows(tile0: int, tile1: int, tile2: int, fan_table: List[int]) -> None:
-    all_fans = [
-        _get_2_chows_fan_unordered(tile0, tile1),
-        _get_2_chows_fan_unordered(tile0, tile2),
-        _get_2_chows_fan_unordered(tile1, tile2),
-    ]
-    _exclusionary_rule(all_fans, 3, 1, fan_table)
-
-
-def _calculate_3_of_4_pungs(tile0: int, tile1: int, tile2: int, tile_extra: int, fan_table: List[int]) -> bool:
-    fan = _get_3_pungs_fan(tile0, tile1, tile2)
+def _calculate_4_chows(mid_tiles: List[int], fan_table: List[int]) -> None:
+    fan = _get_4_chows_fan(mid_tiles[0], mid_tiles[1], mid_tiles[2], mid_tiles[3])
     if fan != FAN_NONE:
         fan_table[fan] = 1
-        return True
+        return
+
+    if (
+        _calculate_3_of_4_chows(mid_tiles[0], mid_tiles[1], mid_tiles[2], mid_tiles[3], fan_table)
+        or _calculate_3_of_4_chows(mid_tiles[0], mid_tiles[1], mid_tiles[3], mid_tiles[2], fan_table)
+        or _calculate_3_of_4_chows(mid_tiles[0], mid_tiles[2], mid_tiles[3], mid_tiles[1], fan_table)
+        or _calculate_3_of_4_chows(mid_tiles[1], mid_tiles[2], mid_tiles[3], mid_tiles[0], fan_table)
+    ):
+        return
+
+    all_fans = [
+        _get_2_chows_fan_unordered(mid_tiles[0], mid_tiles[1]),
+        _get_2_chows_fan_unordered(mid_tiles[0], mid_tiles[2]),
+        _get_2_chows_fan_unordered(mid_tiles[0], mid_tiles[3]),
+        _get_2_chows_fan_unordered(mid_tiles[1], mid_tiles[2]),
+        _get_2_chows_fan_unordered(mid_tiles[1], mid_tiles[3]),
+        _get_2_chows_fan_unordered(mid_tiles[2], mid_tiles[3]),
+    ]
+
+    max_cnt = 3
+    if all_fans[0] == FAN_NONE and all_fans[1] == FAN_NONE and all_fans[2] == FAN_NONE:
+        max_cnt -= 1
+    if all_fans[0] == FAN_NONE and all_fans[3] == FAN_NONE and all_fans[4] == FAN_NONE:
+        max_cnt -= 1
+    if all_fans[1] == FAN_NONE and all_fans[3] == FAN_NONE and all_fans[5] == FAN_NONE:
+        max_cnt -= 1
+    if all_fans[2] == FAN_NONE and all_fans[4] == FAN_NONE and all_fans[5] == FAN_NONE:
+        max_cnt -= 1
+
+    if max_cnt > 0:
+        _exclusionary_rule(all_fans, 6, max_cnt, fan_table)
+
+
+def _calculate_3_chows(mid_tiles: List[int], fan_table: List[int]) -> None:
+    fan = _get_3_chows_fan(mid_tiles[0], mid_tiles[1], mid_tiles[2])
+    if fan != FAN_NONE:
+        fan_table[fan] = 1
+        return
+
+    all_fans = [
+        _get_2_chows_fan_unordered(mid_tiles[0], mid_tiles[1]),
+        _get_2_chows_fan_unordered(mid_tiles[0], mid_tiles[2]),
+        _get_2_chows_fan_unordered(mid_tiles[1], mid_tiles[2]),
+    ]
+    _exclusionary_rule(all_fans, 3, 2, fan_table)
+
+
+def _calculate_2_chows_unordered(mid_tiles: List[int], fan_table: List[int]) -> None:
+    fan = _get_2_chows_fan_unordered(mid_tiles[0], mid_tiles[1])
+    if fan != FAN_NONE:
+        fan_table[fan] += 1
+
+
+def _calculate_kongs(concealed_pung_cnt: int, melded_kong_cnt: int, concealed_kong_cnt: int, fan_table: List[int]) -> None:
+    kong_cnt = melded_kong_cnt + concealed_kong_cnt
+    if kong_cnt == 0:
+        if concealed_pung_cnt == 2:
+            fan_table[TWO_CONCEALED_PUNGS] = 1
+        elif concealed_pung_cnt == 3:
+            fan_table[THREE_CONCEALED_PUNGS] = 1
+        elif concealed_pung_cnt == 4:
+            fan_table[FOUR_CONCEALED_PUNGS] = 1
+        return
+
+    if kong_cnt == 1:
+        if melded_kong_cnt == 1:
+            fan_table[MELDED_KONG] = 1
+            if concealed_pung_cnt == 2:
+                fan_table[TWO_CONCEALED_PUNGS] = 1
+            elif concealed_pung_cnt == 3:
+                fan_table[THREE_CONCEALED_PUNGS] = 1
+        else:
+            fan_table[CONCEALED_KONG] = 1
+            if concealed_pung_cnt == 1:
+                fan_table[TWO_CONCEALED_PUNGS] = 1
+            elif concealed_pung_cnt == 2:
+                fan_table[THREE_CONCEALED_PUNGS] = 1
+            elif concealed_pung_cnt == 3:
+                fan_table[FOUR_CONCEALED_PUNGS] = 1
+        return
+
+    if kong_cnt == 2:
+        if concealed_kong_cnt == 0:
+            fan_table[TWO_MELDED_KONGS] = 1
+            if concealed_pung_cnt == 2:
+                fan_table[TWO_CONCEALED_PUNGS] = 1
+        elif concealed_kong_cnt == 1:
+            if SUPPORT_CONCEALED_KONG_AND_MELDED_KONG:
+                fan_table[CONCEALED_KONG_AND_MELDED_KONG] = 1
+            else:
+                fan_table[MELDED_KONG] = 1
+                fan_table[CONCEALED_KONG] = 1
+            if concealed_pung_cnt == 1:
+                fan_table[TWO_CONCEALED_PUNGS] = 1
+            elif concealed_pung_cnt == 2:
+                fan_table[THREE_CONCEALED_PUNGS] = 1
+        elif concealed_kong_cnt == 2:
+            fan_table[TWO_CONCEALED_KONGS] = 1
+            if concealed_pung_cnt == 1:
+                fan_table[THREE_CONCEALED_PUNGS] = 1
+            elif concealed_pung_cnt == 2:
+                fan_table[FOUR_CONCEALED_PUNGS] = 1
+        return
+
+    if kong_cnt == 3:
+        fan_table[THREE_KONGS] = 1
+        if concealed_kong_cnt == 1:
+            if concealed_pung_cnt > 0:
+                fan_table[TWO_CONCEALED_PUNGS] = 1
+        elif concealed_kong_cnt == 2:
+            if concealed_pung_cnt == 0:
+                fan_table[TWO_CONCEALED_PUNGS] = 1
+            else:
+                fan_table[THREE_CONCEALED_PUNGS] = 1
+        elif concealed_kong_cnt == 3:
+            if concealed_pung_cnt == 0:
+                fan_table[THREE_CONCEALED_PUNGS] = 1
+            else:
+                fan_table[FOUR_CONCEALED_PUNGS] = 1
+        return
+
+    if kong_cnt == 4:
+        fan_table[FOUR_KONGS] = 1
+        if concealed_kong_cnt == 2:
+            fan_table[TWO_CONCEALED_PUNGS] = 1
+        elif concealed_kong_cnt == 3:
+            fan_table[THREE_CONCEALED_PUNGS] = 1
+        elif concealed_kong_cnt == 4:
+            fan_table[FOUR_CONCEALED_PUNGS] = 1
+        return
+
+
+def _calculate_4_pungs(mid_tiles: List[int], fan_table: List[int]) -> None:
+    fan = _get_4_pungs_fan(mid_tiles[0], mid_tiles[1], mid_tiles[2], mid_tiles[3])
+    if fan != FAN_NONE:
+        fan_table[fan] = 1
+        return
+
+    has_3_pungs_fan = False
+    free_pack_idx = -1
+    fan = _get_3_pungs_fan(mid_tiles[0], mid_tiles[1], mid_tiles[2])
+    if fan != FAN_NONE:
+        fan_table[fan] = 1
+        free_pack_idx = 3
+        has_3_pungs_fan = True
+    else:
+        fan = _get_3_pungs_fan(mid_tiles[0], mid_tiles[1], mid_tiles[3])
+        if fan != FAN_NONE:
+            fan_table[fan] = 1
+            free_pack_idx = 2
+            has_3_pungs_fan = True
+        else:
+            fan = _get_3_pungs_fan(mid_tiles[0], mid_tiles[2], mid_tiles[3])
+            if fan != FAN_NONE:
+                fan_table[fan] = 1
+                free_pack_idx = 1
+                has_3_pungs_fan = True
+            else:
+                fan = _get_3_pungs_fan(mid_tiles[1], mid_tiles[2], mid_tiles[3])
+                if fan != FAN_NONE:
+                    fan_table[fan] = 1
+                    free_pack_idx = 0
+                    has_3_pungs_fan = True
+
+    if has_3_pungs_fan:
+        for i in range(4):
+            if i == free_pack_idx:
+                continue
+            fan = _get_2_pungs_fan_unordered(mid_tiles[i], mid_tiles[free_pack_idx])
+            if fan != FAN_NONE:
+                fan_table[fan] += 1
+                break
+        return
+
+    for i in range(4):
+        for j in range(i + 1, 4):
+            fan = _get_2_pungs_fan_unordered(mid_tiles[i], mid_tiles[j])
+            if fan != FAN_NONE:
+                fan_table[fan] += 1
+
+
+def _calculate_3_pungs(mid_tiles: List[int], fan_table: List[int]) -> None:
+    fan = _get_3_pungs_fan(mid_tiles[0], mid_tiles[1], mid_tiles[2])
+    if fan != FAN_NONE:
+        fan_table[fan] = 1
+        return
+
+    for i in range(3):
+        for j in range(i + 1, 3):
+            fan = _get_2_pungs_fan_unordered(mid_tiles[i], mid_tiles[j])
+            if fan != FAN_NONE:
+                fan_table[fan] += 1
+
+
+def _calculate_2_pungs_unordered(mid_tiles: List[int], fan_table: List[int]) -> None:
+    fan = _get_2_pungs_fan_unordered(mid_tiles[0], mid_tiles[1])
+    if fan != FAN_NONE:
+        fan_table[fan] += 1
+
+
+def _is_pure_terminal_chows(chow_packs: List[int], pair_pack: int) -> bool:
+    if tile_get_rank(pack_get_tile(pair_pack)) != 5:
+        return False
+
+    cnt_123 = 0
+    cnt_789 = 0
+    pair_suit = tile_get_suit(pack_get_tile(pair_pack))
+    for i in range(4):
+        suit = tile_get_suit(pack_get_tile(chow_packs[i]))
+        if suit != pair_suit:
+            return False
+        rank = tile_get_rank(pack_get_tile(chow_packs[i]))
+        if rank == 2:
+            cnt_123 += 1
+        elif rank == 8:
+            cnt_789 += 1
+        else:
+            return False
+    return cnt_123 == 2 and cnt_789 == 2
+
+
+def _is_three_suited_terminal_chows(chow_packs: List[int], pair_pack: int) -> bool:
+    if tile_get_rank(pack_get_tile(pair_pack)) != 5:
+        return False
+
+    suit_table_123 = [0, 0, 0, 0, 0]
+    suit_table_789 = [0, 0, 0, 0, 0]
+    pair_suit = tile_get_suit(pack_get_tile(pair_pack))
+    for i in range(4):
+        suit = tile_get_suit(pack_get_tile(chow_packs[i]))
+        if suit == pair_suit:
+            return False
+        rank = tile_get_rank(pack_get_tile(chow_packs[i]))
+        if rank == 2:
+            suit_table_123[suit] += 1
+        elif rank == 8:
+            suit_table_789[suit] += 1
+        else:
+            return False
+
+    if pair_suit == 1:
+        return suit_table_123[2] and suit_table_123[3] and suit_table_789[2] and suit_table_789[3]
+    if pair_suit == 2:
+        return suit_table_123[1] and suit_table_123[3] and suit_table_789[1] and suit_table_789[3]
+    if pair_suit == 3:
+        return suit_table_123[1] and suit_table_123[2] and suit_table_789[1] and suit_table_789[2]
     return False
-
-
-def _calculate_2_of_4_pungs(tile0: int, tile1: int, tile2: int, tile3: int, fan_table: List[int]) -> None:
-    all_fans = [
-        _get_2_pungs_fan_unordered(tile0, tile1),
-        _get_2_pungs_fan_unordered(tile0, tile2),
-        _get_2_pungs_fan_unordered(tile0, tile3),
-        _get_2_pungs_fan_unordered(tile1, tile2),
-        _get_2_pungs_fan_unordered(tile1, tile3),
-        _get_2_pungs_fan_unordered(tile2, tile3),
-    ]
-    _exclusionary_rule(all_fans, 6, 1, fan_table)
-
-
-def _calculate_2_of_3_pungs(tile0: int, tile1: int, tile2: int, fan_table: List[int]) -> None:
-    all_fans = [
-        _get_2_pungs_fan_unordered(tile0, tile1),
-        _get_2_pungs_fan_unordered(tile0, tile2),
-        _get_2_pungs_fan_unordered(tile1, tile2),
-    ]
-    _exclusionary_rule(all_fans, 3, 1, fan_table)
 
 
 def _is_outside_hand(tiles: List[int]) -> bool:
@@ -625,92 +830,145 @@ def _count_concealed_pungs(packs: List[int], fixed_cnt: int) -> int:
     return cnt
 
 
-def _is_regular_waiting_form_unique(tile_table: List[int], left_cnt: int, win_tile: int) -> bool:
-    if left_cnt == 2:
-        tiles = []
+def _check_seven_pairs_waiting(standing_table: List[int], waiting_table: List[int]) -> None:
+    pairs = 0
+    for t in ALL_TILES:
+        cnt = standing_table[t]
+        if cnt == 2 or cnt == 3:
+            pairs += 1
+        elif cnt == 4:
+            pairs += 2
+
+    if pairs == 6:
+        for t in ALL_TILES:
+            cnt = standing_table[t]
+            if cnt == 1 or cnt == 3:
+                waiting_table[t] = 1
+                break
+
+
+def _get_regular_pack_waiting(tile_table: List[int], waiting_table: List[int]) -> None:
+    for t in ALL_TILES:
+        if tile_table[t] < 1:
+            continue
+        if tile_table[t] > 1:
+            waiting_table[t] = 1
+            return
+        if is_numbered_suit_quick(t):
+            r = tile_get_rank(t)
+            if r > 1 and tile_table[t - 1]:
+                if r < 9:
+                    waiting_table[t + 1] = 1
+                if r > 2:
+                    waiting_table[t - 2] = 1
+                return
+            if r > 2 and tile_table[t - 2]:
+                waiting_table[t - 1] = 1
+                return
+
+
+def _check_regular_waiting(tile_table: List[int], tile_cnt: int, prev_eigen: int, waiting_table: List[int]) -> None:
+    if tile_cnt == 1:
         for t in ALL_TILES:
             if tile_table[t] == 1:
-                tiles.append(t)
-        if len(tiles) != 2:
-            return False
-        t0, t1 = tiles
-        if t0 == t1 and t0 == win_tile:
-            return True
-        if is_numbered_suit(t0):
-            r0 = tile_get_rank(t0)
-            if t1 == t0 + 1 and win_tile in (t0 - 1, t0 + 2):
-                return True
-            if t1 == t0 + 2 and win_tile == t0 + 1:
-                return True
-        return False
+                waiting_table[t] = 1
+                break
+        return
+
+    if tile_cnt == 4:
+        for t in ALL_TILES:
+            if tile_table[t] < 2:
+                continue
+            tile_table[t] -= 2
+            _get_regular_pack_waiting(tile_table, waiting_table)
+            tile_table[t] += 2
+
     for t in ALL_TILES:
         if tile_table[t] < 1:
             continue
         if tile_table[t] > 2:
-            tile_table[t] -= 3
-            if _is_regular_waiting_form_unique(tile_table, left_cnt - 3, win_tile):
+            eigen = make_eigen(t, t, t)
+            if eigen > prev_eigen:
+                tile_table[t] -= 3
+                _check_regular_waiting(tile_table, tile_cnt - 3, eigen, waiting_table)
                 tile_table[t] += 3
-                return True
-            tile_table[t] += 3
         if is_numbered_suit(t):
             if tile_get_rank(t) < 8 and tile_table[t + 1] and tile_table[t + 2]:
-                tile_table[t] -= 1
-                tile_table[t + 1] -= 1
-                tile_table[t + 2] -= 1
-                if _is_regular_waiting_form_unique(tile_table, left_cnt - 3, win_tile):
+                eigen = make_eigen(t, t + 1, t + 2)
+                if eigen >= prev_eigen:
+                    tile_table[t] -= 1
+                    tile_table[t + 1] -= 1
+                    tile_table[t + 2] -= 1
+                    _check_regular_waiting(tile_table, tile_cnt - 3, eigen, waiting_table)
                     tile_table[t] += 1
                     tile_table[t + 1] += 1
                     tile_table[t + 2] += 1
-                    return True
-                tile_table[t] += 1
-                tile_table[t + 1] += 1
-                tile_table[t + 2] += 1
-    return False
 
 
-def _is_unique_waiting(tile_table: List[int], standing_cnt: int, win_tile: int) -> bool:
-    tmp_table = list(tile_table)
-    tmp_table[win_tile] += 1
-    return _is_regular_waiting_form_unique(tmp_table, standing_cnt + 1, win_tile)
+def _is_unique_waiting(standing_table: List[int], tile_cnt: int, win_tile: int) -> bool:
+    waiting_table = [0] * TILE_TABLE_SIZE
+    standing_table[win_tile] -= 1
+
+    if tile_cnt == 13:
+        _check_seven_pairs_waiting(standing_table, waiting_table)
+
+    _check_regular_waiting(standing_table, tile_cnt, 0, waiting_table)
+
+    standing_table[win_tile] += 1
+
+    waiting = False
+    for t in ALL_TILES:
+        if waiting_table[t]:
+            if waiting:
+                return False
+            waiting = True
+    return waiting
 
 
-def _adjust_by_waiting_form(packs: List[int], pack_cnt: int, win_tile: int, fan_table: List[int]) -> None:
-    if pack_cnt < 2:
+def _adjust_by_waiting_form(concealed_packs: List[int], pack_cnt: int, win_tile: int, fan_table: List[int]) -> None:
+    if fan_table[MELDED_HAND] or fan_table[FOUR_KONGS]:
         return
-    if pack_get_type(packs[0]) == PACK_TYPE_PAIR:
-        if pack_get_tile(packs[0]) == win_tile:
-            fan_table[SINGLE_WAIT] = 1
-        return
-    if pack_get_type(packs[1]) == PACK_TYPE_PAIR:
-        if pack_get_tile(packs[1]) == win_tile:
-            fan_table[SINGLE_WAIT] = 1
-        return
+
+    pos_flag = 0
     for i in range(pack_cnt):
-        if pack_get_type(packs[i]) == PACK_TYPE_CHOW:
-            t = pack_get_tile(packs[i])
-            if win_tile == t - 1 and tile_get_rank(t) == 8:
-                fan_table[EDGE_WAIT] = 1
-            elif win_tile == t + 1 and tile_get_rank(t) == 2:
-                fan_table[EDGE_WAIT] = 1
-            elif win_tile == t:
-                fan_table[CLOSED_WAIT] = 1
+        pack = concealed_packs[i]
+        pack_type = pack_get_type(pack)
+        if pack_type == PACK_TYPE_CHOW:
+            mid_tile = pack_get_tile(pack)
+            if mid_tile == win_tile:
+                pos_flag |= 0x02
+            elif mid_tile + 1 == win_tile or mid_tile - 1 == win_tile:
+                pos_flag |= 0x01
+        elif pack_type == PACK_TYPE_PAIR:
+            mid_tile = pack_get_tile(pack)
+            if mid_tile == win_tile:
+                pos_flag |= 0x04
+
+    if pos_flag & 0x01:
+        fan_table[EDGE_WAIT] = 1
+    elif pos_flag & 0x02:
+        fan_table[CLOSED_WAIT] = 1
+    elif pos_flag & 0x04:
+        fan_table[SINGLE_WAIT] = 1
 
 
 def _adjust_by_win_flag(win_flag: int, fan_table: List[int]) -> None:
-    if win_flag & WIN_FLAG_SELF_DRAWN:
-        fan_table[SELF_DRAWN] = 1
-    if win_flag & WIN_FLAG_WALL_LAST:
-        if win_flag & WIN_FLAG_SELF_DRAWN:
-            fan_table[LAST_TILE_DRAW] = 1
-        else:
-            fan_table[LAST_TILE_CLAIM] = 1
-    if win_flag & WIN_FLAG_KONG_INVOLVED:
-        if win_flag & WIN_FLAG_SELF_DRAWN:
-            fan_table[OUT_WITH_REPLACEMENT_TILE] = 1
-        else:
-            fan_table[ROBBING_THE_KONG] = 1
     if win_flag & WIN_FLAG_LAST_TILE:
         fan_table[LAST_TILE] = 1
+    if win_flag & WIN_FLAG_SELF_DRAWN:
+        fan_table[SELF_DRAWN] = 1
+        if win_flag & WIN_FLAG_WALL_LAST:
+            fan_table[LAST_TILE_DRAW] = 1
+            fan_table[SELF_DRAWN] = 0
+        if win_flag & WIN_FLAG_KONG_INVOLVED:
+            fan_table[OUT_WITH_REPLACEMENT_TILE] = 1
+            fan_table[SELF_DRAWN] = 0
+    else:
+        if win_flag & WIN_FLAG_WALL_LAST:
+            fan_table[LAST_TILE_CLAIM] = 1
+        if win_flag & WIN_FLAG_KONG_INVOLVED:
+            fan_table[ROBBING_THE_KONG] = 1
+            fan_table[LAST_TILE] = 0
 
 
 def _adjust_by_initial_hands(is_dealer: bool, win_flag: int, fan_table: List[int]) -> None:
@@ -728,86 +986,260 @@ def _adjust_by_initial_hands(is_dealer: bool, win_flag: int, fan_table: List[int
             fan_table[BLESSING_OF_HUMAN_1] = 1
 
 
-def _adjust_by_tiles_hog(standing_table: List[int], fixed_cnt: int, fan_table: List[int]) -> None:
-    for t in ALL_TILES:
-        cnt = standing_table[t]
-        if cnt >= 4:
-            fan_table[TILE_HOG] += 1
+def _adjust_by_self_drawn(packs: List[int], fixed_cnt: int, self_drawn: bool, fan_table: List[int]) -> None:
+    melded_cnt = 0
+    for i in range(fixed_cnt):
+        if is_pack_melded(packs[i]):
+            melded_cnt += 1
+
+    if melded_cnt == 0:
+        fan_table[FULLY_CONCEALED_HAND if self_drawn else CONCEALED_HAND] = 1
+    elif melded_cnt == 4:
+        fan_table[SELF_DRAWN if self_drawn else MELDED_HAND] = 1
+    else:
+        if self_drawn:
+            fan_table[SELF_DRAWN] = 1
 
 
-def _adjust_by_suits(unique_tiles: List[int], fan_table: List[int]) -> None:
-    suits = set(tile_get_suit(t) for t in unique_tiles if tile_get_suit(t) != TILE_SUIT_HONORS)
-    has_honors = any(tile_get_suit(t) == TILE_SUIT_HONORS for t in unique_tiles)
-    if len(suits) == 1:
-        if has_honors:
+def _adjust_by_pair_tile(pair_tile: int, chow_cnt: int, fan_table: List[int]) -> None:
+    if chow_cnt == 4:
+        if is_numbered_suit_quick(pair_tile):
+            fan_table[ALL_CHOWS] = 1
+        return
+
+    if fan_table[TWO_DRAGONS_PUNGS]:
+        if is_dragons(pair_tile):
+            fan_table[LITTLE_THREE_DRAGONS] = 1
+            fan_table[TWO_DRAGONS_PUNGS] = 0
+        return
+
+    if fan_table[BIG_THREE_WINDS]:
+        if is_winds(pair_tile):
+            fan_table[LITTLE_FOUR_WINDS] = 1
+            fan_table[BIG_THREE_WINDS] = 0
+        return
+
+
+def _adjust_by_suits(tiles: List[int], fan_table: List[int]) -> None:
+    suit_flag = 0
+    for t in tiles:
+        suit_flag |= 1 << tile_get_suit(t)
+
+    if not (suit_flag & 0xF1):
+        fan_table[NO_HONORS] = 1
+
+    if not (suit_flag & 0xE3):
+        fan_table[ONE_VOIDED_SUIT] += 1
+    if not (suit_flag & 0xE5):
+        fan_table[ONE_VOIDED_SUIT] += 1
+    if not (suit_flag & 0xE9):
+        fan_table[ONE_VOIDED_SUIT] += 1
+
+    if fan_table[ONE_VOIDED_SUIT] == 2:
+        fan_table[ONE_VOIDED_SUIT] = 0
+        if fan_table[NO_HONORS] == 0:
             fan_table[HALF_FLUSH] = 1
         else:
             fan_table[FULL_FLUSH] = 1
-    elif len(suits) == 2:
-        fan_table[ONE_VOIDED_SUIT] = 1
-    if not has_honors:
-        fan_table[NO_HONORS] = 1
-    if len(suits) == 3 and has_honors:
-        fan_table[ALL_TYPES] = 1
+            fan_table[NO_HONORS] = 0
+
+    if suit_flag == 0x1E:
+        if any(is_winds(t) for t in tiles) and any(is_dragons(t) for t in tiles):
+            fan_table[ALL_TYPES] = 1
 
 
-def _adjust_by_tiles_traits(unique_tiles: List[int], fan_table: List[int]) -> None:
-    if _is_all_simples(unique_tiles):
+def _adjust_by_rank_range(tiles: List[int], fan_table: List[int]) -> None:
+    rank_flag = 0
+    for t in tiles:
+        if not is_numbered_suit_quick(t):
+            return
+        rank_flag |= 1 << tile_get_rank(t)
+
+    if not (rank_flag & 0xFFE1):
+        fan_table[LOWER_FOUR if (rank_flag & 0x0010) else LOWER_TILES] = 1
+        return
+    if not (rank_flag & 0xFC3F):
+        fan_table[UPPER_FOUR if (rank_flag & 0x0040) else UPPER_TILES] = 1
+        return
+    if not (rank_flag & 0xFF8F):
+        fan_table[MIDDLE_TILES] = 1
+
+
+def _adjust_by_packs_traits(packs: List[int], fan_table: List[int]) -> None:
+    terminal_pack = 0
+    honor_pack = 0
+    five_pack = 0
+    even_pack = 0
+    for i in range(5):
+        tile = pack_get_tile(packs[i])
+        if is_numbered_suit_quick(tile):
+            rank = tile_get_rank(tile)
+            if pack_get_type(packs[i]) == PACK_TYPE_CHOW:
+                if rank in (2, 8):
+                    terminal_pack += 1
+                elif rank in (4, 5, 6):
+                    five_pack += 1
+            else:
+                if rank in (1, 9):
+                    terminal_pack += 1
+                elif rank == 5:
+                    five_pack += 1
+                elif rank in (2, 4, 6, 8):
+                    even_pack += 1
+        else:
+            honor_pack += 1
+
+    if terminal_pack + honor_pack == 5:
+        fan_table[OUTSIDE_HAND] = 1
+        return
+    if five_pack == 5:
+        fan_table[ALL_FIVE] = 1
+        return
+    if even_pack == 5:
+        fan_table[ALL_EVEN_PUNGS] = 1
+
+
+def _adjust_by_tiles_traits(tiles: List[int], fan_table: List[int]) -> None:
+    if all(not is_terminal_or_honor(t) for t in tiles):
         fan_table[ALL_SIMPLES] = 1
-    if _is_reversible(unique_tiles):
+
+    if all(is_reversible(t) for t in tiles):
         fan_table[REVERSIBLE_TILES] = 1
-    if _is_all_green(unique_tiles):
+
+    if all(is_green(t) for t in tiles):
         fan_table[ALL_GREEN] = 1
-    if _is_all_honors(unique_tiles):
+
+    if fan_table[ALL_SIMPLES]:
+        return
+
+    if all(is_honor(t) for t in tiles):
         fan_table[ALL_HONORS] = 1
-    if _is_all_terminals(unique_tiles):
+        return
+    if all(is_terminal(t) for t in tiles):
         fan_table[ALL_TERMINALS] = 1
-    if _is_all_terminals_and_honors(unique_tiles):
+        return
+    if all(is_terminal_or_honor(t) for t in tiles):
         fan_table[ALL_TERMINALS_AND_HONORS] = 1
 
 
-def _adjust_by_rank_range(unique_tiles: List[int], fan_table: List[int]) -> None:
-    max_r = 0
-    min_r = 10
-    for t in unique_tiles:
-        if is_numbered_suit_quick(t):
-            r = tile_get_rank(t)
-            max_r = max(max_r, r)
-            min_r = min(min_r, r)
-    if max_r <= 4:
-        fan_table[LOWER_FOUR] = 1
-    if min_r >= 6:
-        fan_table[UPPER_FOUR] = 1
-    if min_r >= 6 and max_r <= 9:
-        fan_table[UPPER_TILES] = 1
-    if min_r >= 4 and max_r <= 6:
-        fan_table[MIDDLE_TILES] = 1
-    if min_r >= 1 and max_r <= 3:
-        fan_table[LOWER_TILES] = 1
+def _adjust_by_tiles_hog(tile_table: List[int], kong_cnt: int, fan_table: List[int]) -> None:
+    cnt = sum(1 for v in tile_table if v == 4)
+    fan_table[TILE_HOG] = cnt - kong_cnt
 
 
 def _final_adjust(fan_table: List[int]) -> None:
-    if fan_table[ALL_TERMINALS]:
-        fan_table[ALL_TERMINALS_AND_HONORS] = 0
-        fan_table[ALL_HONORS] = 0
+    if fan_table[BIG_FOUR_WINDS]:
+        fan_table[ALL_PUNGS] = 0
         fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
-    if fan_table[ALL_HONORS]:
-        fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
-    if fan_table[ALL_TERMINALS_AND_HONORS]:
-        fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
-    if fan_table[FULL_FLUSH]:
+    if fan_table[BIG_THREE_DRAGONS]:
+        fan_table[DRAGON_PUNG] = 0
+    if fan_table[ALL_GREEN]:
         fan_table[HALF_FLUSH] = 0
         fan_table[ONE_VOIDED_SUIT] = 0
-    if fan_table[HALF_FLUSH]:
-        fan_table[ONE_VOIDED_SUIT] = 0
-    if fan_table[ALL_PUNGS]:
+    if fan_table[FOUR_KONGS]:
+        fan_table[SINGLE_WAIT] = 0
+
+    if fan_table[ALL_TERMINALS]:
+        fan_table[ALL_PUNGS] = 0
+        fan_table[OUTSIDE_HAND] = 0
         fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
-    if fan_table[SEVEN_PAIRS]:
+        fan_table[NO_HONORS] = 0
         fan_table[DOUBLE_PUNG] = 0
-    if fan_table[PURE_STRAIGHT]:
-        fan_table[SHORT_STRAIGHT] = 0
-    if fan_table[PURE_DOUBLE_CHOW]:
-        fan_table[MIXED_DOUBLE_CHOW] = 0
+
+    if fan_table[LITTLE_FOUR_WINDS]:
+        fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
+
+    if fan_table[LITTLE_THREE_DRAGONS]:
+        fan_table[DRAGON_PUNG] = 0
+
+    if fan_table[ALL_HONORS]:
+        fan_table[ALL_PUNGS] = 0
+        fan_table[OUTSIDE_HAND] = 0
+        fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
+        fan_table[ONE_VOIDED_SUIT] = 0
+    if fan_table[FOUR_CONCEALED_PUNGS]:
+        fan_table[ALL_PUNGS] = 0
+        fan_table[CONCEALED_HAND] = 0
+        if fan_table[FULLY_CONCEALED_HAND]:
+            fan_table[FULLY_CONCEALED_HAND] = 0
+            fan_table[SELF_DRAWN] = 1
+    if fan_table[PURE_TERMINAL_CHOWS]:
+        fan_table[FULL_FLUSH] = 0
+        fan_table[ALL_CHOWS] = 0
+        fan_table[NO_HONORS] = 0
+    if fan_table[FOUR_PURE_SHIFTED_PUNGS]:
+        fan_table[ALL_PUNGS] = 0
+
+    if fan_table[ALL_TERMINALS_AND_HONORS]:
+        fan_table[ALL_PUNGS] = 0
+        fan_table[OUTSIDE_HAND] = 0
+        fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
+
+    if fan_table[ALL_EVEN_PUNGS]:
+        fan_table[ALL_PUNGS] = 0
+        fan_table[ALL_SIMPLES] = 0
+        fan_table[NO_HONORS] = 0
+    if fan_table[UPPER_TILES]:
+        fan_table[NO_HONORS] = 0
+    if fan_table[MIDDLE_TILES]:
+        fan_table[ALL_SIMPLES] = 0
+        fan_table[NO_HONORS] = 0
+    if fan_table[LOWER_TILES]:
+        fan_table[NO_HONORS] = 0
+
+    if fan_table[THREE_SUITED_TERMINAL_CHOWS]:
+        fan_table[ALL_CHOWS] = 0
+        fan_table[NO_HONORS] = 0
+    if fan_table[ALL_FIVE]:
+        fan_table[ALL_SIMPLES] = 0
+        fan_table[NO_HONORS] = 0
+
+    if fan_table[UPPER_FOUR]:
+        fan_table[NO_HONORS] = 0
+    if fan_table[LOWER_FOUR]:
+        fan_table[NO_HONORS] = 0
+    if fan_table[BIG_THREE_WINDS]:
+        if not fan_table[ALL_HONORS] and not fan_table[ALL_TERMINALS_AND_HONORS]:
+            fan_table[PUNG_OF_TERMINALS_OR_HONORS] -= 3
+
+    if fan_table[REVERSIBLE_TILES]:
+        fan_table[ONE_VOIDED_SUIT] = 0
+    if fan_table[LAST_TILE_DRAW]:
+        fan_table[SELF_DRAWN] = 0
+    if fan_table[OUT_WITH_REPLACEMENT_TILE]:
+        fan_table[SELF_DRAWN] = 0
+
+    if fan_table[MELDED_HAND]:
+        fan_table[SINGLE_WAIT] = 0
+    if fan_table[TWO_DRAGONS_PUNGS]:
+        fan_table[DRAGON_PUNG] = 0
+
+    if fan_table[FULLY_CONCEALED_HAND]:
+        fan_table[SELF_DRAWN] = 0
+
+    if fan_table[ALL_CHOWS]:
+        fan_table[NO_HONORS] = 0
+    if fan_table[ALL_SIMPLES]:
+        fan_table[NO_HONORS] = 0
+
+
+def _adjust_by_winds(tile: int, prevalent_wind: int, seat_wind: int, fan_table: List[int]) -> None:
+    is_deducted = (
+        fan_table[BIG_THREE_WINDS]
+        or fan_table[ALL_TERMINALS_AND_HONORS]
+        or fan_table[ALL_HONORS]
+        or fan_table[LITTLE_FOUR_WINDS]
+    )
+
+    delta = tile - TILE_E
+    if delta == prevalent_wind - Wind.EAST:
+        fan_table[PREVALENT_WIND] = 1
+        if not is_deducted:
+            fan_table[PUNG_OF_TERMINALS_OR_HONORS] -= 1
+    if delta == seat_wind - Wind.EAST:
+        fan_table[SEAT_WIND] = 1
+        if seat_wind != prevalent_wind and not is_deducted:
+            fan_table[PUNG_OF_TERMINALS_OR_HONORS] -= 1
 
 def _adjust_by_win_flag_4_special_form(seat_wind: int, win_flag: int, fan_table: List[int]) -> None:
     _adjust_by_win_flag(win_flag, fan_table)
@@ -1005,162 +1437,124 @@ def _calculate_regular_fan(
     win_flag: int,
     fan_table: List[int],
 ) -> None:
-    fixed_cnt = calculate_param.hand_tiles.pack_count
-    win_tile = calculate_param.win_tile
+    pair_pack = 0
+    chow_packs: List[int] = []
+    pung_packs: List[int] = []
+    chow_cnt = 0
+    pung_cnt = 0
+    concealed_pung_cnt = 0
+    melded_kong_cnt = 0
+    concealed_kong_cnt = 0
 
-    chow_tiles: List[int] = []
-    pung_tiles: List[int] = []
-    kong_tiles: List[int] = []
-    for i in range(4):
+    for i in range(5):
         pack = packs[i]
         pack_type = pack_get_type(pack)
         if pack_type == PACK_TYPE_CHOW:
-            chow_tiles.append(pack_get_tile(pack))
+            chow_packs.append(pack)
+            chow_cnt += 1
         elif pack_type == PACK_TYPE_PUNG:
-            pung_tiles.append(pack_get_tile(pack))
+            pung_packs.append(pack)
+            pung_cnt += 1
+            if not is_pack_melded(pack):
+                concealed_pung_cnt += 1
         elif pack_type == PACK_TYPE_KONG:
-            kong_tiles.append(pack_get_tile(pack))
+            pung_packs.append(pack)
+            pung_cnt += 1
+            if is_pack_melded(pack):
+                melded_kong_cnt += 1
+            else:
+                concealed_kong_cnt += 1
+        elif pack_type == PACK_TYPE_PAIR:
+            pair_pack = pack
+        else:
+            return
 
-    chow_cnt = len(chow_tiles)
-    pung_cnt = len(pung_tiles) + len(kong_tiles)
+    if pair_pack == 0 or chow_cnt + pung_cnt != 4:
+        return
 
-    for t in pung_tiles:
-        fan = _get_1_pung_fan(t)
-        if fan != FAN_NONE:
-            fan_table[fan] += 1
-    for t in kong_tiles:
-        fan = _get_1_pung_fan(t)
-        if fan != FAN_NONE:
-            fan_table[fan] += 1
+    win_tile = calculate_param.win_tile
+
+    _adjust_by_win_flag(win_flag, fan_table)
+
+    if (win_flag & WIN_FLAG_SELF_DRAWN) == 0:
+        if not any(
+            (not is_pack_melded(pack))
+            and (pack_get_tile(pack) - 1 == win_tile or pack_get_tile(pack) == win_tile or pack_get_tile(pack) + 1 == win_tile)
+            for pack in chow_packs
+        ):
+            for i in range(pung_cnt):
+                if pack_get_tile(pung_packs[i]) == win_tile and not is_pack_melded(pung_packs[i]):
+                    concealed_pung_cnt -= 1
+
+    if pung_cnt != 0:
+        _calculate_kongs(concealed_pung_cnt, melded_kong_cnt, concealed_kong_cnt, fan_table)
+
+        if pung_cnt == 4:
+            if fan_table[FOUR_KONGS] == 0 and fan_table[FOUR_CONCEALED_PUNGS] == 0:
+                fan_table[ALL_PUNGS] = 1
+
+        for i in range(pung_cnt):
+            fan = _get_1_pung_fan(pack_get_tile(pung_packs[i]))
+            if fan != FAN_NONE:
+                fan_table[fan] += 1
 
     if chow_cnt == 4:
-        t0, t1, t2, t3 = sorted(chow_tiles)
-        fan = _get_4_chows_fan(t0, t1, t2, t3)
-        if fan != FAN_NONE:
-            fan_table[fan] = 1
+        if _is_three_suited_terminal_chows(chow_packs, pair_pack):
+            fan_table[THREE_SUITED_TERMINAL_CHOWS] = 1
+        elif _is_pure_terminal_chows(chow_packs, pair_pack):
+            fan_table[PURE_TERMINAL_CHOWS] = 1
         else:
-            if not _calculate_3_of_4_chows(t0, t1, t2, t3, fan_table):
-                _calculate_3_of_4_chows(t0, t1, t3, t2, fan_table)
-                _calculate_3_of_4_chows(t0, t2, t3, t1, fan_table)
-                _calculate_3_of_4_chows(t1, t2, t3, t0, fan_table)
-            _calculate_2_of_4_chows(t0, t1, t2, t3, fan_table)
+            mid_tiles = sorted(pack_get_tile(p) for p in chow_packs)
+            _calculate_4_chows(mid_tiles, fan_table)
     elif chow_cnt == 3:
-        t0, t1, t2 = sorted(chow_tiles)
-        fan = _get_3_chows_fan(t0, t1, t2)
-        if fan != FAN_NONE:
-            fan_table[fan] = 1
-        else:
-            _calculate_2_of_3_chows(t0, t1, t2, fan_table)
+        mid_tiles = sorted(pack_get_tile(p) for p in chow_packs)
+        _calculate_3_chows(mid_tiles, fan_table)
     elif chow_cnt == 2:
-        t0, t1 = chow_tiles
-        fan = _get_2_chows_fan_unordered(t0, t1)
-        if fan != FAN_NONE:
-            fan_table[fan] = 1
+        mid_tiles_chow = [pack_get_tile(chow_packs[0]), pack_get_tile(chow_packs[1])]
+        mid_tiles_pung = [pack_get_tile(pung_packs[0]), pack_get_tile(pung_packs[1])]
+        _calculate_2_chows_unordered(mid_tiles_chow, fan_table)
+        _calculate_2_pungs_unordered(mid_tiles_pung, fan_table)
+    elif chow_cnt == 1:
+        mid_tiles = sorted(pack_get_tile(p) for p in pung_packs[:3])
+        _calculate_3_pungs(mid_tiles, fan_table)
+    elif chow_cnt == 0:
+        mid_tiles = sorted(pack_get_tile(p) for p in pung_packs)
+        _calculate_4_pungs(mid_tiles, fan_table)
 
-    if pung_cnt == 4:
-        tiles = sorted(pung_tiles + kong_tiles)
-        fan = _get_4_pungs_fan(tiles[0], tiles[1], tiles[2], tiles[3])
-        if fan != FAN_NONE:
-            fan_table[fan] = 1
-    elif pung_cnt == 3:
-        tiles = sorted(pung_tiles + kong_tiles)
-        fan = _get_3_pungs_fan(tiles[0], tiles[1], tiles[2])
-        if fan != FAN_NONE:
-            fan_table[fan] = 1
-        else:
-            _calculate_2_of_3_pungs(tiles[0], tiles[1], tiles[2], fan_table)
-    elif pung_cnt == 2:
-        tiles = sorted(pung_tiles + kong_tiles)
-        _calculate_2_of_4_pungs(tiles[0], tiles[1], tiles[0], tiles[1], fan_table)
+    fixed_cnt = calculate_param.hand_tiles.pack_count
 
-    if fixed_cnt == 0 and (win_flag & WIN_FLAG_SELF_DRAWN) == 0:
-        fan_table[CONCEALED_HAND] = 1
-    if fixed_cnt == 4 and (win_flag & WIN_FLAG_SELF_DRAWN):
-        fan_table[MELDED_HAND] = 1
+    _adjust_by_self_drawn(packs, fixed_cnt, (win_flag & WIN_FLAG_SELF_DRAWN) != 0, fan_table)
 
-    pair_tile = pack_get_tile(packs[4])
-    if pair_tile == TILE_C:
-        fan_table[LITTLE_THREE_DRAGONS] = 1
-    if pair_tile == TILE_E:
-        if calculate_param.prevalent_wind == Wind.EAST:
-            fan_table[PREVALENT_WIND] = 1
-        if calculate_param.seat_wind == Wind.EAST:
-            fan_table[SEAT_WIND] = 1
-    if pair_tile == TILE_S:
-        if calculate_param.prevalent_wind == Wind.SOUTH:
-            fan_table[PREVALENT_WIND] = 1
-        if calculate_param.seat_wind == Wind.SOUTH:
-            fan_table[SEAT_WIND] = 1
-    if pair_tile == TILE_W:
-        if calculate_param.prevalent_wind == Wind.WEST:
-            fan_table[PREVALENT_WIND] = 1
-        if calculate_param.seat_wind == Wind.WEST:
-            fan_table[SEAT_WIND] = 1
-    if pair_tile == TILE_N:
-        if calculate_param.prevalent_wind == Wind.NORTH:
-            fan_table[PREVALENT_WIND] = 1
-        if calculate_param.seat_wind == Wind.NORTH:
-            fan_table[SEAT_WIND] = 1
+    if SUPPORT_BLESSINGS:
+        if fixed_cnt == 0 and (win_flag & WIN_FLAG_INITIAL):
+            _adjust_by_initial_hands(calculate_param.seat_wind == Wind.EAST, win_flag, fan_table)
 
-    if _is_all_even_pungs(packs):
-        fan_table[ALL_EVEN_PUNGS] = 1
+    _adjust_by_pair_tile(pack_get_tile(pair_pack), chow_cnt, fan_table)
+    _adjust_by_packs_traits(packs, fan_table)
 
-    all_tiles: List[int] = []
-    for i in range(4):
-        p = packs[i]
-        t = pack_get_tile(p)
-        pt = pack_get_type(p)
-        if pt == PACK_TYPE_CHOW:
-            all_tiles.extend([t - 1, t, t + 1])
-        elif pt == PACK_TYPE_PUNG:
-            all_tiles.extend([t, t, t])
-        elif pt == PACK_TYPE_KONG:
-            all_tiles.extend([t, t, t, t])
-    all_tiles.extend([pair_tile, pair_tile])
-
-    if _is_all_simples(all_tiles):
-        fan_table[ALL_SIMPLES] = 1
-    if _is_outside_hand(all_tiles):
-        fan_table[OUTSIDE_HAND] = 1
-    if _is_all_terminals(all_tiles):
-        fan_table[ALL_TERMINALS] = 1
-    if _is_all_honors(all_tiles):
-        fan_table[ALL_HONORS] = 1
-    if _is_all_terminals_and_honors(all_tiles):
-        fan_table[ALL_TERMINALS_AND_HONORS] = 1
+    merged_table = [standing_table[i] + fixed_table[i] for i in range(TILE_TABLE_SIZE)]
 
     _adjust_by_suits(unique_tiles, fan_table)
     _adjust_by_tiles_traits(unique_tiles, fan_table)
     _adjust_by_rank_range(unique_tiles, fan_table)
-    _adjust_by_tiles_hog(standing_table, fixed_cnt, fan_table)
-
-    concealed_pungs = _count_concealed_pungs(packs, fixed_cnt)
-    if concealed_pungs == 4:
-        fan_table[FOUR_CONCEALED_PUNGS] = 1
-    elif concealed_pungs == 3:
-        fan_table[THREE_CONCEALED_PUNGS] = 1
-    elif concealed_pungs == 2:
-        fan_table[TWO_CONCEALED_PUNGS] = 1
-
-    if _has_kong(packs, fixed_cnt):
-        kong_cnt = sum(1 for i in range(fixed_cnt) if pack_get_type(packs[i]) == PACK_TYPE_KONG)
-        if kong_cnt == 4:
-            fan_table[FOUR_KONGS] = 1
-        elif kong_cnt == 3:
-            fan_table[THREE_KONGS] = 1
-        elif kong_cnt == 2:
-            fan_table[TWO_MELDED_KONGS] = 1
-        elif kong_cnt == 1:
-            fan_table[MELDED_KONG] = 1
-
-    if fixed_cnt == 0:
-        fan_table[FULLY_CONCEALED_HAND] = 1
+    if fan_table[QUADRUPLE_CHOW] == 0:
+        _adjust_by_tiles_hog(merged_table, melded_kong_cnt + concealed_kong_cnt, fan_table)
 
     if unique_waiting:
-        _adjust_by_waiting_form(packs[3:], 2, win_tile, fan_table)
+        _adjust_by_waiting_form(packs[fixed_cnt:], 5 - fixed_cnt, win_tile, fan_table)
 
-    _adjust_by_win_flag(win_flag, fan_table)
     _final_adjust(fan_table)
+
+    if fan_table[BIG_FOUR_WINDS] == 0:
+        prevalent_wind = calculate_param.prevalent_wind
+        seat_wind = calculate_param.seat_wind
+        for i in range(pung_cnt):
+            tile = pack_get_tile(pung_packs[i])
+            if is_winds(tile):
+                _adjust_by_winds(tile, prevalent_wind, seat_wind, fan_table)
+
+    if all(v == 0 for v in fan_table):
+        fan_table[CHICKEN_HAND] = 1
 
 
 def _calculate_knitted_straight_fan(
@@ -1170,48 +1564,90 @@ def _calculate_knitted_straight_fan(
     win_flag: int,
     fan_table: List[int],
 ) -> bool:
-    fixed_cnt = calculate_param.hand_tiles.pack_count
+    hand_tiles = calculate_param.hand_tiles
+    fixed_packs = hand_tiles.fixed_packs
     win_tile = calculate_param.win_tile
+
+    if not _has_pair(standing_table):
+        return False
 
     matched_seq = None
     for seq in STANDARD_KNITTED_STRAIGHT:
-        if all(standing_table[t] for t in seq):
+        if all(standing_table[t] > 0 for t in seq):
             matched_seq = seq
             break
     if matched_seq is None:
         return False
 
-    packs = [0] * 5
-    packs[4] = make_pack(0, PACK_TYPE_PAIR, win_tile)
-    remaining = list(standing_table)
+    tile_table = list(standing_table)
     for t in matched_seq:
-        remaining[t] -= 1
+        tile_table[t] -= 1
 
-    idx = 0
-    for t in ALL_TILES:
-        while remaining[t] >= 3:
-            packs[idx] = make_pack(0, PACK_TYPE_PUNG, t)
-            remaining[t] -= 3
-            idx += 1
-        if is_numbered_suit(t) and tile_get_rank(t) < 8:
-            while remaining[t] and remaining[t + 1] and remaining[t + 2]:
-                packs[idx] = make_pack(0, PACK_TYPE_CHOW, t + 1)
-                remaining[t] -= 1
-                remaining[t + 1] -= 1
-                remaining[t + 2] -= 1
-                idx += 1
-    if idx != 2:
+    result = DivisionResult()
+    work = Division()
+
+    fixed_cnt = hand_tiles.pack_count
+    if fixed_cnt == 1:
+        work.packs[3] = fixed_packs[0]
+    _divide_recursively(tile_table, fixed_cnt + 3, 0, 0, work, result)
+    if len(result.divisions) != 1:
         return False
 
+    packs = result.divisions[0].packs
+    involved_pack = packs[3]
+    pair_tile = pack_get_tile(packs[4])
+
     fan_table[KNITTED_STRAIGHT] = 1
-    if fixed_cnt == 0:
-        fan_table[FULLY_CONCEALED_HAND] = 1
+
+    involved_type = pack_get_type(involved_pack)
+    if involved_type == PACK_TYPE_CHOW:
+        if is_numbered_suit_quick(pair_tile):
+            fan_table[ALL_CHOWS] = 1
+        if fixed_table[pair_tile] + standing_table[pair_tile] == 4:
+            fan_table[TILE_HOG] = 1
+    else:
+        involved_tile = pack_get_tile(involved_pack)
+        if is_honor(involved_tile):
+            if is_winds(involved_tile):
+                fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 1
+                _adjust_by_winds(involved_tile, calculate_param.prevalent_wind, calculate_param.seat_wind, fan_table)
+                if is_dragons(pair_tile):
+                    fan_table[ALL_TYPES] = 1
+            else:
+                fan_table[DRAGON_PUNG] = 1
+                if is_winds(pair_tile):
+                    fan_table[ALL_TYPES] = 1
+        else:
+            if is_terminal(involved_tile):
+                fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 1
+            if not is_honor(pair_tile):
+                fan_table[NO_HONORS] = 1
+            if involved_type != PACK_TYPE_KONG and fixed_table[involved_tile] + standing_table[involved_tile] == 4:
+                fan_table[TILE_HOG] = 1
+
     _adjust_by_win_flag(win_flag, fan_table)
 
+    if is_pack_melded(involved_pack):
+        if involved_type == PACK_TYPE_KONG:
+            fan_table[MELDED_KONG] = 1
+    else:
+        if involved_type == PACK_TYPE_KONG:
+            fan_table[CONCEALED_KONG] = 1
+        if win_flag & WIN_FLAG_SELF_DRAWN:
+            fan_table[FULLY_CONCEALED_HAND] = 1
+            fan_table[SELF_DRAWN] = 0
+        else:
+            fan_table[CONCEALED_HAND] = 1
+
+    if SUPPORT_BLESSINGS:
+        if fixed_cnt == 0 and (win_flag & WIN_FLAG_INITIAL):
+            _adjust_by_initial_hands(calculate_param.seat_wind == Wind.EAST, win_flag, fan_table)
+
     heavenly = calculate_param.seat_wind == Wind.EAST and fixed_cnt == 0 and (win_flag & (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)) == (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)
+
     if fixed_cnt == 0:
         if not heavenly:
-            if _is_unique_waiting(standing_table, calculate_param.hand_tiles.tile_count, win_tile):
+            if _is_unique_waiting(tile_table, 4, win_tile):
                 _adjust_by_waiting_form(packs[3:], 2, win_tile, fan_table)
     else:
         if all(win_tile != t for t in matched_seq):
@@ -1221,7 +1657,6 @@ def _calculate_knitted_straight_fan(
                 fan_table[SINGLE_WAIT] = 1
 
     _final_adjust(fan_table)
-
     return True
 
 

@@ -1,6 +1,6 @@
-"""
-Port of mahjong-algorithm fan_calculator.cpp/h from ChineseOfficialMahjongHelper.
-License: MIT (see original project).
+﻿"""
+Exact port of Classes/mahjong-algorithm/fan_calculator.cpp and fan_calculator.h
+from ChineseOfficialMahjongHelper (MIT License).
 """
 
 from __future__ import annotations
@@ -16,14 +16,13 @@ from .tile import (
     PACK_TYPE_PAIR,
     PACK_TYPE_PUNG,
     TILE_TABLE_SIZE,
-    TILE_1m, TILE_9m, TILE_1s, TILE_9s, TILE_1p, TILE_9p,
     TILE_E, TILE_S, TILE_W, TILE_N, TILE_C, TILE_F, TILE_P,
     TILE_SUIT_HONORS,
     is_dragons,
+    is_green,
     is_honor,
     is_numbered_suit,
     is_numbered_suit_quick,
-    is_green,
     is_reversible,
     is_terminal,
     is_terminal_or_honor,
@@ -39,13 +38,11 @@ from .tile import (
 )
 from .standard_tiles import STANDARD_KNITTED_STRAIGHT, STANDARD_THIRTEEN_ORPHANS
 
-
 SUPPORT_CONCEALED_KONG_AND_MELDED_KONG = 1
 KNITTED_STRAIGHT_BODY_WITH_ECS = 1
 DISTINGUISH_PURE_SHIFTED_CHOWS = 0
 NINE_GATES_WHEN_BLESSING_OF_HEAVEN = 1
 SUPPORT_BLESSINGS = 0
-
 
 FAN_NONE = 0
 BIG_FOUR_WINDS = 1
@@ -140,29 +137,26 @@ SINGLE_WAIT = 79
 SELF_DRAWN = 80
 
 FLOWER_TILES = 81
-
 CONCEALED_KONG_AND_MELDED_KONG = 82
 
 FAN_TABLE_SIZE = 83
 
-
-FAN_NAME_EN = [
-    "None",
-    "Big Four Winds", "Big Three Dragons", "All Green", "Nine Gates", "Four Kongs", "Seven Shifted Pairs", "Thirteen Orphans",
-    "All Terminals", "Little Four Winds", "Little Three Dragons", "All Honors", "Four Concealed Pungs", "Pure Terminal Chows",
-    "Quadruple Chow", "Four Pure Shifted Pungs", "Four Pure Shifted Chows", "Three Kongs", "All Terminals and Honors",
-    "Seven Pairs", "Greater Honors and Knitted Tiles", "All Even Pungs", "Full Flush", "Pure Triple Chow", "Pure Shifted Pungs", "Upper Tiles", "Middle Tiles", "Lower Tiles",
-    "Pure Straight", "Three-Suited Terminal Chows", "Pure Shifted Chows", "All Five", "Triple Pung", "Three Concealed Pungs",
-    "Lesser Honors and Knitted Tiles", "Knitted Straight", "Upper Four", "Lower Four", "Big Three Winds",
-    "Mixed Straight", "Reversible Tiles", "Mixed Triple Chow", "Mixed Shifted Pungs", "Chicken Hand", "Last Tile Draw", "Last Tile Claim", "Out with Replacement Tile", "Robbing The Kong",
-    "All Pungs", "Half Flush", "Mixed Shifted Chows", "All Types", "Melded Hand", "Two Concealed Kongs", "Two Dragons Pungs",
-    "Outside Hand", "Fully Concealed Hand", "Two Melded Kongs", "Last Tile",
-    "Dragon Pung", "Prevalent Wind", "Seat Wind", "Concealed Hand", "All Chows", "Tile Hog", "Double Pung",
-    "Two Concealed Pungs", "Concealed Kong", "All Simples",
-    "Pure Double Chow", "Mixed Double Chow", "Short Straight", "Two Terminal Chows", "Pung of Terminals or Honors", "Melded Kong", "One Voided Suit", "No Honors", "Unique Wait (Edge)", "Unique Wait (Closed)", "Unique Wait (Single)", "Self-Drawn",
-    "Flower Tiles", "Concealed Kong and Melded Kong",
+FAN_NAME_ZH = [
+    "无",
+    "大四喜", "大三元", "绿一色", "九莲宝灯", "四杠", "连七对", "十三幺",
+    "清幺九", "小四喜", "小三元", "字一色", "四暗刻", "一色双龙会",
+    "一色四同顺", "一色四节高", "一色四步高",
+    "三杠", "混幺九",
+    "七对", "七星不靠", "全双刻", "清一色", "一色三同顺", "一色三节高", "全大", "全中", "全小",
+    "清龙", "三色双龙会", "一色三步高", "全带五", "三同刻", "三暗刻",
+    "全不靠", "组合龙", "大于五", "小于五", "三风刻",
+    "花龙", "推不倒", "三色三同顺", "三色三节高", "无番和", "妙手回春", "海底捞月", "杠上开花", "抢杠和",
+    "碰碰和", "混一色", "三色三步高", "五门齐", "全求人", "双暗杠", "双箭刻",
+    "全带幺", "不求人", "双明杠", "和绝张",
+    "箭刻", "圈风刻", "门风刻", "门前清", "平和", "四归一", "双同刻", "双暗刻", "暗杠", "断幺",
+    "一般高", "喜相逢", "连六", "老少副", "幺九刻", "明杠", "缺一门", "无字", "独听・边张", "独听・嵌张", "独听・单钓", "自摸",
+    "花牌", "明暗杠",
 ]
-
 
 FAN_VALUE_TABLE = [
     0,
@@ -239,7 +233,7 @@ def _map_packs(packs: List[int], cnt: int, tile_table: List[int]) -> None:
 
 
 def _table_unique(fixed_table: List[int], standing_table: List[int]) -> List[int]:
-    unique_tiles = []
+    unique_tiles: List[int] = []
     for t in ALL_TILES:
         if fixed_table[t] or standing_table[t]:
             unique_tiles.append(t)
@@ -291,10 +285,12 @@ def _divide_recursively(
     idx = step + fixed_cnt
     if idx == 4:
         return _divide_tail(tile_table, fixed_cnt, work_division, result)
+
     ret = False
     for t in ALL_TILES:
         if tile_table[t] < 1:
             continue
+
         if tile_table[t] > 2:
             eigen = make_eigen(t, t, t)
             if eigen > prev_eigen:
@@ -303,6 +299,7 @@ def _divide_recursively(
                 if _divide_recursively(tile_table, fixed_cnt, step + 1, eigen, work_division, result):
                     ret = True
                 tile_table[t] += 3
+
         if is_numbered_suit(t):
             if tile_get_rank(t) < 8 and tile_table[t + 1] and tile_table[t + 2]:
                 eigen = make_eigen(t, t + 1, t + 2)
@@ -316,6 +313,7 @@ def _divide_recursively(
                     tile_table[t] += 1
                     tile_table[t + 1] += 1
                     tile_table[t + 2] += 1
+
     return ret
 
 
@@ -334,7 +332,6 @@ def _divide_win_hand(standing_table: List[int], fixed_packs: List[int], fixed_cn
     work.packs[:fixed_cnt] = fixed_packs[:fixed_cnt]
     _divide_recursively(standing_table, fixed_cnt, 0, 0, work, result)
     return result
-
 
 def _is_four_shifted_1(r0: int, r1: int, r2: int, r3: int) -> bool:
     return r0 + 1 == r1 and r1 + 1 == r2 and r2 + 1 == r3
@@ -368,7 +365,7 @@ def _get_4_chows_fan(t0: int, t1: int, t2: int, t3: int) -> int:
         return FOUR_PURE_SHIFTED_CHOWS
     if _is_four_shifted_1(t0, t1, t2, t3):
         return FOUR_PURE_SHIFTED_CHOWS
-    if t0 == t1 == t2 == t3:
+    if t0 == t1 and t0 == t2 and t0 == t3:
         return QUADRUPLE_CHOW
     return FAN_NONE
 
@@ -377,15 +374,19 @@ def _get_3_chows_fan(t0: int, t1: int, t2: int) -> int:
     s0 = tile_get_suit(t0)
     s1 = tile_get_suit(t1)
     s2 = tile_get_suit(t2)
+
     r0 = tile_get_rank(t0)
     r1 = tile_get_rank(t1)
     r2 = tile_get_rank(t2)
+
     if _is_mixed(s0, s1, s2):
         if _is_shifted_1_unordered(r1, r0, r2):
             return MIXED_SHIFTED_CHOWS
-        if r0 == r1 == r2:
+        if r0 == r1 and r1 == r2:
             return MIXED_TRIPLE_CHOW
-        if (r0, r1, r2) in ((2, 5, 8), (2, 8, 5), (5, 2, 8), (5, 8, 2), (8, 2, 5), (8, 5, 2)):
+        if ((r0 == 2 and r1 == 5 and r2 == 8) or (r0 == 2 and r1 == 8 and r2 == 5)
+            or (r0 == 5 and r1 == 2 and r2 == 8) or (r0 == 5 and r1 == 8 and r2 == 2)
+            or (r0 == 8 and r1 == 2 and r2 == 5) or (r0 == 8 and r1 == 5 and r2 == 2)):
             return MIXED_STRAIGHT
     else:
         if t0 + 3 == t1 and t1 + 3 == t2:
@@ -394,7 +395,7 @@ def _get_3_chows_fan(t0: int, t1: int, t2: int) -> int:
             return PURE_SHIFTED_CHOWS
         if _is_shifted_1(t0, t1, t2):
             return PURE_SHIFTED_CHOWS
-        if t0 == t1 == t2:
+        if t0 == t1 and t0 == t2:
             return PURE_TRIPLE_CHOW
     return FAN_NONE
 
@@ -428,24 +429,28 @@ def _get_3_pungs_fan(t0: int, t1: int, t2: int) -> int:
         s0 = tile_get_suit(t0)
         s1 = tile_get_suit(t1)
         s2 = tile_get_suit(t2)
+
         r0 = tile_get_rank(t0)
         r1 = tile_get_rank(t1)
         r2 = tile_get_rank(t2)
+
         if _is_mixed(s0, s1, s2):
             if _is_shifted_1_unordered(r1, r0, r2):
                 return MIXED_SHIFTED_PUNGS
-            if r0 == r1 == r2:
+            if r0 == r1 and r1 == r2:
                 return TRIPLE_PUNG
         else:
             if t0 + 1 == t1 and t1 + 1 == t2:
                 return PURE_SHIFTED_PUNGS
     else:
-        if (t0, t1, t2) in (
-            (TILE_E, TILE_S, TILE_W), (TILE_E, TILE_S, TILE_N), (TILE_E, TILE_W, TILE_N), (TILE_S, TILE_W, TILE_N)
-        ):
+        if ((t0 == TILE_E and t1 == TILE_S and t2 == TILE_W)
+            or (t0 == TILE_E and t1 == TILE_S and t2 == TILE_N)
+            or (t0 == TILE_E and t1 == TILE_W and t2 == TILE_N)
+            or (t0 == TILE_S and t1 == TILE_W and t2 == TILE_N)):
             return BIG_THREE_WINDS
         if t0 == TILE_C and t1 == TILE_F and t2 == TILE_P:
             return BIG_THREE_DRAGONS
+
     return FAN_NONE
 
 
@@ -467,10 +472,11 @@ def _get_1_pung_fan(mid_tile: int) -> int:
     return FAN_NONE
 
 
-def _get_1_chow_extra_fan(t0: int, t1: int, t2: int, t_extra: int) -> int:
-    fan0 = _get_2_chows_fan_unordered(t0, t_extra)
-    fan1 = _get_2_chows_fan_unordered(t1, t_extra)
-    fan2 = _get_2_chows_fan_unordered(t2, t_extra)
+def _get_1_chow_extra_fan(tile0: int, tile1: int, tile2: int, tile_extra: int) -> int:
+    fan0 = _get_2_chows_fan_unordered(tile0, tile_extra)
+    fan1 = _get_2_chows_fan_unordered(tile1, tile_extra)
+    fan2 = _get_2_chows_fan_unordered(tile2, tile_extra)
+
     if fan0 == PURE_DOUBLE_CHOW or fan1 == PURE_DOUBLE_CHOW or fan2 == PURE_DOUBLE_CHOW:
         return PURE_DOUBLE_CHOW
     if fan0 == MIXED_DOUBLE_CHOW or fan1 == MIXED_DOUBLE_CHOW or fan2 == MIXED_DOUBLE_CHOW:
@@ -479,6 +485,7 @@ def _get_1_chow_extra_fan(t0: int, t1: int, t2: int, t_extra: int) -> int:
         return SHORT_STRAIGHT
     if fan0 == TWO_TERMINAL_CHOWS or fan1 == TWO_TERMINAL_CHOWS or fan2 == TWO_TERMINAL_CHOWS:
         return TWO_TERMINAL_CHOWS
+
     return FAN_NONE
 
 
@@ -489,6 +496,7 @@ def _exclusionary_rule(all_fans: List[int], fan_cnt: int, max_cnt: int, fan_tabl
         if all_fans[i] != FAN_NONE:
             cnt += 1
             table[all_fans[i] - PURE_DOUBLE_CHOW] += 1
+
     limit_cnt = 1
     while cnt > max_cnt and limit_cnt >= 0:
         idx = 4
@@ -498,69 +506,70 @@ def _exclusionary_rule(all_fans: List[int], fan_cnt: int, max_cnt: int, fan_tabl
                 table[idx] -= 1
                 cnt -= 1
         limit_cnt -= 1
+
     fan_table[PURE_DOUBLE_CHOW] = table[0]
     fan_table[MIXED_DOUBLE_CHOW] = table[1]
     fan_table[SHORT_STRAIGHT] = table[2]
     fan_table[TWO_TERMINAL_CHOWS] = table[3]
 
 
-def _calculate_3_of_4_chows(t0: int, t1: int, t2: int, t_extra: int, fan_table: List[int]) -> bool:
-    fan = _get_3_chows_fan(t0, t1, t2)
+def _calculate_3_of_4_chows(tile0: int, tile1: int, tile2: int, tile_extra: int, fan_table: List[int]) -> bool:
+    fan = _get_3_chows_fan(tile0, tile1, tile2)
     if fan != FAN_NONE:
         fan_table[fan] = 1
-        extra = _get_1_chow_extra_fan(t0, t1, t2, t_extra)
-        if extra != FAN_NONE:
-            fan_table[extra] = 1
+        fan = _get_1_chow_extra_fan(tile0, tile1, tile2, tile_extra)
+        if fan != FAN_NONE:
+            fan_table[fan] = 1
         return True
     return False
 
 
-def _calculate_2_of_4_chows(t0: int, t1: int, t2: int, t3: int, fan_table: List[int]) -> None:
+def _calculate_2_of_4_chows(tile0: int, tile1: int, tile2: int, tile3: int, fan_table: List[int]) -> None:
     all_fans = [
-        _get_2_chows_fan_unordered(t0, t1),
-        _get_2_chows_fan_unordered(t0, t2),
-        _get_2_chows_fan_unordered(t0, t3),
-        _get_2_chows_fan_unordered(t1, t2),
-        _get_2_chows_fan_unordered(t1, t3),
-        _get_2_chows_fan_unordered(t2, t3),
+        _get_2_chows_fan_unordered(tile0, tile1),
+        _get_2_chows_fan_unordered(tile0, tile2),
+        _get_2_chows_fan_unordered(tile0, tile3),
+        _get_2_chows_fan_unordered(tile1, tile2),
+        _get_2_chows_fan_unordered(tile1, tile3),
+        _get_2_chows_fan_unordered(tile2, tile3),
     ]
     _exclusionary_rule(all_fans, 6, 2, fan_table)
 
 
-def _calculate_2_of_3_chows(t0: int, t1: int, t2: int, fan_table: List[int]) -> None:
+def _calculate_2_of_3_chows(tile0: int, tile1: int, tile2: int, fan_table: List[int]) -> None:
     all_fans = [
-        _get_2_chows_fan_unordered(t0, t1),
-        _get_2_chows_fan_unordered(t0, t2),
-        _get_2_chows_fan_unordered(t1, t2),
+        _get_2_chows_fan_unordered(tile0, tile1),
+        _get_2_chows_fan_unordered(tile0, tile2),
+        _get_2_chows_fan_unordered(tile1, tile2),
     ]
     _exclusionary_rule(all_fans, 3, 1, fan_table)
 
 
-def _calculate_3_of_4_pungs(t0: int, t1: int, t2: int, t_extra: int, fan_table: List[int]) -> bool:
-    fan = _get_3_pungs_fan(t0, t1, t2)
+def _calculate_3_of_4_pungs(tile0: int, tile1: int, tile2: int, tile_extra: int, fan_table: List[int]) -> bool:
+    fan = _get_3_pungs_fan(tile0, tile1, tile2)
     if fan != FAN_NONE:
         fan_table[fan] = 1
         return True
     return False
 
 
-def _calculate_2_of_4_pungs(t0: int, t1: int, t2: int, t3: int, fan_table: List[int]) -> None:
+def _calculate_2_of_4_pungs(tile0: int, tile1: int, tile2: int, tile3: int, fan_table: List[int]) -> None:
     all_fans = [
-        _get_2_pungs_fan_unordered(t0, t1),
-        _get_2_pungs_fan_unordered(t0, t2),
-        _get_2_pungs_fan_unordered(t0, t3),
-        _get_2_pungs_fan_unordered(t1, t2),
-        _get_2_pungs_fan_unordered(t1, t3),
-        _get_2_pungs_fan_unordered(t2, t3),
+        _get_2_pungs_fan_unordered(tile0, tile1),
+        _get_2_pungs_fan_unordered(tile0, tile2),
+        _get_2_pungs_fan_unordered(tile0, tile3),
+        _get_2_pungs_fan_unordered(tile1, tile2),
+        _get_2_pungs_fan_unordered(tile1, tile3),
+        _get_2_pungs_fan_unordered(tile2, tile3),
     ]
     _exclusionary_rule(all_fans, 6, 1, fan_table)
 
 
-def _calculate_2_of_3_pungs(t0: int, t1: int, t2: int, fan_table: List[int]) -> None:
+def _calculate_2_of_3_pungs(tile0: int, tile1: int, tile2: int, fan_table: List[int]) -> None:
     all_fans = [
-        _get_2_pungs_fan_unordered(t0, t1),
-        _get_2_pungs_fan_unordered(t0, t2),
-        _get_2_pungs_fan_unordered(t1, t2),
+        _get_2_pungs_fan_unordered(tile0, tile1),
+        _get_2_pungs_fan_unordered(tile0, tile2),
+        _get_2_pungs_fan_unordered(tile1, tile2),
     ]
     _exclusionary_rule(all_fans, 3, 1, fan_table)
 
@@ -704,6 +713,21 @@ def _adjust_by_win_flag(win_flag: int, fan_table: List[int]) -> None:
         fan_table[LAST_TILE] = 1
 
 
+def _adjust_by_initial_hands(is_dealer: bool, win_flag: int, fan_table: List[int]) -> None:
+    if not (win_flag & WIN_FLAG_INITIAL):
+        return
+    if win_flag & WIN_FLAG_SELF_DRAWN:
+        if is_dealer:
+            fan_table[BLESSING_OF_HEAVEN] = 1
+        else:
+            fan_table[BLESSING_OF_HUMAN_2] = 1
+    else:
+        if is_dealer:
+            fan_table[BLESSING_OF_EARTH] = 1
+        else:
+            fan_table[BLESSING_OF_HUMAN_1] = 1
+
+
 def _adjust_by_tiles_hog(standing_table: List[int], fixed_cnt: int, fan_table: List[int]) -> None:
     for t in ALL_TILES:
         cnt = standing_table[t]
@@ -785,11 +809,11 @@ def _final_adjust(fan_table: List[int]) -> None:
     if fan_table[PURE_DOUBLE_CHOW]:
         fan_table[MIXED_DOUBLE_CHOW] = 0
 
-
 def _adjust_by_win_flag_4_special_form(seat_wind: int, win_flag: int, fan_table: List[int]) -> None:
     _adjust_by_win_flag(win_flag, fan_table)
-    if SUPPORT_BLESSINGS and (win_flag & WIN_FLAG_INITIAL):
-        _adjust_by_initial_hands(seat_wind == Wind.EAST, win_flag, fan_table)
+    if SUPPORT_BLESSINGS:
+        if win_flag & WIN_FLAG_INITIAL:
+            _adjust_by_initial_hands(seat_wind == Wind.EAST, win_flag, fan_table)
 
 
 def _is_seven_pairs(tile_table: List[int]) -> bool:
@@ -817,16 +841,22 @@ def _is_thirteen_orphans(unique_tiles: List[int]) -> bool:
 def _calculate_honors_and_knitted_tiles(unique_tiles: List[int], fan_table: List[int]) -> bool:
     if len(unique_tiles) != 14:
         return False
-    honor_begin = 0
+
+    honor_begin = None
     for i, t in enumerate(unique_tiles):
         if is_honor(t):
             honor_begin = i
             break
+    if honor_begin is None:
+        honor_begin = len(unique_tiles)
+
     numbered_cnt = honor_begin
     if numbered_cnt > 9 or numbered_cnt < 7:
         return False
+
     if not any(all(t in seq for t in unique_tiles[:honor_begin]) for seq in STANDARD_KNITTED_STRAIGHT):
         return False
+
     if numbered_cnt == 7 and unique_tiles[7:] == STANDARD_THIRTEEN_ORPHANS[6:]:
         fan_table[GREATER_HONORS_AND_KNITTED_TILES] = 1
         return True
@@ -835,6 +865,7 @@ def _calculate_honors_and_knitted_tiles(unique_tiles: List[int], fan_table: List
         if numbered_cnt == 9:
             fan_table[KNITTED_STRAIGHT] = 1
         return True
+
     return False
 
 
@@ -862,13 +893,16 @@ def _calculate_special_form_fan(
             _adjust_by_win_flag_4_special_form(seat_wind, win_flag, fan_table)
             _final_adjust(fan_table)
         return True
+
     if _calculate_honors_and_knitted_tiles(unique_tiles, fan_table):
         _adjust_by_win_flag_4_special_form(seat_wind, win_flag, fan_table)
         return True
+
     if _is_thirteen_orphans(unique_tiles):
         fan_table[THIRTEEN_ORPHANS] = 1
         _adjust_by_win_flag_4_special_form(seat_wind, win_flag, fan_table)
         return True
+
     return False
 
 
@@ -879,12 +913,13 @@ def _calculate_nine_gates_fan(
     win_flag: int,
     fan_table: List[int],
 ) -> bool:
+    s = None
+    r = None
     heavenly = seat_wind == Wind.EAST and (win_flag & (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)) == (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)
-    if heavenly and not NINE_GATES_WHEN_BLESSING_OF_HEAVEN:
-        return False
-    s = tile_get_suit(win_tile)
-    r = tile_get_rank(win_tile)
     if heavenly:
+        if not NINE_GATES_WHEN_BLESSING_OF_HEAVEN:
+            return False
+        s = tile_get_suit(win_tile)
         win_tile2 = 0
         for i in range(2, 9):
             tmp = make_tile(s, i)
@@ -906,26 +941,34 @@ def _calculate_nine_gates_fan(
             else:
                 return False
     else:
+        s = tile_get_suit(win_tile)
+        r = tile_get_rank(win_tile)
         if r == 1:
             if standing_table[win_tile] != 4 or standing_table[make_tile(s, 9)] != 3:
                 return False
-            if any(standing_table[make_tile(s, i)] != 1 for i in range(2, 9)):
-                return False
+            for i in range(2, 9):
+                if standing_table[make_tile(s, i)] != 1:
+                    return False
         elif r == 9:
             if standing_table[win_tile] != 4 or standing_table[make_tile(s, 1)] != 3:
                 return False
-            if any(standing_table[make_tile(s, i)] != 1 for i in range(2, 9)):
-                return False
+            for i in range(2, 9):
+                if standing_table[make_tile(s, i)] != 1:
+                    return False
         else:
             if standing_table[win_tile] != 2:
                 return False
             if standing_table[make_tile(s, 1)] != 3 or standing_table[make_tile(s, 9)] != 3:
                 return False
-            if any(standing_table[make_tile(s, i)] != 1 for i in range(2, r)):
-                return False
-            if any(standing_table[make_tile(s, i)] != 1 for i in range(r + 1, 9)):
-                return False
+            for i in range(2, r):
+                if standing_table[make_tile(s, i)] != 1:
+                    return False
+            for i in range(r + 1, 9):
+                if standing_table[make_tile(s, i)] != 1:
+                    return False
+
     fan_table[NINE_GATES] = 1
+
     if r in (1, 9):
         fan_table[PURE_STRAIGHT] = 1
         fan_table[TILE_HOG] = 1
@@ -938,7 +981,9 @@ def _calculate_nine_gates_fan(
         fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 1
     elif r in (3, 4, 6, 7):
         fan_table[SHORT_STRAIGHT] = 1
+
     _adjust_by_win_flag_4_special_form(seat_wind, win_flag, fan_table)
+
     return True
 
 
@@ -949,7 +994,6 @@ def _get_fan_by_table(fan_table: List[int]) -> int:
             continue
         fan += FAN_VALUE_TABLE[i] * fan_table[i]
     return fan
-
 
 def _calculate_regular_fan(
     packs: List[int],
@@ -1175,7 +1219,9 @@ def _calculate_knitted_straight_fan(
         else:
             if standing_table[win_tile] == 3:
                 fan_table[SINGLE_WAIT] = 1
+
     _final_adjust(fan_table)
+
     return True
 
 
@@ -1183,10 +1229,12 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
     hand_tiles = calculate_param.hand_tiles
     fixed_cnt = hand_tiles.pack_count
     standing_cnt = hand_tiles.tile_count
+
     if standing_cnt <= 0 or fixed_cnt < 0 or fixed_cnt > 4 or fixed_cnt * 3 + standing_cnt != 13:
         return ERROR_WRONG_TILES_COUNT
 
     win_tile = calculate_param.win_tile
+
     fixed_table = _new_tile_table()
     standing_table = _new_tile_table()
     _map_packs(hand_tiles.fixed_packs, fixed_cnt, fixed_table)
@@ -1196,13 +1244,15 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
     unique_tiles = _table_unique(fixed_table, standing_table)
 
     win_flag = calculate_param.win_flag
+
     if standing_table[win_tile] != 1:
         win_flag &= ~WIN_FLAG_LAST_TILE
     if fixed_table[win_tile] == 3:
         win_flag |= WIN_FLAG_LAST_TILE
+
     if win_flag & WIN_FLAG_KONG_INVOLVED:
         if win_flag & WIN_FLAG_SELF_DRAWN:
-            if not _has_kong(hand_tiles.fixed_packs, fixed_cnt):
+            if not any(pack_get_type(p) == PACK_TYPE_KONG for p in hand_tiles.fixed_packs[:fixed_cnt]):
                 win_flag &= ~WIN_FLAG_KONG_INVOLVED
         else:
             if fixed_table[win_tile] != 0 or standing_table[win_tile] != 1:
@@ -1212,9 +1262,9 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
     tmp_table = [0] * FAN_TABLE_SIZE
 
     if fixed_cnt == 0:
-        if _calculate_special_form_fan(standing_table, win_tile, unique_tiles, calculate_param.seat_wind, win_flag, tmp_table) \
-            or _calculate_knitted_straight_fan(fixed_table, standing_table, calculate_param, win_flag, tmp_table) \
-            or _calculate_nine_gates_fan(standing_table, win_tile, calculate_param.seat_wind, win_flag, tmp_table):
+        if (_calculate_special_form_fan(standing_table, win_tile, unique_tiles, calculate_param.seat_wind, win_flag, tmp_table)
+            or _calculate_knitted_straight_fan(fixed_table, standing_table, calculate_param, win_flag, tmp_table)
+            or _calculate_nine_gates_fan(standing_table, win_tile, calculate_param.seat_wind, win_flag, tmp_table)):
             max_fan = _get_fan_by_table(tmp_table)
     elif fixed_cnt == 1:
         if _calculate_knitted_straight_fan(fixed_table, standing_table, calculate_param, win_flag, tmp_table):
@@ -1223,9 +1273,10 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
     if max_fan == 0 or tmp_table[SEVEN_PAIRS] == 1:
         heavenly = calculate_param.seat_wind == Wind.EAST and fixed_cnt == 0 and (win_flag & (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)) == (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)
         unique_waiting = (not heavenly) and _is_unique_waiting(standing_table, standing_cnt, win_tile)
+
         result = _divide_win_hand(standing_table, hand_tiles.fixed_packs, fixed_cnt)
         if result.divisions:
-            selected = None
+            selected: Optional[List[int]] = None
             for div in result.divisions:
                 current_table = [0] * FAN_TABLE_SIZE
                 _calculate_regular_fan(div.packs, fixed_table, standing_table, unique_tiles, calculate_param, unique_waiting, win_flag, current_table)
@@ -1243,8 +1294,10 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
         return ERROR_NOT_WIN
 
     max_fan += calculate_param.flower_count
+
     if fan_table is not None:
         for i in range(FAN_TABLE_SIZE):
             fan_table[i] = tmp_table[i]
         fan_table[FLOWER_TILES] = calculate_param.flower_count
+
     return max_fan

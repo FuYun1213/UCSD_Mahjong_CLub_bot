@@ -16,7 +16,8 @@ from discord.ext import commands
 from discord import app_commands
 from typing import List
 from discord.ext import tasks
-from mahjong_ui import SeatSelectView
+from mahjong_ui import SeatSelectView 
+from mahjong_mcr.discord_ui import McrCalculatorView
 from discord.ui import View, Button, Select, Modal, TextInput
 # --- 1. 配置区域 ---
 # ⚠️ 请确保您的 .env 文件名正确，如果是 .env 只需要 load_dotenv()
@@ -1403,6 +1404,15 @@ async def record(interaction: discord.Interaction, player_name: str):
         content=f"👋 你好 **{player_name}**，请选择你的起家位置：", 
         view=view,
         ephemeral=False # 设为 False 让大家都能看到这局开始了，设为 True 则只有你能看见
+    )
+
+@client.tree.command(name="mcr_fan", description="MCR fan calculator (tile UI)")
+async def mcr_fan(interaction: discord.Interaction):
+    view = McrCalculatorView(interaction.user.id)
+    await interaction.response.send_message(
+        content="国标算番：从以下牌中选择手牌.",
+        view=view,
+        ephemeral=True
     )
 
 @client.tree.command(name="report", description="生成战报 (周/月/Quarter)")

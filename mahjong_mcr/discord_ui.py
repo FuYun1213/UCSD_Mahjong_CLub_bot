@@ -72,6 +72,17 @@ def _pack_tiles(pack: int) -> List[int]:
     return []
 
 
+def _format_packs(packs: List[int]) -> str:
+    if not packs:
+        return "[]"
+    groups = []
+    for pack in packs:
+        tiles = _pack_tiles(pack)
+        text = "".join(_tile_display(tile_to_string(t)) for t in tiles)
+        groups.append(f"[{text}]")
+    return " ".join(groups)
+
+
 class FlowerModal(Modal):
     def __init__(self, parent: "McrSettingsView"):
         super().__init__(title="设置花牌数")
@@ -449,7 +460,7 @@ class McrCalculatorView(View):
             f"当前页: {self.page}\n"
             f"立牌 ({len(self.hand_tiles)}/{max_tiles}): {_format_hand(self.hand_tiles)}\n"
             f"和牌: {win_tile}\n"
-            f"副露: {self.pack_count}\n"
+            f"副露 ({self.pack_count}): {_format_packs(self.fixed_packs)}\n"
             f"风位: 门风={wind_map[self.seat_wind]}, 圈风={wind_map[self.prevalent_wind]}\n"
             f"标记: {', '.join(flags) if flags else '无'} | 花牌: {self.flower_count}\n"
             f"{waits_text}"

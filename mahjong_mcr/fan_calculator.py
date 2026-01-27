@@ -6,7 +6,7 @@ from ChineseOfficialMahjongHelper (MIT License).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from .tile import (
     ALL_TILES,
@@ -16,6 +16,7 @@ from .tile import (
     PACK_TYPE_PAIR,
     PACK_TYPE_PUNG,
     TILE_TABLE_SIZE,
+    TILE_1s, TILE_5s, TILE_7s, TILE_9s,
     TILE_E, TILE_S, TILE_W, TILE_N, TILE_C, TILE_F, TILE_P,
     TILE_SUIT_HONORS,
     is_dragons,
@@ -43,7 +44,7 @@ SUPPORT_CONCEALED_KONG_AND_MELDED_KONG = 1
 KNITTED_STRAIGHT_BODY_WITH_ECS = 1
 DISTINGUISH_PURE_SHIFTED_CHOWS = 0
 NINE_GATES_WHEN_BLESSING_OF_HEAVEN = 1
-SUPPORT_BLESSINGS = 0
+SUPPORT_BLESSINGS = 1
 
 FAN_NONE = 0
 BIG_FOUR_WINDS = 1
@@ -140,7 +141,16 @@ SELF_DRAWN = 80
 FLOWER_TILES = 81
 CONCEALED_KONG_AND_MELDED_KONG = 82
 
-FAN_TABLE_SIZE = 83
+BLESSING_OF_HEAVEN = 83
+BLESSING_OF_EARTH = 84
+BLESSING_OF_HUMAN_1 = 85
+BLESSING_OF_HUMAN_2 = 86
+TWICE_PURE_DOUBLE_CHOWS = 87
+MIRROR_HAND = 88
+RED_PEACOCK = 89
+LITTLE_THREE_WINDS = 90
+
+FAN_TABLE_SIZE = 91
 
 FAN_NAME_ZH = [
     "无",
@@ -156,7 +166,8 @@ FAN_NAME_ZH = [
     "全带幺", "不求人", "双明杠", "和绝张",
     "箭刻", "圈风刻", "门风刻", "门前清", "平和", "四归一", "双同刻", "双暗刻", "暗杠", "断幺",
     "一般高", "喜相逢", "连六", "老少副", "幺九刻", "明杠", "缺一门", "无字", "独听・边张", "独听・嵌张", "独听・单钓", "自摸",
-    "花牌", "明暗杠",
+    "花牌", "明暗杠", "天和", "地和", "人和I", "人和II",
+    "两般高", "镜同和", "红孔雀", "小三风",
 ]
 
 FAN_VALUE_TABLE = [
@@ -175,6 +186,8 @@ FAN_VALUE_TABLE = [
     1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     1,
     5,
+    8, 8, 8, 8,
+    32, 16, 88, 8,
 ]
 
 
@@ -807,6 +820,76 @@ def _is_reversible(tiles: List[int]) -> bool:
     return all(is_reversible(t) for t in tiles)
 
 
+def _is_red_peacock(tiles: List[int]) -> bool:
+    allowed = {TILE_1s, TILE_5s, TILE_7s, TILE_9s, TILE_C}
+    return all(t in allowed for t in tiles)
+
+
+def _max_double_chows_for_suit(pair_counts: List[int]) -> int:
+    memo: Dict[tuple, int] = {}
+
+    def dfs(counts: List[int]) -> int:
+        key = tuple(counts)
+        if key in memo:
+            return memo[key]
+        best = 0
+        for r in range(1, 8):
+            if counts[r] > 0 and counts[r + 1] > 0 and counts[r + 2] > 0:
+                counts[r] -= 1
+                counts[r + 1] -= 1
+                counts[r + 2] -= 1
+                best = max(best, 1 + dfs(counts))
+                counts[r] += 1
+                counts[r + 1] += 1
+                counts[r + 2] += 1
+        memo[key] = best
+        return best
+
+    return dfs(pair_counts[:])
+
+
+def _is_twice_pure_double_chows(tile_table: List[int]) -> bool:
+    total = 0
+    for suit in (1, 2, 3):
+        counts = [0] * 10
+        for r in range(1, 10):
+            counts[r] = tile_table[make_tile(suit, r)] // 2
+        total += _max_double_chows_for_suit(counts)
+        if total >= 2:
+            return True
+    return False
+
+
+def _is_mirror_hand(packs: List[int], pair_pack: int) -> bool:
+    suit_map: Dict[int, List[tuple]] = {}
+    for pack in packs:
+        pack_type = pack_get_type(pack)
+        if pack_type == PACK_TYPE_PAIR:
+            continue
+        tile = pack_get_tile(pack)
+        if is_honor(tile):
+            return False
+        suit = tile_get_suit(tile)
+        if pack_type == PACK_TYPE_CHOW:
+            sig = ("c", tile_get_rank(tile))
+        else:
+            sig = ("p", tile_get_rank(tile))
+        suit_map.setdefault(suit, []).append(sig)
+
+    if len(suit_map) != 2:
+        return False
+    if any(len(v) != 2 for v in suit_map.values()):
+        return False
+
+    suits = list(suit_map.keys())
+    if sorted(suit_map[suits[0]]) != sorted(suit_map[suits[1]]):
+        return False
+
+    pair_suit = tile_get_suit(pack_get_tile(pair_pack))
+    if pair_suit in suit_map:
+        return False
+    return True
+
 def _is_all_even_pungs(packs: List[int]) -> bool:
     for p in packs[:4]:
         if pack_get_type(p) == PACK_TYPE_CHOW:
@@ -1109,6 +1192,9 @@ def _adjust_by_tiles_traits(tiles: List[int], fan_table: List[int]) -> None:
     if all(is_green(t) for t in tiles):
         fan_table[ALL_GREEN] = 1
 
+    if _is_red_peacock(tiles):
+        fan_table[RED_PEACOCK] = 1
+
     if fan_table[ALL_SIMPLES]:
         return
 
@@ -1136,6 +1222,11 @@ def _final_adjust(fan_table: List[int]) -> None:
     if fan_table[ALL_GREEN]:
         fan_table[HALF_FLUSH] = 0
         fan_table[ONE_VOIDED_SUIT] = 0
+    if fan_table[RED_PEACOCK]:
+        fan_table[ALL_PUNGS] = 0
+        fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
+        fan_table[DRAGON_PUNG] = 0
+        fan_table[HALF_FLUSH] = 0
     if fan_table[FOUR_KONGS]:
         fan_table[SINGLE_WAIT] = 0
 
@@ -1144,6 +1235,8 @@ def _final_adjust(fan_table: List[int]) -> None:
         fan_table[OUTSIDE_HAND] = 0
         fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
         fan_table[NO_HONORS] = 0
+        fan_table[DOUBLE_PUNG] = 0
+    if fan_table[SEVEN_PAIRS] or fan_table[TWICE_PURE_DOUBLE_CHOWS]:
         fan_table[DOUBLE_PUNG] = 0
 
     if fan_table[LITTLE_FOUR_WINDS]:
@@ -1221,6 +1314,9 @@ def _final_adjust(fan_table: List[int]) -> None:
         fan_table[NO_HONORS] = 0
     if fan_table[ALL_SIMPLES]:
         fan_table[NO_HONORS] = 0
+
+    if fan_table[BLESSING_OF_HEAVEN] or fan_table[BLESSING_OF_HUMAN_2]:
+        fan_table[SELF_DRAWN] = 0
 
 
 def _adjust_by_winds(tile: int, prevalent_wind: int, seat_wind: int, fan_table: List[int]) -> None:
@@ -1311,13 +1407,17 @@ def _calculate_special_form_fan(
 ) -> bool:
     if _is_seven_pairs(standing_table):
         s = tile_get_suit(win_tile)
+        twice = _is_twice_pure_double_chows(standing_table)
         if _is_seven_shifted_pairs(standing_table, s):
             fan_table[SEVEN_SHIFTED_PAIRS] = 1
             if standing_table[make_tile(s, 1)] == 0 and standing_table[make_tile(s, 9)] == 0:
                 fan_table[ALL_SIMPLES] = 1
             _adjust_by_win_flag_4_special_form(seat_wind, win_flag, fan_table)
         else:
-            fan_table[SEVEN_PAIRS] = 1
+            if twice:
+                fan_table[TWICE_PURE_DOUBLE_CHOWS] = 1
+            else:
+                fan_table[SEVEN_PAIRS] = 1
             _adjust_by_suits(unique_tiles, fan_table)
             _adjust_by_tiles_traits(unique_tiles, fan_table)
             _adjust_by_rank_range(unique_tiles, fan_table)
@@ -1521,6 +1621,9 @@ def _calculate_regular_fan(
         mid_tiles = sorted(pack_get_tile(p) for p in pung_packs)
         _calculate_4_pungs(mid_tiles, fan_table)
 
+    if _is_mirror_hand(packs, pair_pack):
+        fan_table[MIRROR_HAND] = 1
+
     fixed_cnt = calculate_param.hand_tiles.pack_count
 
     _adjust_by_self_drawn(packs, fixed_cnt, (win_flag & WIN_FLAG_SELF_DRAWN) != 0, fan_table)
@@ -1545,6 +1648,23 @@ def _calculate_regular_fan(
 
     _final_adjust(fan_table)
 
+    little_three_winds_deduct = 0
+    has_prev_wind_pung = False
+    has_seat_wind_pung = False
+    if is_winds(pack_get_tile(pair_pack)):
+        wind_pung_cnt = 0
+        for i in range(pung_cnt):
+            wtile = pack_get_tile(pung_packs[i])
+            if is_winds(wtile):
+                wind_pung_cnt += 1
+                if (wtile - TILE_E) == calculate_param.prevalent_wind:
+                    has_prev_wind_pung = True
+                if (wtile - TILE_E) == calculate_param.seat_wind:
+                    has_seat_wind_pung = True
+        if wind_pung_cnt == 2:
+            fan_table[LITTLE_THREE_WINDS] = 1
+            little_three_winds_deduct = 2
+
     if fan_table[BIG_FOUR_WINDS] == 0:
         prevalent_wind = calculate_param.prevalent_wind
         seat_wind = calculate_param.seat_wind
@@ -1552,6 +1672,16 @@ def _calculate_regular_fan(
             tile = pack_get_tile(pung_packs[i])
             if is_winds(tile):
                 _adjust_by_winds(tile, prevalent_wind, seat_wind, fan_table)
+
+    if fan_table[LITTLE_THREE_WINDS] and little_three_winds_deduct > 0:
+        deducted_by_winds = 0
+        if has_prev_wind_pung:
+            deducted_by_winds += 1
+        if has_seat_wind_pung and calculate_param.seat_wind != calculate_param.prevalent_wind:
+            deducted_by_winds += 1
+        remaining = little_three_winds_deduct - deducted_by_winds
+        if remaining > 0 and fan_table[PUNG_OF_TERMINALS_OR_HONORS] >= remaining:
+            fan_table[PUNG_OF_TERMINALS_OR_HONORS] -= remaining
 
     if all(v == 0 for v in fan_table):
         fan_table[CHICKEN_HAND] = 1
@@ -1705,7 +1835,7 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
         if _calculate_knitted_straight_fan(fixed_table, standing_table, calculate_param, win_flag, tmp_table):
             max_fan = _get_fan_by_table(tmp_table)
 
-    if max_fan == 0 or tmp_table[SEVEN_PAIRS] == 1:
+    if max_fan == 0 or tmp_table[SEVEN_PAIRS] == 1 or tmp_table[TWICE_PURE_DOUBLE_CHOWS] == 1:
         heavenly = calculate_param.seat_wind == Wind.EAST and fixed_cnt == 0 and (win_flag & (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)) == (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)
         unique_waiting = (not heavenly) and _is_unique_waiting(standing_table, standing_cnt, win_tile)
 
@@ -1720,7 +1850,7 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
                     max_fan = current_fan
                     selected = current_table
                 elif current_fan == max_fan:
-                    if current_table[PURE_TRIPLE_CHOW] == 1 or tmp_table[SEVEN_PAIRS] == 1 or current_table[TRIPLE_PUNG]:
+                    if current_table[PURE_TRIPLE_CHOW] == 1 or tmp_table[SEVEN_PAIRS] == 1 or tmp_table[TWICE_PURE_DOUBLE_CHOWS] == 1 or current_table[TRIPLE_PUNG]:
                         selected = current_table
             if fan_table is not None and selected is not None:
                 tmp_table = selected

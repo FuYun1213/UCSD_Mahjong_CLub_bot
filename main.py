@@ -7,7 +7,7 @@ import urllib.parse
 import asyncio
 import datetime
 import pandas as pd
-from datetime import datetime
+from datetime import datetime,timedelta,timezone
 from collections import Counter
 from dotenv import load_dotenv
 from oauth2client.service_account import ServiceAccountCredentials
@@ -1257,7 +1257,15 @@ async def record_game(
         if manual_time:
             final_time_str = manual_time
         else:
-            final_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            # ✅ 新写法：获取带时区的 UTC 时间
+            current_utc = datetime.now(timezone.utc)
+            
+            # 计算 UTC-8 (西八区)
+            # 注意：因为 current_utc 是带时区的，减去 8 小时后它依然带时区信息，更加严谨
+            local_time = current_utc - timedelta(hours=8)
+            
+            # 格式化为字符串 (去掉时区信息只留文字，保持你原有的格式)
+            final_time_str = local_time.strftime("%Y-%m-%d %H:%M:%S")
 
         # --- 📸 阶段一：获取“变动前”状态 ---
         status_msg = await interaction.followup.send("⏳ 正在读取当前排名...", wait=True)
@@ -1525,19 +1533,14 @@ async def register(interaction: discord.Interaction, new_name: str):
     global PLAYER_NAME_CACHE 
     await interaction.response.defer(ephemeral=False)
     
-    # 去除首尾空格，防止 " Alex " 和 "Alex" 造成混淆
     new_name = new_name.strip()
 
-    # --- 2. 检查名字是否已存在 ---
-    # 直接利用你已有的缓存来检查，速度快
-    # 忽略大小写比较 (可选，视你需求而定)
+
     if any(name.lower() == new_name.lower() for name in PLAYER_NAME_CACHE):
         await interaction.followup.send(f"❌ Registration Failed.name **{new_name}** is already taken")
         return
 
-    # --- 3. 写入 Google Sheets ---
     try:
-        # 使用 asyncio.to_thread 避免卡顿 (原理同之前的保存CSV)
         result_msg = await asyncio.to_thread(perform_google_sheet_registration, new_name)
         if "成功" in result_msg:            
             # 只有当本地列表里还没有这个名字时才添加 (双重保险)

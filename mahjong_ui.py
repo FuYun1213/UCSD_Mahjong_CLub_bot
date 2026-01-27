@@ -3,13 +3,24 @@ from discord.ui import View, Button, Select, Modal, TextInput
 import pandas as pd
 import os
 from datetime import datetime
+import asyncio 
 
-# ==========================================
-# 0. 配置与役种数据
-# ==========================================
 DATA_FILE = 'mahjong_records.csv'
+data_lock = asyncio.Lock()
 
-# 【改动1】从这里移除了 宝牌、赤宝牌、里宝牌，因为我们要用数字输入
+# --- 辅助函数 (保持不变) ---
+def _save_csv_sync(record_dict):
+    df_new = pd.DataFrame([record_dict])
+    if not os.path.exists(DATA_FILE):
+        df_new.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
+    else:
+        df_new.to_csv(DATA_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
+
+async def save_record(record_dict):
+    async with data_lock:
+        await asyncio.to_thread(_save_csv_sync, record_dict)
+
+# --- 役种列表 (保持不变) ---
 YAKU_1_HAN = [
     ("立直 (Riichi)", "立直"), ("一发 (Ippatsu)", "一发"), ("门前清自摸 (Menzen Tsumo)", "门前清自摸"),
     ("断幺九 (Tanyao)", "断幺九"), ("平和 (Pinfu)", "平和"), ("一帕口 (Iipeiko)", "一帕口"),
@@ -17,14 +28,12 @@ YAKU_1_HAN = [
     ("役牌: 场风 (Seat Wind)", "役牌:场风"), ("役牌: 自风 (Prevalent Wind)", "役牌:自风"),
     ("岭上开花 (Rinshan)", "岭上开花"), ("抢杠 (Chankan)", "抢杠"), ("海底/河底 (Haitei/Houtei)", "海底/河底")
 ]
-
 YAKU_2_HAN = [
     ("三色同顺 (Sanshoku Doujun)", "三色同顺"), ("一气通贯 (Itsu)", "一气通贯"), ("混全带幺九 (Chanta)", "混全带幺九"),
     ("七对子 (Chiitoitsu)", "七对子"), ("对对和 (Toitoi)", "对对和"), ("三暗刻 (San Ankou)", "三暗刻"),
     ("三色同刻 (Sanshoku Doukou)", "三色同刻"), ("三杠子 (San Kantsu)", "三杠子"), 
     ("小三元 (Shousangen)", "小三元"), ("混老头 (Honroutou)", "混老头")
 ]
-
 YAKU_HIGH = [
     ("二帕口 (Ryanpeiko)", "二帕口"), ("混一色 (Honitsu)", "混一色"), ("纯全带幺九 (Junchan)", "纯全带幺九"),
     ("清一色 (Chinitsu)", "清一色"), 
@@ -34,22 +43,16 @@ YAKU_HIGH = [
     ("九莲宝灯 (Chuuren Poutou)", "九莲宝灯"), ("天和/地和 (Tenhou/Chiihou)", "天和/地和")
 ]
 
-def save_record(record_dict):
-    """保存数据到 CSV"""
-    df_new = pd.DataFrame([record_dict])
-    if not os.path.exists(DATA_FILE):
-        df_new.to_csv(DATA_FILE, index=False, encoding='utf-8-sig')
-    else:
-        df_new.to_csv(DATA_FILE, mode='a', header=False, index=False, encoding='utf-8-sig')
-
 # ==========================================
-# 1. 【核心改动】最终确认点数的弹窗
+# 1. FinalScoreModal (修改：接收 win_type)
 # ==========================================
 class FinalScoreModal(Modal):
-    def __init__(self, parent_view, selected_yaku):
-        super().__init__(title="和牌结算 (Win Settlement)")
+    def __init__(self, parent_view, selected_yaku, win_type):
+        # win_type 会是 "自摸" 或 "荣和"
+        super().__init__(title=f"{win_type}结算 (Settlement)")
         self.parent_view = parent_view 
         self.selected_yaku = selected_yaku 
+        self.win_type = win_type # ✅ 新增：记录赢牌方式
         
         # 1. 点数 (必填)
         self.points_input = TextInput(
@@ -60,33 +63,24 @@ class FinalScoreModal(Modal):
         )
         self.add_item(self.points_input)
 
-        # 2. 宝牌数量 (选填)
+        # 2. 宝牌数量
         self.dora_input = TextInput(
             label="宝牌数 (Dora Count)", 
-            placeholder="输入张数 (0-13)", 
-            required=False, 
-            default="0",
-            max_length=2
+            placeholder="0", required=False, default="0", max_length=2
         )
         self.add_item(self.dora_input)
 
-        # 3. 赤宝牌数量 (选填)
+        # 3. 赤宝牌数量
         self.aka_input = TextInput(
             label="赤宝牌数 (Red Dora Count)", 
-            placeholder="输入张数 (0-3)", 
-            required=False, 
-            default="0",
-            max_length=1
+            placeholder="0", required=False, default="0", max_length=1
         )
         self.add_item(self.aka_input)
 
-        # 4. 里宝牌数量 (选填)
+        # 4. 里宝牌数量
         self.ura_input = TextInput(
             label="里宝牌数 (Ura Dora Count)", 
-            placeholder="输入张数 (立直后可选)", 
-            required=False, 
-            default="0",
-            max_length=2
+            placeholder="0", required=False, default="0", max_length=2
         )
         self.add_item(self.ura_input)
 
@@ -94,39 +88,43 @@ class FinalScoreModal(Modal):
         try:
             points = int(self.points_input.value)
             
-            # --- 处理 Dora 数量 ---
-            # 如果输入为空或者非数字，默认为 0
+            # Dora 处理
             dora_count = int(self.dora_input.value) if self.dora_input.value.isdigit() else 0
             aka_count = int(self.aka_input.value) if self.aka_input.value.isdigit() else 0
             ura_count = int(self.ura_input.value) if self.ura_input.value.isdigit() else 0
             
-            # 将 Dora 信息添加到役种列表里
+            # --- 构造详细信息 ---
             final_yaku_list = self.selected_yaku.copy()
+            
+            # ✅ 关键修改：把【自摸】或【荣和】加到役种列表的最前面
+            # 这样 CSV 的 details 列看起来像： "【自摸】, 立直, 平和, 宝牌x2"
+            final_yaku_list.insert(0, f"【{self.win_type}】")
+
             if dora_count > 0: final_yaku_list.append(f"宝牌x{dora_count}")
             if aka_count > 0: final_yaku_list.append(f"赤宝牌x{aka_count}")
             if ura_count > 0: final_yaku_list.append(f"里宝牌x{ura_count}")
             
-            yaku_str = ", ".join(final_yaku_list) if final_yaku_list else "无役/Only Dora"
+            yaku_str = ", ".join(final_yaku_list)
             
+            # 回传给主界面记录
             await self.parent_view.origin_view.record_win(
-                interaction, points, yaku_str
+                interaction, points, yaku_str, self.win_type
             )
         except ValueError:
             await interaction.response.send_message("❌ 错误：请输入有效的数字！", ephemeral=True)
 
 # ==========================================
-# 2. 役种选择界面 (View)
+# 2. YakuSelectView (修改：拆分按钮)
 # ==========================================
 class YakuSelectView(View):
     def __init__(self, origin_view):
         super().__init__(timeout=300)
         self.origin_view = origin_view 
-        self.selected_yaku = [] 
         
-        # Dora 现在不在菜单里了，菜单只用来选“名字”
-        self.add_yaku_select(YAKU_1_HAN, "1番 (Dora在下一步填)...", 1)
-        self.add_yaku_select(YAKU_2_HAN, "2番/3番 (可多选)...", 2)
-        self.add_yaku_select(YAKU_HIGH, "满贯/役满 (可多选)...", 3)
+        # 役种下拉菜单 (Rows 0, 1, 2)
+        self.add_yaku_select(YAKU_1_HAN, "1番 (Dora在下一步填)...", 0)
+        self.add_yaku_select(YAKU_2_HAN, "2番/3番 (可多选)...", 1)
+        self.add_yaku_select(YAKU_HIGH, "满贯/役满 (可多选)...", 2)
 
     def add_yaku_select(self, yaku_list, placeholder, row):
         options = [discord.SelectOption(label=name, value=val) for name, val in yaku_list]
@@ -137,18 +135,30 @@ class YakuSelectView(View):
     async def yaku_callback(self, interaction: discord.Interaction):
         await interaction.response.defer()
 
-    @discord.ui.button(label="下一步: 输入点数 & Dora", style=discord.ButtonStyle.success, row=4)
-    async def confirm_btn(self, interaction: discord.Interaction, button: Button):
-        self.selected_yaku = []
+    def get_selected_yaku(self):
+        """辅助函数：收集所有选中的役种"""
+        selected = []
         for child in self.children:
             if isinstance(child, Select) and child.values:
-                self.selected_yaku.extend(child.values)
-        
-        # 弹出包含 Dora 输入框的 Modal
-        await interaction.response.send_modal(FinalScoreModal(self, self.selected_yaku))
+                selected.extend(child.values)
+        return selected
+
+    # ✅ 新增按钮 1: 自摸 (绿色)
+    @discord.ui.button(label="自摸 (Tsumo)", style=discord.ButtonStyle.success, row=3)
+    async def btn_tsumo(self, interaction: discord.Interaction, button: Button):
+        selected = self.get_selected_yaku()
+        # 弹出 Modal，并标记 win_type="自摸"
+        await interaction.response.send_modal(FinalScoreModal(self, selected, "自摸"))
+
+    # ✅ 新增按钮 2: 荣和 (蓝色)
+    @discord.ui.button(label="荣和 (Ron)", style=discord.ButtonStyle.primary, row=3)
+    async def btn_ron(self, interaction: discord.Interaction, button: Button):
+        selected = self.get_selected_yaku()
+        # 弹出 Modal，并标记 win_type="荣和"
+        await interaction.response.send_modal(FinalScoreModal(self, selected, "荣和"))
 
 # ==========================================
-# 3. 普通点数弹窗 (点炮/自摸用)
+# 3. SimplePointsModal (保持不变)
 # ==========================================
 class SimplePointsModal(Modal):
     def __init__(self, title, action_type, session_view):
@@ -166,7 +176,7 @@ class SimplePointsModal(Modal):
             await interaction.response.send_message("❌ 请输入有效的数字！", ephemeral=True)
 
 # ==========================================
-# 4. 游戏主控制面板 (增加副露状态)
+# 4. GameSessionView (修改：record_win)
 # ==========================================
 class GameSessionView(View):
     def __init__(self, player_name, seat, user_id):
@@ -179,7 +189,7 @@ class GameSessionView(View):
         self.round_num = 1
         self.honba = 0
         self.riichi_status = False 
-        self.is_open_hand = False  # 副露状态
+        self.is_open_hand = False  
         
         self.update_buttons()
 
@@ -264,12 +274,15 @@ class GameSessionView(View):
     async def action_win_step1(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id: return
         await interaction.response.send_message(
-            "🀄 **请选择役种:**\nDora 数量将在下一步输入。",
+            "🀄 **请选择役种:**\n选完后，请点击下方按钮选择 **自摸** 或 **荣和**。",
             view=YakuSelectView(origin_view=self),
             ephemeral=True
         )
 
-    async def record_win(self, interaction, points, yaku_str):
+    # ✅ 修改：接收 win_type 参数
+    async def record_win(self, interaction, points, yaku_str, win_type):
+        # 我们依然将 action 记为 "和牌"，但把 "自摸/荣和" 放在了 yaku_str (details) 里
+        # 这样做是为了兼容之前的统计逻辑
         await self.record_action(interaction, "和牌", points, yaku_str)
 
     async def action_deal_in(self, interaction: discord.Interaction):
@@ -302,7 +315,7 @@ class GameSessionView(View):
         
         desc = f"**{action_type}** | **{points}**点"
         if details != "N/A" and details != "流局/听牌":
-            desc += f"\n役种: {details}"
+            desc += f"\n役种: {details}" # 这里会显示 "【自摸】, 立直, ..."
         
         status_text = []
         if self.riichi_status: status_text.append("🔴立直")
@@ -317,6 +330,7 @@ class GameSessionView(View):
         else:
              await interaction.response.send_message(embed=embed, ephemeral=True)
 
+    # --- 局数流转 (保持不变) ---
     async def next_renchan(self, interaction: discord.Interaction):
         if interaction.user.id != self.user_id: return
         self.honba += 1
@@ -346,6 +360,9 @@ class GameSessionView(View):
         await interaction.response.edit_message(content="🛑 记录结束。", view=None, embed=None)
         self.stop()
 
+# ==========================================
+# 5. SeatSelectView (保持不变)
+# ==========================================
 class SeatSelectView(View):
     def __init__(self, player_name, user_id):
         super().__init__()

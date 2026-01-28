@@ -1462,6 +1462,8 @@ def _calculate_nine_gates_fan(
     win_flag: int,
     fan_table: List[int],
 ) -> bool:
+    if not is_numbered_suit_quick(win_tile):
+        return False
     s = None
     r = None
     heavenly = seat_wind == Wind.EAST and (win_flag & (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)) == (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)
@@ -1885,3 +1887,9 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
         fan_table[FLOWER_TILES] = calculate_param.flower_count
 
     return max_fan
+
+"""
+TODO: Add a match count mode. In this mode, the hand will be counted in the player's database, which can show how many
+ fan they roned in their lifetime based on their hand. This should include buttons: pass, ting pai (a switch), fangchong,
+ ron (which will count fan based on their current setting), zimo-ed. 
+"""

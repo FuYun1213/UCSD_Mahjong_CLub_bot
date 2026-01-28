@@ -1,7 +1,3 @@
-"""
-CLI test helper for MCR fan calculation using the exact rules ported from C++.
-"""
-
 from __future__ import annotations
 
 import argparse

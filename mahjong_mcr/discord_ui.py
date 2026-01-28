@@ -14,6 +14,7 @@ from .tile import (
     make_pack,
     string_to_tile,
     tile_to_string,
+    pack_get_offer,
     pack_get_tile,
     pack_get_type,
     tile_get_rank,
@@ -72,13 +73,32 @@ def _pack_tiles(pack: int) -> List[int]:
     return []
 
 
+def _tiles_to_pack_string(tiles: List[int]) -> str:
+    if not tiles:
+        return ""
+    token = tile_to_string(tiles[0])
+    if len(token) == 1:
+        return "".join(tile_to_string(t) for t in tiles)
+    suit = token[1]
+    ranks = "".join(tile_to_string(t)[0] for t in tiles)
+    return f"{ranks}{suit}"
+
+
 def _format_packs(packs: List[int]) -> str:
     if not packs:
         return "[]"
     groups = []
     for pack in packs:
         tiles = _pack_tiles(pack)
-        text = "".join(_tile_display(tile_to_string(t)) for t in tiles)
+        pack_type = pack_get_type(pack)
+        offer = pack_get_offer(pack)
+        text = _tiles_to_pack_string(tiles)
+        if pack_type in (PACK_TYPE_CHOW, PACK_TYPE_PUNG):
+            if offer != 1:
+                text = f"{text}{offer}"
+        elif pack_type == PACK_TYPE_KONG:
+            if offer != 0:
+                text = f"{text}{offer}"
         groups.append(f"[{text}]")
     return " ".join(groups)
 
@@ -100,7 +120,7 @@ class FlowerModal(Modal):
             await interaction.response.send_message("花牌数范围 0-8。", ephemeral=True)
             return
         self.parent_view.parent_view.flower_count = count
-        await self.parent_view.parent_view.refresh(interaction, notice="花牌数已更新。")
+        await self.parent_view.parent_view.refresh(interaction, notice="花牌数已更新。", use_settings=True)
 
 
 class McrSettingsView(View):
@@ -111,12 +131,13 @@ class McrSettingsView(View):
         self.add_item(_WindSelect("门风", row=0, is_seat=True, parent=self))
         self.add_item(_WindSelect("圈风", row=1, is_seat=False, parent=self))
 
-        self.add_item(_ToggleButton("自摸", row=2, flag=WIN_FLAG_SELF_DRAWN, parent=self))
-        self.add_item(_ToggleButton("绝张", row=2, flag=WIN_FLAG_LAST_TILE, parent=self))
-        self.add_item(_ToggleButton("起手", row=2, flag=WIN_FLAG_INITIAL, parent=self))
+        flags = self.parent_view.win_flag
+        self.add_item(_ToggleButton("自摸", row=2, flag=WIN_FLAG_SELF_DRAWN, parent=self, active=bool(flags & WIN_FLAG_SELF_DRAWN)))
+        self.add_item(_ToggleButton("绝张", row=2, flag=WIN_FLAG_LAST_TILE, parent=self, active=bool(flags & WIN_FLAG_LAST_TILE)))
+        self.add_item(_ToggleButton("起手", row=2, flag=WIN_FLAG_INITIAL, parent=self, active=bool(flags & WIN_FLAG_INITIAL)))
 
-        self.add_item(_ToggleButton("杠相关", row=3, flag=WIN_FLAG_KONG_INVOLVED, parent=self))
-        self.add_item(_ToggleButton("海底", row=3, flag=WIN_FLAG_WALL_LAST, parent=self))
+        self.add_item(_ToggleButton("杠相关", row=3, flag=WIN_FLAG_KONG_INVOLVED, parent=self, active=bool(flags & WIN_FLAG_KONG_INVOLVED)))
+        self.add_item(_ToggleButton("海底", row=3, flag=WIN_FLAG_WALL_LAST, parent=self, active=bool(flags & WIN_FLAG_WALL_LAST)))
 
         self.add_item(_ActionButton("花牌", row=4, action="flowers", parent=self))
         self.add_item(_ActionButton("清空", row=4, action="clear", parent=self))
@@ -142,19 +163,20 @@ class _WindSelect(discord.ui.Select):
             self.parent_view.parent_view.seat_wind = wind
         else:
             self.parent_view.parent_view.prevalent_wind = wind
-        await self.parent_view.parent_view.refresh(interaction, notice="风位已更新。")
+        await self.parent_view.parent_view.refresh(interaction, notice="风位已更新。", use_settings=True)
 
 
 class _ToggleButton(Button):
-    def __init__(self, label: str, row: int, flag: int, parent: McrSettingsView):
-        super().__init__(label=label, style=discord.ButtonStyle.secondary, row=row)
+    def __init__(self, label: str, row: int, flag: int, parent: McrSettingsView, active: bool):
+        style = discord.ButtonStyle.danger if active else discord.ButtonStyle.secondary
+        super().__init__(label=label, style=style, row=row)
         self.flag = flag
         self.parent_view = parent
 
     async def callback(self, interaction: discord.Interaction):
         parent = self.parent_view.parent_view
         parent.win_flag ^= self.flag
-        await parent.refresh(interaction, notice="标记已更新。")
+        await parent.refresh(interaction, notice="标记已更新。", use_settings=True)
 
 
 class _ActionButton(Button):
@@ -170,7 +192,7 @@ class _ActionButton(Button):
             return
         if self.action == "clear":
             parent.reset_state()
-            await parent.refresh(interaction, notice="已清空。")
+            await parent.refresh(interaction, notice="已清空。", use_settings=True)
             return
         if self.action == "flowers":
             await interaction.response.send_modal(FlowerModal(self.parent_view))
@@ -238,6 +260,8 @@ class McrCalculatorView(View):
         self.prevalent_wind = Wind.EAST
         self.seat_wind = Wind.EAST
         self.flower_count = 0
+        self._waits_cache_key: Optional[tuple] = None
+        self._waits_cache_text: str = ""
         self.rebuild_items()
 
     def reset_state(self) -> None:
@@ -251,6 +275,8 @@ class McrCalculatorView(View):
         self.prevalent_wind = Wind.EAST
         self.seat_wind = Wind.EAST
         self.flower_count = 0
+        self._waits_cache_key = None
+        self._waits_cache_text = ""
         self.rebuild_items()
 
     def rebuild_items(self) -> None:
@@ -404,10 +430,23 @@ class McrCalculatorView(View):
         max_tiles = 13 - self.pack_count * 3
         if len(self.hand_tiles) != max_tiles:
             return ""
+        key = (
+            tuple(sorted(self.hand_tiles)),
+            tuple(self.fixed_packs),
+            self.pack_count,
+            self.win_flag,
+            self.prevalent_wind,
+            self.seat_wind,
+            self.flower_count,
+        )
+        if key == self._waits_cache_key:
+            return self._waits_cache_text
         hand = HandTiles(self.fixed_packs, self.pack_count, list(self.hand_tiles), len(self.hand_tiles))
         useful = [False] * 0x48
         if not is_waiting(hand, useful):
-            return "听牌：未听牌"
+            self._waits_cache_key = key
+            self._waits_cache_text = "听牌：未听牌"
+            return self._waits_cache_text
         parts = []
         for t in ALL_TILES:
             if not useful[t]:
@@ -424,10 +463,15 @@ class McrCalculatorView(View):
             total_fan = calculate_fan(param, fan_table)
             label = _tile_display(tile_to_string(t))
             if total_fan < 0:
-                parts.append(f"{label}(诈和)")
-            else:
-                parts.append(f"{label}({total_fan}番)")
-        return "听牌：" + " ".join(parts)
+                continue
+            parts.append(f"{label}({total_fan}番)")
+        if not parts:
+            self._waits_cache_key = key
+            self._waits_cache_text = "听牌：未听牌"
+            return self._waits_cache_text
+        self._waits_cache_key = key
+        self._waits_cache_text = "听牌：" + " ".join(parts)
+        return self._waits_cache_text
 
     async def refresh(self, interaction: discord.Interaction, notice: Optional[str] = None, use_settings: bool = False) -> None:
         content = self.render_status()

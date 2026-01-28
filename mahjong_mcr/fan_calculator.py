@@ -177,7 +177,7 @@ FAN_VALUE_TABLE = [
     48, 48,
     32, 32, 32,
     24, 24, 24, 24, 24, 24, 24, 24, 24,
-    16, 16, 16, 16, 16, 16,
+    16, 32, 16, 16, 16, 16,
     12, 12, 12, 12, 12,
     8, 8, 8, 8, 8, 8, 8, 8, 8,
     6, 6, 6, 6, 6, 6, 6,
@@ -187,7 +187,7 @@ FAN_VALUE_TABLE = [
     1,
     5,
     8, 8, 8, 8,
-    32, 16, 88, 8,
+    16, 12, 88, 8,
 ]
 
 
@@ -1238,6 +1238,16 @@ def _final_adjust(fan_table: List[int]) -> None:
         fan_table[DOUBLE_PUNG] = 0
     if fan_table[SEVEN_PAIRS] or fan_table[TWICE_PURE_DOUBLE_CHOWS]:
         fan_table[DOUBLE_PUNG] = 0
+    if fan_table[TWICE_PURE_DOUBLE_CHOWS]:
+        fan_table[PURE_DOUBLE_CHOW] = 0
+        if fan_table[MIXED_DOUBLE_CHOW] > 1:
+            fan_table[MIXED_DOUBLE_CHOW] = 1
+        if fan_table[SHORT_STRAIGHT] > 1:
+            fan_table[SHORT_STRAIGHT] = 1
+        if fan_table[TWO_TERMINAL_CHOWS] > 1:
+            fan_table[TWO_TERMINAL_CHOWS] = 1
+        fan_table[CONCEALED_HAND] = 0
+        fan_table[FULLY_CONCEALED_HAND] = 0
 
     if fan_table[LITTLE_FOUR_WINDS]:
         fan_table[PUNG_OF_TERMINALS_OR_HONORS] = 0
@@ -1283,6 +1293,7 @@ def _final_adjust(fan_table: List[int]) -> None:
     if fan_table[THREE_SUITED_TERMINAL_CHOWS]:
         fan_table[ALL_CHOWS] = 0
         fan_table[NO_HONORS] = 0
+        fan_table[MIRROR_HAND] = 0
     if fan_table[ALL_FIVE]:
         fan_table[ALL_SIMPLES] = 0
         fan_table[NO_HONORS] = 0
@@ -1407,23 +1418,29 @@ def _calculate_special_form_fan(
 ) -> bool:
     if _is_seven_pairs(standing_table):
         s = tile_get_suit(win_tile)
-        twice = _is_twice_pure_double_chows(standing_table)
         if _is_seven_shifted_pairs(standing_table, s):
             fan_table[SEVEN_SHIFTED_PAIRS] = 1
             if standing_table[make_tile(s, 1)] == 0 and standing_table[make_tile(s, 9)] == 0:
                 fan_table[ALL_SIMPLES] = 1
             _adjust_by_win_flag_4_special_form(seat_wind, win_flag, fan_table)
         else:
-            if twice:
-                fan_table[TWICE_PURE_DOUBLE_CHOWS] = 1
-            else:
-                fan_table[SEVEN_PAIRS] = 1
+            fan_table[SEVEN_PAIRS] = 1
             _adjust_by_suits(unique_tiles, fan_table)
             _adjust_by_tiles_traits(unique_tiles, fan_table)
             _adjust_by_rank_range(unique_tiles, fan_table)
             _adjust_by_tiles_hog(standing_table, 0, fan_table)
             _adjust_by_win_flag_4_special_form(seat_wind, win_flag, fan_table)
             _final_adjust(fan_table)
+
+            temp_table = list(standing_table)
+            result = _divide_win_hand(temp_table, [], 0)
+            for div in result.divisions:
+                chow_packs = [p for p in div.packs[:4] if pack_get_type(p) == PACK_TYPE_CHOW]
+                if len(chow_packs) == 4:
+                    mid_tiles = sorted(pack_get_tile(p) for p in chow_packs)
+                    if mid_tiles[0] == mid_tiles[1] and mid_tiles[2] == mid_tiles[3] and mid_tiles[0] != mid_tiles[2]:
+                        fan_table[TWICE_PURE_DOUBLE_CHOWS] = 1
+                        break
         return True
 
     if _calculate_honors_and_knitted_tiles(unique_tiles, fan_table):
@@ -1537,6 +1554,7 @@ def _calculate_regular_fan(
     win_flag: int,
     fan_table: List[int],
 ) -> None:
+    fixed_cnt = calculate_param.hand_tiles.pack_count
     pair_pack = 0
     chow_packs: List[int] = []
     pung_packs: List[int] = []
@@ -1606,6 +1624,8 @@ def _calculate_regular_fan(
         else:
             mid_tiles = sorted(pack_get_tile(p) for p in chow_packs)
             _calculate_4_chows(mid_tiles, fan_table)
+            if mid_tiles[0] == mid_tiles[1] and mid_tiles[2] == mid_tiles[3] and mid_tiles[0] != mid_tiles[2]:
+                fan_table[TWICE_PURE_DOUBLE_CHOWS] = 1
     elif chow_cnt == 3:
         mid_tiles = sorted(pack_get_tile(p) for p in chow_packs)
         _calculate_3_chows(mid_tiles, fan_table)
@@ -1621,10 +1641,9 @@ def _calculate_regular_fan(
         mid_tiles = sorted(pack_get_tile(p) for p in pung_packs)
         _calculate_4_pungs(mid_tiles, fan_table)
 
-    if _is_mirror_hand(packs, pair_pack):
-        fan_table[MIRROR_HAND] = 1
-
-    fixed_cnt = calculate_param.hand_tiles.pack_count
+    if fan_table[TWICE_PURE_DOUBLE_CHOWS] == 0:
+        if _is_mirror_hand(packs, pair_pack):
+            fan_table[MIRROR_HAND] = 1
 
     _adjust_by_self_drawn(packs, fixed_cnt, (win_flag & WIN_FLAG_SELF_DRAWN) != 0, fan_table)
 
@@ -1835,7 +1854,7 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
         if _calculate_knitted_straight_fan(fixed_table, standing_table, calculate_param, win_flag, tmp_table):
             max_fan = _get_fan_by_table(tmp_table)
 
-    if max_fan == 0 or tmp_table[SEVEN_PAIRS] == 1 or tmp_table[TWICE_PURE_DOUBLE_CHOWS] == 1:
+    if max_fan == 0 or tmp_table[SEVEN_PAIRS] == 1:
         heavenly = calculate_param.seat_wind == Wind.EAST and fixed_cnt == 0 and (win_flag & (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)) == (WIN_FLAG_INITIAL | WIN_FLAG_SELF_DRAWN)
         unique_waiting = (not heavenly) and _is_unique_waiting(standing_table, standing_cnt, win_tile)
 
@@ -1850,7 +1869,7 @@ def calculate_fan(calculate_param: CalculateParam, fan_table: Optional[List[int]
                     max_fan = current_fan
                     selected = current_table
                 elif current_fan == max_fan:
-                    if current_table[PURE_TRIPLE_CHOW] == 1 or tmp_table[SEVEN_PAIRS] == 1 or tmp_table[TWICE_PURE_DOUBLE_CHOWS] == 1 or current_table[TRIPLE_PUNG]:
+                    if current_table[PURE_TRIPLE_CHOW] == 1 or tmp_table[SEVEN_PAIRS] == 1 or current_table[TRIPLE_PUNG]:
                         selected = current_table
             if fan_table is not None and selected is not None:
                 tmp_table = selected

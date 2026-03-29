@@ -22,8 +22,8 @@ class QuarterUpdate(commands.Cog):
 
     @app_commands.command(name="quarter_end", description="[Admin Only] 赛季结算与表格更新")
     @app_commands.describe(
-        current_quarter="当前赛季名字 (如: 2024Q1)",
-        next_quarter="下个赛季名字 (如: 2024Q2)"
+        current_quarter="当前赛季名字 (example: 24 Fall)",
+        next_quarter="下个赛季名字 (example :25 Spring )"
     )
     # ✅ 权限控制：只有 Discord 服务器管理员可用
     @app_commands.default_permissions(administrator=True) 
@@ -39,24 +39,36 @@ class QuarterUpdate(commands.Cog):
             # ---------------------------------------------------------
             # 1. 复制并重命名表格 (Duplicate and Rename Sheets)
             # ---------------------------------------------------------
+           # ---------------------------------------------------------
+            # 1. 复制并重命名表格，同时冻结数据 (Duplicate and Freeze)
+            # ---------------------------------------------------------
             ws_ranking = self.sh.worksheet("Ranking Quarter")
             ws_personal = self.sh.worksheet("Personal Data Quarter")
 
-            # 复制表格 (如果已存在同名表格会报错，我们用 try-except 捕获)
             try:
-                self.sh.duplicate_sheet(ws_ranking.id, new_sheet_name=f"{current_quarter} Ranking")
-                self.sh.duplicate_sheet(ws_personal.id, new_sheet_name=f"{current_quarter} Personal Data")
+                # 复制出新表格，并拿到新表格的控制权
+                new_ranking = self.sh.duplicate_sheet(ws_ranking.id, new_sheet_name=f"{current_quarter} Ranking")
+                new_personal = self.sh.duplicate_sheet(ws_personal.id, new_sheet_name=f"{current_quarter} Personal Data")
+                
+                # 🥶 核心修复：冻结数据（把公式变成死数据）
+                # 读取当前的计算结果
+                ranking_data = new_ranking.get_all_values()
+                personal_data = new_personal.get_all_values()
+                
+                # 重新写回去，覆盖掉原本的公式
+                new_ranking.update(values=ranking_data, range_name='A1')
+                new_personal.update(values=personal_data, range_name='A1')
+
             except Exception as e:
                 if "already exists" in str(e).lower():
-                    await interaction.followup.send(f"⚠️ 警告: `{current_quarter}` 相关的备份表格已经存在，无法重复复制！")
+                    await interaction.followup.send(f"⚠️ 警告: `{current_quarter}` 相关的备份表格已经存在！请去表格里手动删除它们再重试。")
                     return
                 raise e
-
             # ---------------------------------------------------------
             # 2. 找到 'Games/pt' 的空行并打上新赛季标记 (Find empty row & mark)
             # 注意: 你的公式里写的是 'Games/pt'，如果表名叫 'Games Riichi' 请修改这里
             # ---------------------------------------------------------
-            ws_games = self.sh.worksheet("Games/pt")
+            ws_games = self.sh.worksheet("Games Riichi")
             
             # 获取所有数据，找到第一行空行的行号
             all_values = ws_games.get_all_values()

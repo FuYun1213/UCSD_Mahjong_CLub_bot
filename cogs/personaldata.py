@@ -164,11 +164,11 @@ def get_personal_stats_from_sheet(sh, target_name, sheet_name, start_row=1):
             return {
                 "avg_place": row[3] if len(row) > 3 else "N/A",
                 "avg_point": row[6] if len(row) > 6 else "N/A",
-                "count_1st": row[10] if len(row) > 10 else "N/A",
-                "count_2nd": row[11] if len(row) > 11 else "N/A",
-                "count_3rd": row[12] if len(row) > 12 else "N/A",
-                "count_4th": row[13] if len(row) > 13 else "N/A",
-                "total_games": row[14] if len(row) > 14 else "N/A",
+                "count_1st": row[11] if len(row) > 11 else "N/A",
+                "count_2nd": row[12] if len(row) > 12 else "N/A",
+                "count_3rd": row[13] if len(row) > 13 else "N/A",
+                "count_4th": row[14] if len(row) > 14 else "N/A",
+                "total_games": row[15] if len(row) > 15 else "N/A",
                 "source_sheet": sheet_name,
             }
     return None

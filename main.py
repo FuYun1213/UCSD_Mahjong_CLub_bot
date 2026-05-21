@@ -11,6 +11,7 @@ from discord import app_commands
 from typing import List
 from discord.ext import tasks
 from discord.ui import View, Button, Select, Modal, TextInput
+from bot_action_log import record_action
 # --- 1. 配置区域 ---
 # ⚠️ 请确保您的 .env 文件名正确，如果是 .env 只需要 load_dotenv()
 load_dotenv('DISCORD_BOT_TOKEN.env') 
@@ -19,6 +20,7 @@ SHEET_ID = "1Ce5k2Blbf5MYXbM4rSTeWHOf2uTHPrvZX6vm6Cdyc5Q"
 JSON_KEYFILE = 'credentials.json'
 # ⚠️ 请替换为您服务器的真实ID
 GUILD_ID = discord.Object(id=1278056421224747162) 
+WWYD_GUILD_ID = discord.Object(id=1323725275950878840)
 data_lock = asyncio.Lock()
 
 # --- 2. 连接 Google Cloud ---
@@ -61,6 +63,7 @@ def update_player_cache():
 # --- 4. 机器人核心类定义 ---
 intents = discord.Intents.default()
 intents.message_content = True # 必须开启，否则无法读取消息内容
+intents.members = True
 
 class MyBot(commands.Bot):
     def __init__(self):
@@ -71,11 +74,20 @@ class MyBot(commands.Bot):
         await self.load_extension("cogs.quarterupdate")
         await self.load_extension("cogs.personaldata")
         await self.load_extension("cogs.recordgame")
+        await self.load_extension("cogs.revert")
+        await self.load_extension("cogs.replaymonitor")
+        await self.load_extension("cogs.versus")
+        await self.load_extension("cogs.wwydtracker")
         print("✅ 模块加载完成 (Cogs loaded)！")
 
+        # Copy the freshly loaded global cog commands into the main guild first.
         self.tree.copy_global_to(guild=GUILD_ID)
-
         await self.tree.sync(guild=GUILD_ID)
+        await self.tree.sync(guild=WWYD_GUILD_ID)
+
+        # Then delete stale global commands from Discord so duplicates do not appear.
+        self.tree.clear_commands(guild=None)
+        await self.tree.sync()
         print(f"✅ 指令已同步 (Synced to Guild)！")
         
 
@@ -218,114 +230,6 @@ async def player_name_autocomplete(
         if current.lower() in name.lower()
     ]
     return choices[:25]
-# --- 1.2 获取两人对决数据的函数 (显示真实名字版) ---
-# --- 1.2 获取两人对决数据的函数 (含大胜/踩头统计) ---
-def get_versus_data(player_a, player_b):
-    try:
-        sh = gc.open_by_key(SHEET_ID)
-        ws = sh.worksheet("Games Riichi")
-        rows = ws.get_all_values()
-        
-        p1 = player_a.lower().strip()
-        p2 = player_b.lower().strip()
-        
-        if p1 == p2:
-            return None, "请输入两个不同的名字。"
-
-        stats = {
-            "total_matches": 0,
-            "p1_stats": {"wins": 0, "big_wins": 0, "stomps": 0, "weighted_score": 0},
-            "p2_stats": {"wins": 0, "big_wins": 0, "stomps": 0, "weighted_score": 0},
-            "p1_pt_diff": 0.0, # 使用 PT 做分差
-            "recent_record": [] 
-        }
-
-        last_game_signature = ""
-
-        for row in rows[1:]:
-            if len(row) < 8: continue 
-            
-            # --- 去重 ---
-            current_signature = "".join([str(x).strip().lower() for x in row[0:8]])
-            if current_signature == last_game_signature:
-                continue
-            last_game_signature = current_signature
-            
-            # 获取玩家列表
-            current_players = [n.lower().strip() for n in row[0:4]]
-            
-            if p1 in current_players and p2 in current_players:
-                stats["total_matches"] += 1
-                
-                # 1. 获取本局 4 个人的分数，算出排名
-                # 注意：这里用 Raw Score (4-7列) 来算绝对排名最稳妥
-                scores_for_rank = []
-                for i in range(4):
-                    try:
-                        s = float(row[4+i])
-                    except: s = -999999
-                    scores_for_rank.append(s)
-                
-                # 找到 A 和 B 在本局的得分
-                idx_1 = current_players.index(p1)
-                idx_2 = current_players.index(p2)
-                score_val_1 = scores_for_rank[idx_1]
-                score_val_2 = scores_for_rank[idx_2]
-                
-                # 2. 计算排名 (1-4)
-                # 逻辑：比我分高的人数 + 1 = 我的排名
-                rank_1 = sum(1 for s in scores_for_rank if s > score_val_1) + 1
-                rank_2 = sum(1 for s in scores_for_rank if s > score_val_2) + 1
-                
-                # 3. 计算 PT 差 (用于直击点差) - 抓取 8-11 列
-                try: pt_1 = float(row[4 + idx_1])
-                except: pt_1 = 0
-                try: pt_2 = float(row[4 + idx_2])
-                except: pt_2 = 0
-                stats["p1_pt_diff"] += (pt_1 - pt_2)
-
-                # 4. 判定胜负类型
-                winner = "Draw"
-                rank_diff = abs(rank_1 - rank_2)
-                
-                if rank_1 < rank_2: # P1 赢 (排名数字小=名次高)
-                    winner = player_a
-                    stats["p1_stats"]["wins"] += 1
-                    
-                    if rank_diff == 3: # 1位 vs 4位 -> 踩头
-                        stats["p1_stats"]["stomps"] += 1
-                        stats["p1_stats"]["weighted_score"] += 3 # 1+2
-                    elif rank_diff == 2: # 1位 vs 3位 / 2位 vs 4位 -> 大胜
-                        stats["p1_stats"]["big_wins"] += 1
-                        stats["p1_stats"]["weighted_score"] += 2 # 1+1
-                    else:
-                        stats["p1_stats"]["weighted_score"] += 1 # 普通胜
-
-                elif rank_2 < rank_1: # P2 赢
-                    winner = player_b
-                    stats["p2_stats"]["wins"] += 1
-                    
-                    if rank_diff == 3:
-                        stats["p2_stats"]["stomps"] += 1
-                        stats["p2_stats"]["weighted_score"] += 3
-                    elif rank_diff == 2:
-                        stats["p2_stats"]["big_wins"] += 1
-                        stats["p2_stats"]["weighted_score"] += 2
-                    else:
-                        stats["p2_stats"]["weighted_score"] += 1
-
-                stats["recent_record"].append(winner)
-                if len(stats["recent_record"]) > 5:
-                    stats["recent_record"].pop(0)
-
-        if stats["total_matches"] == 0:
-            return None, f"未找到 {player_a} 和 {player_b} 同桌记录。"
-            
-        return stats, None
-
-    except Exception as e:
-        print(f"Versus Error: {e}")
-        return None, str(e)
 # --- 1.3 获取排行榜数据的函数 ---
 def get_ranking_data(category):
     try:
@@ -599,108 +503,6 @@ async def recent_match(interaction: discord.Interaction, player_name: str):
     msg += "-----------------------------------"
     
     await interaction.edit_original_response(content=msg)
-@client.tree.command(name="versus", description="Query the match history between the two players.")
-@app_commands.describe(player_a="选手 A", player_b="选手 B")
-@app_commands.autocomplete(player_a=player_name_autocomplete, player_b=player_name_autocomplete)
-async def versus(interaction: discord.Interaction, player_a: str, player_b: str):
-    await interaction.response.defer()
-    
-    data, error = get_versus_data(player_a, player_b)
-    if data is None:
-        await interaction.followup.send(f"❌ {error}")
-        return
-        
-    s1 = data["p1_stats"]
-    s2 = data["p2_stats"]
-    total = data["total_matches"]
-    
-    # 算出平局
-    draws = total - s1["wins"] - s2["wins"]
-    
-    # --- 计算统治力 (Weighted Rate) ---
-    score1 = s1["weighted_score"]
-    score2 = s2["weighted_score"]
-    total_score = score1 + score2
-    
-    if total_score > 0:
-        rate_a = (score1 / total_score) * 100
-        rate_b = (score2 / total_score) * 100
-    else:
-        rate_a = 50
-        rate_b = 50
-        
-    # 进度条 (基于积分，而非胜场)
-    bar_len = 12
-    num_a = int((rate_a / 100) * bar_len)
-    num_b = int((rate_b / 100) * bar_len)
-    # 修正浮点误差导致的长度不足
-    if num_a + num_b < bar_len and total_score > 0:
-        if rate_a >= rate_b: num_a += 1
-        else: num_b += 1
-        
-    bar_str = "🟦" * num_a + "🟥" * num_b
-    while len(bar_str) < bar_len: bar_str += "⬜"
-
-    # 评语逻辑
-    diff_rate = abs(rate_a - rate_b)
-    leader = player_a if rate_a > rate_b else player_b
-    loser = player_b if rate_a > rate_b else player_a
-    
-    comment = "势均力敌！"
-    if total < 5: comment = "刚开始较量..."
-    elif diff_rate > 40: comment = f"{leader} 正在对 {loser} 进行降维打击！💥"
-    elif diff_rate > 20: comment = f"{leader} 掌握了绝对的统治力！"
-    elif diff_rate > 10: comment = f"{leader} 稍占上风。"
-
-    # --- 构建 Embed ---
-    embed = discord.Embed(
-        title=f"⚔️: {player_a} 🆚 {player_b}",
-        description=f"Total **{total}** Games | {comment}",
-        color=0xFF4500
-    )
-    
-    # 1. 核心胜场数据
-    embed.add_field(
-        name="📊 总胜场",
-        value=f"**{player_a}**: `{s1['wins']}` 胜\n**{player_b}**: `{s2['wins']}` 胜\n(平: {draws})",
-        inline=True
-    )
-    
-    # 2. 直击 PT 差
-    diff = data['p1_pt_diff']
-    sign = "+" if diff > 0 else ""
-    embed.add_field(
-        name="Head-to-Head Score",
-        value=f"**{player_a}** 对 B:\n`{sign}{diff:.1f}` pts",
-        inline=True
-    )
-    
-    # 3. 💥 关键数据：碾压统计 (分两列显示)
-    # A 的碾压数据
-    stomp_text_a = (
-        f"**大胜** (+2): `{s1['big_wins']}` 次\n"
-        f"**踩头** (+3): `{s1['stomps']}` 次"
-    )
-    embed.add_field(name=f"🟦 {player_a} 战绩详情", value=stomp_text_a, inline=False)
-
-    # B 的碾压数据
-    stomp_text_b = (
-        f"**大胜** (+2): `{s2['big_wins']}` 次\n"
-        f"**踩头** (+3): `{s2['stomps']}` 次"
-    )
-    embed.add_field(name=f"🟥 {player_b} 战绩详情", value=stomp_text_b, inline=False)
-    
-    # 4. 统治力进度条
-    embed.add_field(
-        name="⚖️ 统治力 (基于积分权重)",
-        value=f"{bar_str}\n`{rate_a:.1f}%` ◀── 积分占比 ──▶ `{rate_b:.1f}%`",
-        inline=False
-    )
-    
-    recent_str = " -> ".join(data["recent_record"])
-    embed.set_footer(text=f"最近5场胜者: {recent_str}")
-
-    await interaction.followup.send(embed=embed)
 from discord import app_commands # 确保引用了这个
 
 @client.tree.command(name="ranking", description="查看服务器排行榜 (MMR / PT / 场次)")
@@ -804,13 +606,25 @@ async def register(interaction: discord.Interaction, new_name: str):
         return
 
     try:
-        result_msg = await asyncio.to_thread(perform_google_sheet_registration, new_name)
-        if "成功" in result_msg:            
+        result = await asyncio.to_thread(perform_google_sheet_registration, new_name)
+        result_msg = result["message"] if isinstance(result, dict) else result
+        if "成功" in result_msg:
             # 只有当本地列表里还没有这个名字时才添加 (双重保险)
             if new_name not in PLAYER_NAME_CACHE:
                 PLAYER_NAME_CACHE.append(new_name)
                 print(f"✅ 本地缓存已手动追加: {new_name}")
-            
+            if isinstance(result, dict):
+                record_action(
+                    user_id=interaction.user.id,
+                    user_name=str(interaction.user),
+                    action_type="register",
+                    summary=f"Registered player {new_name}",
+                    payload={
+                        "ratings_row": result["row_number"],
+                        "ratings_values": result["row_values"],
+                    },
+                )
+
             await interaction.followup.send(f"✅ {result_msg}")
         else:
             await interaction.followup.send(f"❌ {result_msg}")
@@ -832,11 +646,16 @@ def perform_google_sheet_registration(player_name):
         # 准备要写入的一行数据： [名字, 初始分]
         # 假设名字在 A 列 (第1列)，分数在 B 列 (第2列)
         new_row = [player_name, 1500]
+        new_row_number = len(ws.col_values(1)) + 1
         
         # append_row 会自动寻找表格最底部的空行写入，非常方便且安全
         ws.append_row(new_row)
         
-        return f"注册成功！欢迎 **{player_name}** 加入。初始分数: 1500"
+        return {
+            "message": f"注册成功！欢迎 **{player_name}** 加入。初始分数: 1500",
+            "row_number": new_row_number,
+            "row_values": new_row,
+        }
     except Exception as e:
         print(f"写入 Google Sheet 失败: {e}")
         return f"数据库写入失败: {e}"

@@ -52,6 +52,17 @@ def format_number(value):
     return f"{number:.1f}" if number % 1 else str(int(number))
 
 
+def format_rate(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return str(value) if value not in (None, "") else "N/A"
+
+    if number <= 1:
+        number *= 100
+    return f"{number:.2f}%"
+
+
 def update_player_cache():
     global _player_name_cache
     try:
@@ -163,12 +174,18 @@ def get_personal_stats_from_sheet(sh, target_name, sheet_name, start_row=1):
         if row and row[0].strip().lower() == target_name:
             return {
                 "avg_place": row[3] if len(row) > 3 else "N/A",
+                "top2_rate": row[4] if len(row) > 4 else "N/A",
+                "highest_point": row[5] if len(row) > 5 else "N/A",
                 "avg_point": row[6] if len(row) > 6 else "N/A",
-                "count_1st": row[10] if len(row) > 10 else "N/A",
-                "count_2nd": row[11] if len(row) > 11 else "N/A",
-                "count_3rd": row[12] if len(row) > 12 else "N/A",
-                "count_4th": row[13] if len(row) > 13 else "N/A",
-                "total_games": row[14] if len(row) > 14 else "N/A",
+                "rate_1st": row[7] if len(row) > 7 else "N/A",
+                "rate_2nd": row[8] if len(row) > 8 else "N/A",
+                "rate_3rd": row[9] if len(row) > 9 else "N/A",
+                "rate_4th": row[10] if len(row) > 10 else "N/A",
+                "count_1st": row[11] if len(row) > 11 else "N/A",
+                "count_2nd": row[12] if len(row) > 12 else "N/A",
+                "count_3rd": row[13] if len(row) > 13 else "N/A",
+                "count_4th": row[14] if len(row) > 14 else "N/A",
+                "total_games": row[15] if len(row) > 15 else "N/A",
                 "source_sheet": sheet_name,
             }
     return None
@@ -363,7 +380,8 @@ class PersonalData(commands.Cog):
         player_name: str,
         quarter: Optional[str] = None,
     ):
-        await interaction.response.defer(ephemeral=False)
+        if not interaction.response.is_done():
+            await interaction.response.defer(ephemeral=False)
 
         data, error = get_personal_detailed_data(player_name, quarter)
         if data is None:
@@ -405,15 +423,22 @@ class PersonalData(commands.Cog):
             name="Total Games (Overall)",
             value=(
                 f"`{info['total_games']}` Games\n"
-                f"[1st: `{info['count_1st']}` / 2nd: `{info['count_2nd']}` / "
-                f"3rd: `{info['count_3rd']}` / 4th: `{info['count_4th']}`]"
+                f"1st: `{info['count_1st']}` (`{format_rate(info['rate_1st'])}`) / "
+                f"2nd: `{info['count_2nd']}` (`{format_rate(info['rate_2nd'])}`)\n"
+                f"3rd: `{info['count_3rd']}` (`{format_rate(info['rate_3rd'])}`) / "
+                f"4th: `{info['count_4th']}` (`{format_rate(info['rate_4th'])}`)"
             ),
             inline=False,
         )
 
         embed.add_field(
             name="Averages",
-            value=f"Avg Place: `{info['avg_place']}`\nAvg Point: `{info['avg_point']}`",
+            value=(
+                f"Avg Rank: `{info['avg_place']}`\n"
+                f"Top 2 Rate: `{format_rate(info['top2_rate'])}`\n"
+                f"Highest Point: `{info['highest_point']}`\n"
+                f"Avg Point: `{info['avg_point']}`"
+            ),
             inline=True,
         )
         embed.add_field(
@@ -437,6 +462,8 @@ class PersonalData(commands.Cog):
             embed.set_image(url=chart_url)
         else:
             embed.set_footer(text="Not enough data to generate PT chart.")
+
+        embed.set_footer(text=f"{embed.footer.text or ''} Personal Data v2".strip())
 
         await interaction.followup.send(embed=embed)
 

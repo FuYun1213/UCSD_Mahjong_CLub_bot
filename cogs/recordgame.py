@@ -8,6 +8,8 @@ import gspread
 from discord import app_commands
 from discord.ext import commands
 
+from bot_action_log import record_action
+
 
 SHEET_ID = "1Ce5k2Blbf5MYXbM4rSTeWHOf2uTHPrvZX6vm6Cdyc5Q"
 CREDENTIALS_FILE = "credentials.json"
@@ -254,11 +256,14 @@ class RecordGame(commands.Cog):
             sh = get_sheet()
 
             ws_pt = sh.worksheet("Games/pt")
-            ws_pt.append_row([final_time_str])
+            pt_row = len(ws_pt.get_all_values()) + 1
+            pt_values = [final_time_str]
+            ws_pt.append_row(pt_values)
 
             ws_riichi = sh.worksheet("Games Riichi")
             new_row = len(ws_riichi.get_all_values()) + 1
-            ws_riichi.append_row(players_ordered + scores_ordered)
+            riichi_values = players_ordered + scores_ordered
+            ws_riichi.append_row(riichi_values)
 
             yakuman_text = ", ".join(yakuman_values)
             if yakuman_winner or yakuman_deal_in or yakuman_text:
@@ -270,8 +275,28 @@ class RecordGame(commands.Cog):
             await status_msg.edit(content=f"Recorded at {final_time_str}. Waiting for Google Sheet calculation...")
             await asyncio.sleep(60)
 
+            calculated_row = ws_riichi.row_values(new_row)
+            mmr_deltas = calculated_row[8:12] if len(calculated_row) >= 12 else []
+
+            record_action(
+                user_id=interaction.user.id,
+                user_name=str(interaction.user),
+                action_type="record_game",
+                summary=f"Recorded game at {final_time_str}: {', '.join(players_ordered)}",
+                payload={
+                    "games_pt_row": pt_row,
+                    "games_pt_values": pt_values,
+                    "games_riichi_row": new_row,
+                    "games_riichi_values": riichi_values,
+                    "mmr_deltas": mmr_deltas,
+                    "yakuman_winner": yakuman_winner or "",
+                    "yakuman_deal_in": yakuman_deal_in or "",
+                    "yakuman_text": yakuman_text,
+                },
+            )
+
             post_status = get_players_status(players_ordered)
-            embed = discord.Embed(title="Game Summary", color=0x00FF00)
+            embed = discord.Embed(title="✅ 结算完成 (Game Summary)", color=0x00FF00)
             embed.description = f"**Time Recorded:** {final_time_str}"
 
             if yakuman_text:
@@ -281,7 +306,7 @@ class RecordGame(commands.Cog):
                 yakuman_line += f"\nYakuman: `{yakuman_text}`"
                 embed.add_field(name="Yakuman", value=yakuman_line, inline=False)
 
-            rank_emojis = ["1st", "2nd", "3rd", "4th"]
+            rank_emojis = ["🐶", "🥈", "🥉", "🪦"]
             for i, name in enumerate(players_ordered):
                 score = scores_ordered[i]
                 pre = pre_status.get(name, {})
@@ -297,11 +322,11 @@ class RecordGame(commands.Cog):
                 post_mmr_rank = safe_int(post.get("mmr_rank", 999))
                 mmr_rank_diff = pre_mmr_rank - post_mmr_rank
                 if mmr_rank_diff > 0:
-                    mmr_rank_icon = f"up {mmr_rank_diff}"
+                    mmr_rank_icon = f"🔺{mmr_rank_diff}"
                 elif mmr_rank_diff < 0:
-                    mmr_rank_icon = f"down {abs(mmr_rank_diff)}"
+                    mmr_rank_icon = f"🔻{abs(mmr_rank_diff)}"
                 else:
-                    mmr_rank_icon = "same"
+                    mmr_rank_icon = "➖"
                 mmr_rank = post_mmr_rank if post_mmr_rank != 999 else "??"
 
                 post_pt = safe_float(post.get("pt", 0))
@@ -314,11 +339,11 @@ class RecordGame(commands.Cog):
                 post_pt_rank = safe_int(post.get("pt_rank", 999))
                 pt_rank_diff = pre_pt_rank - post_pt_rank
                 if pt_rank_diff > 0:
-                    pt_rank_icon = f"up {pt_rank_diff}"
+                    pt_rank_icon = f"🔺{pt_rank_diff}"
                 elif pt_rank_diff < 0:
-                    pt_rank_icon = f"down {abs(pt_rank_diff)}"
+                    pt_rank_icon = f"🔻{abs(pt_rank_diff)}"
                 else:
-                    pt_rank_icon = "same"
+                    pt_rank_icon = "➖"
                 pt_rank = post_pt_rank if post_pt_rank != 999 else "??"
 
                 field_val = (

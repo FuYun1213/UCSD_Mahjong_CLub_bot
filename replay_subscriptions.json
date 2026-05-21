@@ -1,0 +1,23 @@
+{
+  "1278056421224747162:1488771447915544586:riichi_city:垒浮云": {
+    "platform": "riichi_city",
+    "game_name": "垒浮云",
+    "channel_id": 1488771447915544586,
+    "subscriber_id": 662784001005584431,
+    "last_record_id": null
+  },
+  "1278056421224747162:1488771447915544586:mahjong_soul:122321217": {
+    "platform": "mahjong_soul",
+    "game_name": "122321217",
+    "channel_id": 1488771447915544586,
+    "subscriber_id": 662784001005584431,
+    "last_record_id": "241118-64432016-7c96-45e9-8d82-25379bd5b8fa"
+  },
+  "1278056421224747162:1446237650473189460:mahjong_soul:67413001": {
+    "platform": "mahjong_soul",
+    "game_name": "67413001",
+    "channel_id": 1446237650473189460,
+    "subscriber_id": 662784001005584431,
+    "last_record_id": "210407-3fd04b16-aca3-4d7e-bbf4-ac2f9b2ed43f"
+  }
+}

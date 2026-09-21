@@ -24,4 +24,4 @@ jobs:
       - run: npm ci
       - run: npm run build:preview
       - name: Check core seating, registration and competition behavior
-        run: python -m pytest tests/test_seat_cards.py tests/test_registration_v10.py tests/test_placement_challenge.py -q
+        run: python -m pytest tests/test_seat_cards.py tests/test_registration_v10.py tests/test_placement_challenge.py tests/test_password_reset_codes.py -k "not browser" -q

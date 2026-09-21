@@ -962,32 +962,103 @@ def resolve_registered_account(data_file, target_name):
     raise ValueError("Target account is not registered or needs administrator review.")
 
 
+class PasswordResetError(ValueError):
+    def __init__(self, message, code="invalid_reset_code"):
+        super().__init__(message)
+        self.code = code
+
+
+def recovery_account_enabled(account):
+    return not (account.get("disabled") or account.get("is_active") is False
+                or account.get("status") in {"disabled", "banned", "deleted", "pending_claim"})
+
+
+def revoke_account_sessions(account, display_name):
+    account_id = str(account.get("account_id") or "")
+    for token, session_name in list(_sessions.items()):
+        if ((account_id and _session_account_ids.get(token) == account_id)
+                or normalize_name(session_name) == normalize_name(display_name)):
+            _sessions.pop(token, None)
+            _session_account_ids.pop(token, None)
+
+
 @account_mutation
 def reset_user_password(data, username):
-    if not is_super_admin(username):
-        raise PermissionError("Only super admins can reset passwords.")
-    target_name = (data.get("username") or "").strip()
-    new_password = data.get("new_password") or ""
-    if len(new_password) < 6:
-        raise ValueError("New password must be at least 6 characters.")
-
+    """Issue a code without changing the user's existing password or sessions."""
+    if not is_admin(username):
+        raise PermissionError("Only admins can issue password reset codes.")
+    if any(key in data for key in ("password", "new_password", "confirm_password")):
+        raise PasswordResetError("Administrators can only generate a reset code. Refresh this page.", "admin_password_reset_disabled")
+    target_name = data.get("username")
+    if not isinstance(target_name, str):
+        raise ValueError("Please select a registered user.")
+    registered_names.ensure_directory(USERS_FILE)
     data_file = users_data()
     target_key, display_name = resolve_registered_account(data_file, target_name)
-    salt, hashed = password_hash(new_password)
-    data_file["users"][target_key]["salt"] = salt
-    data_file["users"][target_key]["password_hash"] = hashed
+    account = data_file["users"][target_key]
+    if not recovery_account_enabled(account):
+        raise ValueError("This account is unavailable.")
+    if role_for_user(display_name) != "user" and not is_super_admin(username):
+        raise PermissionError("Only super admins can issue reset codes for administrator accounts.")
+    if data.get("user_id") is not None and str(data["user_id"]) != str(account.get("account_id")):
+        raise PasswordResetError("This player's name changed. Select the player again.", "stale_reset_account")
+    raw = "".join(secrets.choice("ABCDEFGHJKLMNPQRSTUVWXYZ23456789") for _ in range(12))
+    issued_at = int(time.time())
+    account["password_reset"] = {
+        "digest": hashlib.sha256(raw.encode("ascii")).hexdigest(),
+        "issued_at": issued_at, "expires_at": issued_at + 30 * 60,
+        "issued_by": stable_account_id(username), "failed_attempts": 0,
+    }
     write_json(USERS_FILE, data_file)
-    for token, session_name in list(_sessions.items()):
-        if normalize_name(session_name) == normalize_name(display_name):
-            _sessions.pop(token, None)
-    record_action(
-        user_id=0,
-        user_name=username,
-        action_type="reset_password",
-        summary=f"Reset password for {display_name}",
-        payload={"target": display_name},
-    )
-    return {"ok": True, "message": f"{display_name}'s password has been reset.", "target": display_name}
+    record_action(user_id=0, user_name=username, action_type="issue_password_reset_code",
+                  summary=f"Issued password reset code for {display_name}",
+                  payload={"target": display_name, "expires_at": issued_at + 30 * 60})
+    return {"ok": True, "message": "Reset code generated. The user must choose their own new password.",
+            "target": display_name, "reset_code": "-".join(raw[i:i+4] for i in range(0, 12, 4)),
+            "expires_at": issued_at + 30 * 60, "expires_in": 1800, "reset_url": "/login#reset-password"}
+
+
+@account_mutation
+def redeem_password_reset(data):
+    """Consume the code and publish the new hash in the same locked account write."""
+    new_password = data.get("new_password")
+    if not isinstance(new_password, str) or not 6 <= len(new_password) <= 1024:
+        raise PasswordResetError("Password must contain 6–1024 characters.", "invalid_reset_password")
+    if new_password != data.get("confirm_password"):
+        raise PasswordResetError("Please enter the new password twice.", "reset_password_mismatch")
+    invalid = PasswordResetError("The reset code is invalid or expired. Ask an administrator for a new code.")
+    username, code = data.get("username"), data.get("reset_code")
+    if not isinstance(username, str) or len(username) > 128 or not isinstance(code, str) or len(code) > 64:
+        raise invalid
+    directory = users_data()
+    try:
+        key, display_name = resolve_registered_account(directory, username)
+    except ValueError:
+        raise invalid from None
+    account = directory["users"][key]
+    pending = account.get("password_reset")
+    if not recovery_account_enabled(account) or not isinstance(pending, dict):
+        raise invalid
+    if time.time() >= pending.get("expires_at", 0) or pending.get("failed_attempts", 0) >= 5:
+        account.pop("password_reset", None)
+        write_json(USERS_FILE, directory)
+        raise invalid
+    normalized = re.sub(r"[\s-]", "", code).upper()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    if not secrets.compare_digest(digest, pending.get("digest", "")):
+        pending["failed_attempts"] = pending.get("failed_attempts", 0) + 1
+        if pending["failed_attempts"] >= 5:
+            account.pop("password_reset", None)
+        write_json(USERS_FILE, directory)
+        raise invalid
+    salt, hashed = password_hash(new_password)
+    account.update(salt=salt, password_hash=hashed, password_changed_at=int(time.time()))
+    account.pop("password_reset", None)
+    write_json(USERS_FILE, directory)
+    revoke_account_sessions(account, display_name)
+    record_action(user_id=0, user_name=display_name, action_type="redeem_password_reset_code",
+                  summary=f"User reset their own password: {display_name}", payload={"target": display_name})
+    return {"ok": True, "message": "Password updated. Log in with your new password."}
 
 
 @account_mutation
@@ -2311,6 +2382,7 @@ class WebsiteRegistrationRequired(ValueError):
     code = "website_registration_required"
 
 
+@account_mutation
 def login_user(data):
     if not isinstance(data, dict) or not isinstance(data.get("username"), str) or not isinstance(data.get("password"), str):
         raise ValueError("Please enter your username and password.")
@@ -2368,22 +2440,55 @@ def change_password(username, data):
     salt, new_hash = password_hash(new_password)
     user["salt"] = salt
     user["password_hash"] = new_hash
+    user.pop("password_reset", None)
     write_json(USERS_FILE, data_file)
     return True
 
 
 def request_password_reset(data):
-    username = (data.get("username") or "").strip()
-    if not username:
-        raise ValueError("Please enter your username.")
-    mention = os.getenv("DISCORD_FUYUN_MENTION", "@fuyun")
-    channel_id = find_game_record_channel_id()
-    discord_request(
-        "POST",
-        f"/channels/{channel_id}/messages",
-        {"content": f"{mention} Password reset requested for `{username}` from the UCSD Mahjong web dashboard."},
-    )
-    return True
+    """Notify only the recovery channel; reserve a cooldown before network I/O."""
+    username = data.get("username")
+    if not isinstance(username, str) or not username.strip() or len(username) > 128:
+        raise PasswordResetError("Please enter your player name.", "reset_name_required")
+    response = {"ok": True, "message": "If this player has an active website account, an administrator has been notified. Ask them for your reset code."}
+    marker = secrets.token_hex(16)
+    with registered_names.account_lock(USERS_FILE):
+        registered_names.ensure_directory(USERS_FILE)
+        directory = users_data()
+        try:
+            key, display_name = resolve_registered_account(directory, username)
+        except ValueError:
+            return response
+        account = directory["users"][key]
+        if not recovery_account_enabled(account):
+            return response
+        previous = account.get("password_reset_request") or {}
+        if time.time() - previous.get("requested_at", 0) < 10 * 60:
+            return response
+        account_id = str(account["account_id"])
+        account["password_reset_request"] = {"request_id": marker, "requested_at": time.time()}
+        write_json(USERS_FILE, directory)
+    from urllib.parse import urlencode
+    origin = os.getenv("PUBLIC_SITE_URL", "https://ucsdmj.org").rstrip("/") or "https://ucsdmj.org"
+    link = origin + "/?" + urlencode({"page": "admin", "recovery_user": account_id}) + "#account-recovery"
+    # Never reuse the score channel, include a password/code, or mention everyone.
+    payload = {"content": "Password reset request / 密码重置申请", "allowed_mentions": {"parse": []},
+               "embeds": [{"title": "Generate reset code / 生成重置码", "url": link,
+                           "description": "核实玩家身份后，打开链接生成一次性重置码并交给本人。玩家自行设置新密码。",
+                           "fields": [{"name": "Player / 玩家", "value": display_name[:128]}]}]}
+    try:
+        discord_request("POST", "/channels/1488771447915544586/messages", payload)
+    except Exception:
+        with registered_names.account_lock(USERS_FILE):
+            directory = users_data()
+            for account in directory["users"].values():
+                if str(account.get("account_id")) == account_id and (account.get("password_reset_request") or {}).get("request_id") == marker:
+                    account.pop("password_reset_request", None)
+                    write_json(USERS_FILE, directory)
+                    break
+        # Provider exceptions can contain private configuration; never reflect them.
+        raise PasswordResetError("Could not notify the administrator. Please try again later.", "reset_notification_failed") from None
+    return response
 
 
 def validate_record_payload(data):
@@ -3054,7 +3159,7 @@ class Handler(SimpleHTTPRequestHandler):
         if path == "/api/record-game" and os.getenv("NFC_REPLACE_RECORDING", "true").lower() == "true":
             response_json(self, {"ok": False, "message": "请刷新网页，使用拍照登分或人工确认。", "score_url": "/score"}, 410)
             return
-        if path not in {"/api/admin/account-claims/review", "/api/register/claim", "/api/register/resume", "/api/discord/start", "/api/record-game", "/api/register", "/api/login", "/api/logout", "/api/live-games", "/api/live-hands", "/api/profile/avatar", "/api/profile/discord-unbind", "/api/change-password", "/api/forgot-password", "/api/quarter", "/api/admin/role", "/api/admin/password-reset", "/api/admin/account-delete", "/api/admin/player-create", "/api/admin/player-rename", "/api/admin/registered-name", "/api/admin/player-merge", "/api/admin/player-icon", "/api/admin/yakuman", "/api/admin/yakuman-update", "/api/admin/yakuman-delete", "/api/admin/yakuman-hard-delete", "/api/admin/yakuman-photo", "/api/admin/action-revert", "/api/revert"}:
+        if path not in {"/api/admin/account-claims/review", "/api/register/claim", "/api/register/resume", "/api/discord/start", "/api/record-game", "/api/register", "/api/login", "/api/logout", "/api/live-games", "/api/live-hands", "/api/profile/avatar", "/api/profile/discord-unbind", "/api/change-password", "/api/forgot-password", "/api/reset-password", "/api/quarter", "/api/admin/role", "/api/admin/password-reset", "/api/admin/account-delete", "/api/admin/player-create", "/api/admin/player-rename", "/api/admin/registered-name", "/api/admin/player-merge", "/api/admin/player-icon", "/api/admin/yakuman", "/api/admin/yakuman-update", "/api/admin/yakuman-delete", "/api/admin/yakuman-hard-delete", "/api/admin/yakuman-photo", "/api/admin/action-revert", "/api/revert"}:
             self.send_error(404)
             return
 
@@ -3144,8 +3249,9 @@ class Handler(SimpleHTTPRequestHandler):
                 change_password(username, data)
                 body = {"ok": True, "message": "Password updated."}
             elif path == "/api/forgot-password":
-                request_password_reset(data)
-                body = {"ok": True, "message": "Password reset request sent to fuyun on Discord."}
+                body = request_password_reset(data)
+            elif path == "/api/reset-password":
+                body = redeem_password_reset(data)
             elif path == "/api/quarter":
                 username = require_user(self)
                 body = change_current_quarter(data, username)

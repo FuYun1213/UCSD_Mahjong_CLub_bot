@@ -1,7 +1,7 @@
 const assert=require("assert"),{chromium}=require("playwright"),{prepare}=require("./browser_support.cjs");
 const base=process.env.NFC_TEST_URL;
 (async()=>{
- const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL || undefined,headless:true});
+ const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||undefined,headless:true});
  try{
   const context=await browser.newContext({viewport:{width:1360,height:1000}});await prepare(context,base);
   assert((await context.request.post(base+"/api/login",{data:{username:"photo1",password:"photo-test-password"}})).ok());
@@ -37,7 +37,7 @@ const base=process.env.NFC_TEST_URL;
   assert.equal(await role.evaluate(input=>input.checkValidity()),false);assert.equal(writes.filter(request=>request.url().endsWith("/api/admin/role")).length,0);
   await choose(role,"photo3");assert.equal(await roleForm.locator('input[type="hidden"][name="username"]').inputValue(),"photo3");
   await role.fill("photo3 edited");await role.fill("photo3");assert.equal(await roleForm.locator('input[type="hidden"][name="username"]').inputValue(),"");assert.equal(await role.evaluate(input=>input.checkValidity()),false);
-  const resetForm=page.locator("form").filter({has:page.getByRole("button",{name:"Reset password",exact:true})});
+  const resetForm=page.locator("form").filter({has:page.getByRole("button",{name:"Generate reset code",exact:true})});
   await choose(resetForm.getByRole("combobox",{name:"Registered Name",exact:true}),"photo4");
   assert.equal(await resetForm.locator('input[type="hidden"][name="username"]').inputValue(),"photo4");
   await page.getByRole("button",{name:"Add yakuman",exact:true}).click();
@@ -71,9 +71,9 @@ const base=process.env.NFC_TEST_URL;
   await page.locator('select[name="game_id"]').selectOption(String(game.id));
   await choose(page.getByRole("combobox",{name:"Winner",exact:true}),"Renamed Photo Two");
   await page.getByRole("button",{name:"Recent Match",exact:true}).click();
-  await choose(page.getByRole("combobox",{name:"Find a Registered Name",exact:true}),"Renamed Photo Two");
-  const third=page.getByRole("combobox",{name:"Player 3 Registered Name",exact:true});await choose(third,"photo3");
-  assert.equal(await third.inputValue(),"photo3");assert.equal(await page.getByRole("combobox",{name:"Player 1 Registered Name",exact:true}).inputValue(),"");
+  await choose(page.getByRole("combobox",{name:"Find a Player",exact:true}),"photo3");
+  const third=page.getByRole("combobox",{name:"Player 3",exact:true});await choose(third,"photo3");
+  assert.equal(await third.inputValue(),"photo3");assert.equal(await page.getByRole("combobox",{name:"Player 1",exact:true}).inputValue(),"");
   assert.equal(await page.locator('input[list],select[name="winner"],select[name="deal_in"]').count(),0);
   assert((await context.request.post(base+"/api/login",{data:{username:"photo5",password:"photo-test-password"}})).ok());
   await page.goto(base+"/login");await page.getByRole("textbox",{name:"Your Registered Name",exact:true}).waitFor();

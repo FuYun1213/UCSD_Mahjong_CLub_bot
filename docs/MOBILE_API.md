@@ -37,6 +37,9 @@
 | `POST /api/register` | 新玩家注册 | 无需登录 |
 | `POST /api/register/claim` | 申请认领原有玩家 | 无需登录；随后管理员审核 |
 | `POST /api/register/resume` | 查询认领结果并恢复会话 | 认领 Cookie |
+| `POST /api/forgot-password` | 请求管理员发放重置码，专用 Discord 频道通知 | 无需登录；账号冷却与接口限流 |
+| `POST /api/admin/password-reset` | 生成一次性码，不接受新密码 | 管理员；特权账号须超级管理员 |
+| `POST /api/reset-password` | 用重置码自行设置新密码 | 无需登录；必须持有有效码 |
 | `GET /api/registered-users?q=…` | 已注册用户搜索 | 登录 |
 | `GET /api/club-tables` | 桌子列表及状态 | 登录 |
 | `GET /api/club-tables/{tableId}` | 桌子与预约详情 | 登录 |
@@ -91,3 +94,11 @@ Content-Type: application/json
 - 对照示例：`tests/test_web_score_bridge.py`、`test_seat_leave_public_history.py`、`test_registration_v10.py`、`test_manual_score.py`
 
 使用普通开发启动时，私有 API 的 `http://127.0.0.1:8001/docs` 提供 FastAPI Swagger，`/openapi.json` 提供该服务的 schema。它不包含 `web_server.py` 的登录、历史和活动接口；这些以本指南及源码为准。演示脚本为私有 API 分配随机端口，统一对外入口仍是 5083。
+
+## 密码找回
+
+申请请求体为 `{"username":"玩家注册名"}`，返回统一提示以避免暴露账号状态；通知附带需管理员登录的玩家管理链接。管理接口传 `username`（可附 `user_id` 防止重命名后的选择过期），返回一次性 `reset_code` 与 `expires_at`。不得提交 `new_password` 等密码字段。
+
+玩家兑换请求体为 `{"username":"玩家注册名","reset_code":"XXXX-XXXX-XXXX","new_password":"用户自行输入","confirm_password":"用户再次输入"}`。码 30 分钟有效，一次性使用，重新签发使旧码失效；连续 5 次错误后需要新码。密码和代码在锁定的同一次账号写入中更新，成功后撤销该账号旧会话，需重新登录。普通改密也会使未使用的重置码失效。
+
+通知使用服务器中指定的密码申请频道，不复用 Game Record。此代码快照的频道为 `1488771447915544586`，独立部署时需修改 `request_password_reset` 的目标频道并配置自己的机器人权限。测试均注入假发送器，不发真实消息。

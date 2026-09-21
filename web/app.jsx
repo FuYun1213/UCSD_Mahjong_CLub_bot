@@ -278,6 +278,10 @@ function App() {
     requestAnimationFrame(() => applyPageLanguage(language));
   }, [language, page, dashboard, profile, players, yakumanOptions, lastResult, status]);
 
+  React.useEffect(()=>{
+    if(page==="admin"&&sessionLoaded&&!session&&new URLSearchParams(location.search).has("recovery_user"))location.replace(globalLoginUrl());
+  },[page,sessionLoaded,session]);
+
   function removeYakumanFromDashboard(yakumanId, responseData = {}) {
     const idNumber = Number(yakumanId);
     setDashboard((current) => {
@@ -1289,6 +1293,103 @@ function QuarterPtChart({ points, player, quarter }) {
   );
 }
 
+function recoveryError(language, error) {
+  const messages = {
+    invalid_reset_code: ["The reset code is invalid or expired. Ask an administrator for a new code.", "重置码错误或已失效，请向管理员领取新码。"],
+    invalid_reset_password: ["Password must contain 6–1024 characters.", "密码长度须为 6–1024 个字符。"],
+    reset_password_mismatch: ["Please enter the new password twice.", "两次输入的新密码不一致。"],
+    reset_notification_failed: ["Could not notify the administrator. Please try again later.", "暂时无法通知管理员，请稍后重试。"],
+    reset_name_required: ["Please enter your player name.", "请输入你的玩家名称。"],
+    stale_reset_account: ["This player's name changed. Select the player again.", "玩家名称已变更，请重新选择。"],
+    admin_password_reset_disabled: ["Administrators can only generate a reset code. Refresh this page.", "管理员只能生成重置码，请刷新页面。"],
+    request_denied: ["Permission denied or too many requests. Administrator accounts require a super admin.", "无操作权限或请求过于频繁；管理员账号须由超级管理员生成重置码。"]
+  };
+  const pair=messages[error.code];
+  return pair?v10(language,...pair):error instanceof TypeError?v10(language,"Request failed. Please retry.","请求失败，请重试。"):error.message;
+}
+
+function PasswordRecovery({language}) {
+  const [busy,setBusy]=React.useState(""),[notice,setNotice]=React.useState(null),pending=React.useRef(false);
+  const t=(en,cn)=>v10(language,en,cn);
+  async function send(event,kind) {
+    event.preventDefault();if(pending.current)return;
+    const form=event.currentTarget,body=Object.fromEntries(new FormData(form));
+    if(kind==="redeem"&&body.new_password!==body.confirm_password){setNotice({error:{code:"reset_password_mismatch"}});return;}
+    pending.current=true;setBusy(kind);setNotice(null);
+    try {
+      const response=await fetch(kind==="request"?"/api/forgot-password":"/api/reset-password",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      const data=await response.json();if(!response.ok||!data.ok)throw Object.assign(new Error(data.message||"Request failed."),{code:data.code});
+      setNotice({kind});if(kind==="redeem")form.reset();
+    }catch(error){setNotice({error});}finally{pending.current=false;setBusy("");}
+  }
+  React.useEffect(()=>{if(location.hash==="#reset-password")document.getElementById("reset-password")?.scrollIntoView();},[]);
+  return <section id="reset-password" data-password-recovery data-i18n-owned className="mt-5 scroll-mt-28 border-t border-zinc-200 pt-5">
+    <h3 className="font-black">{t("Forgot password","忘记密码")}</h3>
+    <p className="my-2 text-sm text-zinc-600">{t("Request a reset code from an administrator, then set your new password below.","先申请并向管理员领取重置码，再在下面自行设置新密码。")}</p>
+    <form data-reset-request onSubmit={e=>send(e,"request")} className="grid gap-3">
+      <fieldset disabled={Boolean(busy)} className="grid gap-3">
+        <label className="grid gap-1 text-sm font-semibold">{t("Player name","玩家名称")}<input name="username" autoComplete="username" required maxLength={128} className={inputStyle}/></label>
+        <button className={buttonStyle}>{busy==="request"?t("Sending…","正在发送…"):t("Request reset code","申请重置码")}</button>
+      </fieldset>
+    </form>
+    <form data-reset-redeem onSubmit={e=>send(e,"redeem")} className="mt-5 grid gap-3 rounded-xl border border-zinc-200 p-4">
+      <h4 className="font-bold">{t("Already have a code?","已有重置码？")}</h4>
+      <fieldset disabled={Boolean(busy)} className="grid gap-3">
+        <label className="grid gap-1 text-sm font-semibold">{t("Player name","玩家名称")}<input name="username" autoComplete="username" required maxLength={128} className={inputStyle}/></label>
+        <label className="grid gap-1 text-sm font-semibold">{t("Reset code","重置码")}<input name="reset_code" autoComplete="one-time-code" autoCapitalize="characters" spellCheck={false} required maxLength={64} placeholder="XXXX-XXXX-XXXX" className={inputStyle}/></label>
+        <label className="grid gap-1 text-sm font-semibold">{t("New password","新密码")}<input name="new_password" type="password" autoComplete="new-password" required minLength={6} maxLength={1024} className={inputStyle}/></label>
+        <label className="grid gap-1 text-sm font-semibold">{t("Confirm new password","确认新密码")}<input name="confirm_password" type="password" autoComplete="new-password" required minLength={6} maxLength={1024} className={inputStyle}/></label>
+        <button className={buttonStyle}>{busy==="redeem"?t("Updating…","正在更新…"):t("Set my new password","设置我的新密码")}</button>
+      </fieldset>
+      <p className="text-xs text-zinc-500">{t("Codes expire after 30 minutes and can only be used once.","重置码 30 分钟内有效，仅可使用一次。")}</p>
+    </form>
+    {notice&&<p className="mt-3 text-sm font-semibold" role={notice.error?"alert":"status"}>{notice.error?recoveryError(language,notice.error):notice.kind==="redeem"?t("Password updated. Log in with your new password.","密码已更新，请使用新密码登录。"):t("If this player has an active website account, an administrator has been notified. Ask them for your reset code.","若该玩家已开通可用的网站账号，申请已通知管理员，请向管理员领取重置码。")}</p>}
+  </section>;
+}
+
+function PasswordResetAdmin({language}) {
+  const [person,setPerson]=React.useState(null),[issued,setIssued]=React.useState(null),[busy,setBusy]=React.useState(false),[error,setError]=React.useState(null),[copied,setCopied]=React.useState(false),pending=React.useRef(false);
+  const t=(en,cn)=>v10(language,en,cn);
+  React.useEffect(()=>{
+    const id=new URLSearchParams(location.search).get("recovery_user");if(!id)return;
+    const controller=new AbortController();
+    (async()=>{try{
+      const response=await fetch("/api/registered-users?ids="+encodeURIComponent(id),{cache:"no-store",signal:controller.signal});
+      if(!response.ok)throw new Error(t("Could not load the requested player. Select them below.","无法加载申请玩家，请在下方重新选择。"));
+      const data=await response.json();if(!data.users?.length)throw new Error(t("This account is unavailable.","该账号目前不可用。"));
+      setPerson(data.users[0]);requestAnimationFrame(()=>document.getElementById("account-recovery")?.scrollIntoView());
+    }catch(err){if(!controller.signal.aborted)setError(err);}})();
+    return()=>controller.abort();
+  },[]);
+  async function issue(event){
+    event.preventDefault();if(pending.current||!person)return;
+    pending.current=true;setBusy(true);setIssued(null);setError(null);setCopied(false);
+    try{
+      const response=await fetch("/api/admin/password-reset",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:person.name,user_id:person.id})});
+      const data=await response.json();if(!response.ok||!data.ok)throw Object.assign(new Error(data.message||"Request failed."),{code:data.code});
+      setIssued(data);
+    }catch(err){setError(err);}finally{pending.current=false;setBusy(false);}
+  }
+  return <section id="account-recovery" data-reset-admin data-i18n-owned className="mt-5 scroll-mt-28 border-t border-zinc-200 pt-5">
+    <h3 className="font-black">{t("Password reset code","密码重置码")}</h3>
+    <p className="my-2 text-sm text-zinc-600">{t("Verify the player's identity, then give them a code. The player chooses their own new password. Generating a new code invalidates the previous one.","核实玩家身份后生成重置码并交给本人。新密码由玩家自行设置；重新生成会使旧码失效。")}</p>
+    <form onSubmit={issue} className="grid gap-3">
+      <RegisteredUserCombobox value={person} onChange={p=>{setPerson(p);setIssued(null);setError(null);setCopied(false);}} language={language} label={MahjongI18n.t(language,"registeredName")} required disabled={busy}/>
+      <input type="hidden" name="username" value={person?.name||""}/>
+      <button className={buttonStyle} disabled={busy||!person}>{busy?t("Generating…","正在生成…"):t("Generate reset code","生成重置码")}</button>
+    </form>
+    {error&&<p className="mt-3 text-sm text-red-700" role="alert">{recoveryError(language,error)}</p>}
+    {issued&&<div data-issued-reset className="mt-4 grid gap-3 rounded-xl border border-amber-200 bg-amber-50 p-4">
+      <p className="font-bold">{issued.target}</p>
+      <label className="grid gap-1 text-sm font-semibold">{t("Reset code","重置码")}<input readOnly value={issued.reset_code} onFocus={e=>e.target.select()} className={inputStyle+" font-mono tracking-wider"}/></label>
+      <p className="text-sm">{t("Expires at","失效时间")}: {new Date(issued.expires_at*1000).toLocaleString(language==="CN"?"zh-CN":"en-US")}</p>
+      <p className="text-sm">{t("This code is shown only here. Share it privately with the player.","重置码仅在此处显示，请私下交给该玩家。")}</p>
+      <button type="button" className={buttonStyle} onClick={async()=>{try{await navigator.clipboard.writeText(issued.reset_code);setCopied(true);}catch{setError(new Error(t("Select and copy the code manually.","请选中重置码手动复制。")));}}}>{copied?t("Copied","已复制"):t("Copy code","复制重置码")}</button>
+      <a className="break-all text-sm underline" href="/login#reset-password">{t("User reset page","玩家重置密码页面")}: {location.origin}/login#reset-password</a>
+    </div>}
+  </section>;
+}
+
 function AccountCard({ players, session, profile, onSession, onProfile, onRefresh, language }) {
   const [message, setMessage] = React.useState("");
 
@@ -1342,16 +1443,6 @@ function AccountCard({ players, session, profile, onSession, onProfile, onRefres
       const data = await request("/api/change-password", form);
       setMessage(data.warning || data.message);
       form.reset();
-    } catch (error) {
-      setMessage(error.message);
-    }
-  }
-
-  async function forgotPassword(event) {
-    event.preventDefault();
-    try {
-      const data = await request("/api/forgot-password", event.currentTarget);
-      setMessage(data.message);
     } catch (error) {
       setMessage(error.message);
     }
@@ -1433,13 +1524,7 @@ function AccountCard({ players, session, profile, onSession, onProfile, onRefres
           <button type="button" onClick={logout} className="rounded-xl border border-zinc-300 bg-white px-4 py-3 font-bold">Log out</button>
         </div>
       </form>
-      <form onSubmit={forgotPassword} className="mt-5 grid gap-3 border-t border-zinc-200 pt-5">
-        <label className="grid gap-2 text-sm font-bold text-zinc-600">
-          Forgot password
-          <input name="username" required placeholder="Your player name" className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
-        </label>
-        <button className="rounded-xl border border-zinc-300 bg-white px-4 py-3 font-bold">Message @fuyun</button>
-      </form>
+      <PasswordRecovery language={language}/>
       <p className="mt-4 min-h-5 text-sm font-semibold text-zinc-600">{message || (session ? `Active account: ${session}` : MahjongI18n.t(language, "websiteRegistrationHelp"))}</p>
     </Card>
   );
@@ -1561,27 +1646,15 @@ function QuarterControlCard({ language, session, profile, players, yakumanOption
   }
 
   async function manageAccount(event) {
-    event.preventDefault();
-    if (!canSuperAdmin) {
-      setAccountMessage("Only super admins can manage account recovery.");
-      return;
-    }
-    const submitter = event.nativeEvent.submitter?.value || "reset";
-    const form = event.currentTarget;
-    const payload = Object.fromEntries(new FormData(form).entries());
-    const endpoint = submitter === "delete" ? "/api/admin/account-delete" : "/api/admin/password-reset";
-    if (submitter === "delete" && !window.confirm(`Delete account for ${payload.username || "this user"}?`)) return;
-    setAccountMessage(submitter === "delete" ? "Deleting account..." : "Resetting password...");
-    try {
-      const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
-      const data = await response.json();
-      if (!response.ok || !data.ok) throw new Error(data.message || "Could not update account.");
-      setAccountMessage(data.message);
-      form.reset();
-      onRefresh();
-    } catch (error) {
-      setAccountMessage(error.message);
-    }
+    event.preventDefault();if(!canSuperAdmin)return;
+    const form=event.currentTarget,payload=Object.fromEntries(new FormData(form));
+    if(!window.confirm(`Delete account for ${payload.username||"this user"}?`))return;
+    setAccountMessage("Deleting account...");
+    try{
+      const response=await fetch("/api/admin/account-delete",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload)});
+      const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.message||"Could not delete account.");
+      setAccountMessage(data.message);form.reset();onRefresh();
+    }catch(error){setAccountMessage(error.message);}
   }
 
   async function mergePlayers(event) {
@@ -1786,17 +1859,13 @@ function QuarterControlCard({ language, session, profile, players, yakumanOption
           <p className="md:col-span-3 min-h-5 text-sm font-semibold text-zinc-600">{roleMessage}</p>
         </form>
       )}
+      {canAdmin && <PasswordResetAdmin language={language}/>}
       {canSuperAdmin && (
-        <form onSubmit={manageAccount} className="mt-5 grid gap-3 border-t border-zinc-200 pt-5 md:grid-cols-[1fr_1fr_auto_auto]">
-          <div className="md:col-span-4">
-            <h3 className="text-xs font-extrabold uppercase tracking-[0.14em] text-zinc-500">Account recovery (super admin only)</h3>
-            <p className="mt-2 text-sm font-semibold text-zinc-500">Passwords are hashed, so they cannot be viewed. Reset a password or delete a registered web account here.</p>
-          </div>
+        <form onSubmit={manageAccount} className="mt-5 grid gap-3 border-t border-zinc-200 pt-5 md:grid-cols-[1fr_auto]">
+          <h3 data-i18n-owned className="md:col-span-2 text-sm font-bold">{v10(language,"Delete web account (super admin only)","删除网站账号（仅超级管理员）")}</h3>
           <RegisteredUserField name="username" label={MahjongI18n.t(language,"registeredName")} required language={language}/>
-          <input name="new_password" type="password" placeholder="New password for reset" className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
-          <button name="action" value="reset" className="h-11 rounded-xl border border-zinc-300 bg-white px-5 font-bold">Reset password</button>
-          <button name="action" value="delete" className="h-11 rounded-xl border border-red-200 bg-red-50 px-5 font-extrabold text-red-700">Delete account</button>
-          <p className="md:col-span-4 min-h-5 text-sm font-semibold text-zinc-600">{accountMessage}</p>
+          <button className="h-11 rounded-xl border border-red-200 bg-red-50 px-5 font-extrabold text-red-700">Delete account</button>
+          <p className="md:col-span-2 min-h-5 text-sm font-semibold text-zinc-600">{accountMessage}</p>
         </form>
       )}
     </Card>

@@ -1,0 +1,44 @@
+const assert=require("assert"),{chromium}=require("playwright"),{prepare}=require("./browser_support.cjs");
+const base=process.env.NFC_TEST_URL;
+(async()=>{
+ const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL||undefined,headless:true});
+ try{
+  const user=await browser.newContext({viewport:{width:390,height:844}});await prepare(user,base);
+  const page=await user.newPage(),errors=[];page.on("pageerror",e=>errors.push(e.message));page.setDefaultTimeout(15000);
+  await page.goto(base+"/login#reset-password");
+  const recovery=page.locator("[data-password-recovery]"),request=recovery.locator("[data-reset-request]"),redeem=recovery.locator("[data-reset-redeem]");
+  await request.locator('[name="username"]').fill("photo2");
+  await request.getByRole("button",{name:"Request reset code",exact:true}).click();
+  await recovery.getByRole("status").filter({hasText:"administrator has been notified"}).waitFor();
+  assert.equal(await page.getByRole("button",{name:"Message @fuyun",exact:true}).count(),0);
+  const old=await browser.newContext();assert((await old.request.post(base+"/api/login",{data:{username:"photo2",password:"photo-test-password"}})).ok());
+  const admin=await browser.newContext();await prepare(admin,base);const ap=await admin.newPage();ap.setDefaultTimeout(15000);ap.on("pageerror",e=>errors.push(e.message));
+  let issues=0;ap.on('request',r=>{if(r.method()==='POST'&&r.url().endsWith('/api/admin/password-reset'))issues++;});
+  const destination="/?page=admin&recovery_user=photo-user-2#account-recovery";
+  await ap.goto(base+destination);await ap.waitForURL(u=>u.pathname==="/login");
+  assert.equal(new URL(ap.url()).searchParams.get('redirect_url'),destination);
+  const login=ap.locator("form").filter({has:ap.getByRole("button",{name:"Log in",exact:true})});
+  await login.locator('[name="username"]').fill("photo1");await login.locator('[name="password"]').fill("photo-test-password");await login.getByRole('button',{name:'Log in',exact:true}).click();
+  await ap.waitForURL(u=>u.searchParams.get("page")==="admin");
+  const panel=ap.locator('[data-reset-admin]');await panel.waitFor();
+  await ap.waitForFunction(()=>document.querySelector('[data-reset-admin] [role="combobox"]')?.value==='photo2');
+  assert.equal(issues,0);assert.equal(await panel.locator('input[type="password"]').count(),0);
+  await panel.getByRole('button',{name:'Generate reset code',exact:true}).click();
+  const output=panel.locator('[data-issued-reset] input');await output.waitFor();const code=await output.inputValue();assert(/^[A-Z2-9]{4}(-[A-Z2-9]{4}){2}$/.test(code));assert.equal(issues,1);
+  assert.equal((await (await old.request.get(base+'/api/session')).json()).profile.name,"photo2");
+  await page.getByRole('button',{name:'CN',exact:true}).click();
+  await redeem.locator('[name="username"]').fill('photo2');await redeem.locator('[name="reset_code"]').fill('WRONG-CODE');
+  await redeem.locator('[name="new_password"]').fill('MyPrivate!2026');await redeem.locator('[name="confirm_password"]').fill('MyPrivate!2026');
+  await redeem.getByRole('button',{name:'设置我的新密码',exact:true}).click();await recovery.getByRole('alert').filter({hasText:'重置码错误或已失效'}).waitFor();
+  assert.equal(await redeem.locator('[name="new_password"]').inputValue(),'MyPrivate!2026');
+  await redeem.locator('[name="reset_code"]').fill(code);await redeem.getByRole('button',{name:'设置我的新密码',exact:true}).click();
+  await recovery.getByRole('status').filter({hasText:'密码已更新'}).waitFor();
+  assert.equal(await redeem.locator('[name="reset_code"]').inputValue(),'');
+  assert.equal((await (await old.request.get(base+'/api/session')).json()).profile,null);
+  assert.equal((await user.request.post(base+'/api/login',{data:{username:'photo2',password:'photo-test-password'}})).status(),400);
+  assert((await user.request.post(base+'/api/login',{data:{username:'photo2',password:'MyPrivate!2026'}})).ok());
+  assert.equal((await admin.request.get(base+'/api/session')).status(),200);
+  assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth),false);
+  assert.deepEqual(errors,[]);console.log('PASS: request, admin link/login/prefill, code issuance, CN mobile redemption and session revocation');
+ }finally{await browser.close();}
+})().catch(e=>{console.error(e);process.exit(1);});

@@ -1,6 +1,10 @@
 import asyncio
+import json
+import os
 import traceback
-from datetime import datetime, timedelta, timezone
+import urllib.error
+import urllib.request
+from datetime import datetime
 from typing import List, Optional
 
 import discord
@@ -8,9 +12,14 @@ import gspread
 from discord import app_commands
 from discord.ext import commands
 
+from bot_action_log import record_action
+import mahjong_store
+import player_directory
+
 
 SHEET_ID = "1Ce5k2Blbf5MYXbM4rSTeWHOf2uTHPrvZX6vm6Cdyc5Q"
 CREDENTIALS_FILE = "credentials.json"
+MAHJONG_DB_FILE = os.getenv("MAHJONG_DB_FILE") or mahjong_store.DEFAULT_DB_FILE
 
 YAKUMAN_CHOICES = [
     app_commands.Choice(name="天和", value="天和"),
@@ -39,6 +48,64 @@ _gc = None
 _sh = None
 _player_name_cache = []
 
+WIND_FIELDS = [
+    ("E", "east", "East Wind"),
+    ("S", "south", "South Wind"),
+    ("W", "west", "West Wind"),
+    ("N", "north", "North Wind"),
+]
+
+
+def normalize_source_player_id(name):
+    normalized = "".join(character.lower() if character.isalnum() else "-" for character in name.strip())
+    while "--" in normalized:
+        normalized = normalized.replace("--", "-")
+    return f"ucsd-{normalized.strip('-') or 'player'}"
+
+
+def narts_played_at(final_time):
+    from competition_time import event_time, utc_now
+    try:
+        return event_time(str(final_time))
+    except (TypeError, ValueError):
+        return utc_now()
+
+
+def submit_narts_match(sql_game_id, final_time, wind_entries):
+    api_key = os.getenv("NARTS_EXTERNAL_API_KEY", "").strip()
+    if not api_key:
+        return {"enabled": False, "message": "NARTS sync skipped: NARTS_EXTERNAL_API_KEY is not set."}
+
+    endpoint = os.getenv("NARTS_EXTERNAL_API_ENDPOINT", "https://riichi.one/api/external/v1/matches").strip()
+    payload = {
+        "idempotencyKey": f"ucsd-sql-game-{sql_game_id}",
+        "playedAt": narts_played_at(final_time),
+        "players": [
+            {
+                "sourcePlayerId": normalize_source_player_id(entry["name"]),
+                "username": entry["name"],
+                "rawScore": entry["score"],
+                "seatWind": entry["seatWind"],
+            }
+            for entry in wind_entries
+        ],
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            response_text = response.read().decode("utf-8", errors="replace")
+            return {"enabled": True, "ok": True, "status": response.status, "response": response_text}
+    except urllib.error.HTTPError as error:
+        response_text = error.read().decode("utf-8", errors="replace")
+        return {"enabled": True, "ok": False, "status": error.code, "response": response_text}
+    except Exception as error:
+        return {"enabled": True, "ok": False, "status": None, "response": str(error)}
+
 
 def get_sheet():
     global _gc, _sh
@@ -51,26 +118,28 @@ def get_sheet():
 def update_player_cache():
     global _player_name_cache
     try:
-        names = get_sheet().worksheet("Ratings").col_values(1)
-        _player_name_cache = [name for name in names[1:] if name.strip()]
+        _player_name_cache = player_directory.player_names(MAHJONG_DB_FILE)
     except Exception as e:
         print(f"RecordGame Cog: player cache failed: {e}")
         _player_name_cache = []
+
+
+def add_player_to_cache(player_name: str):
+    normalized_name = player_name.strip()
+    if normalized_name and not any(
+        name.lower() == normalized_name.lower()
+        for name in _player_name_cache
+    ):
+        _player_name_cache.append(normalized_name)
 
 
 async def player_name_autocomplete(
     interaction: discord.Interaction,
     current: str,
 ) -> List[app_commands.Choice[str]]:
-    if not _player_name_cache:
-        update_player_cache()
-
-    choices = [
-        app_commands.Choice(name=name, value=name)
-        for name in _player_name_cache
-        if current.lower() in name.lower()
-    ]
-    return choices[:25]
+    await asyncio.to_thread(update_player_cache)
+    return [app_commands.Choice(name=name, value=name)
+            for name in player_directory.matching_names(_player_name_cache, current)]
 
 
 def safe_float(value):
@@ -88,6 +157,12 @@ def safe_int(value):
 
 
 def get_players_status(player_names):
+    try:
+        with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
+            return mahjong_store.player_status_map(connection, player_names)
+    except Exception as e:
+        print(f"RecordGame Cog: SQL status lookup failed: {e}")
+
     status = {
         name: {"mmr": 0, "mmr_rank": "Unranked", "pt": 0, "pt_rank": "Unranked"}
         for name in player_names
@@ -163,14 +238,14 @@ class RecordGame(commands.Cog):
 
     @app_commands.command(name="record_game", description="录入成绩并显示变动")
     @app_commands.describe(
-        rank1_name="第1名名字",
-        rank1_score="第1名分数",
-        rank2_name="第2名名字",
-        rank2_score="第2名分数",
-        rank3_name="第3名名字",
-        rank3_score="第3名分数",
-        rank4_name="第4名名字",
-        rank4_score="第4名分数",
+        east_name="East Wind player",
+        east_score="East Wind score",
+        south_name="South Wind player",
+        south_score="South Wind score",
+        west_name="West Wind player",
+        west_score="West Wind score",
+        north_name="North Wind player",
+        north_score="North Wind score",
         manual_time="可选: 手动输入时间, 留空则为当前时间",
         yakuman_winner="可选: 役满和牌者, 写入 Games Riichi S 列",
         yakuman_deal_in="可选: 役满放铳者, 写入 Games Riichi T 列",
@@ -180,10 +255,10 @@ class RecordGame(commands.Cog):
         yakuman_4="可选: 第四个役满",
     )
     @app_commands.autocomplete(
-        rank1_name=player_name_autocomplete,
-        rank2_name=player_name_autocomplete,
-        rank3_name=player_name_autocomplete,
-        rank4_name=player_name_autocomplete,
+        east_name=player_name_autocomplete,
+        south_name=player_name_autocomplete,
+        west_name=player_name_autocomplete,
+        north_name=player_name_autocomplete,
         yakuman_winner=player_name_autocomplete,
         yakuman_deal_in=player_name_autocomplete,
     )
@@ -196,14 +271,14 @@ class RecordGame(commands.Cog):
     async def record_game(
         self,
         interaction: discord.Interaction,
-        rank1_name: str,
-        rank1_score: int,
-        rank2_name: str,
-        rank2_score: int,
-        rank3_name: str,
-        rank3_score: int,
-        rank4_name: str,
-        rank4_score: int,
+        east_name: str,
+        east_score: int,
+        south_name: str,
+        south_score: int,
+        west_name: str,
+        west_score: int,
+        north_name: str,
+        north_score: int,
         manual_time: Optional[str] = None,
         yakuman_winner: Optional[str] = None,
         yakuman_deal_in: Optional[str] = None,
@@ -214,8 +289,16 @@ class RecordGame(commands.Cog):
     ):
         await interaction.response.defer()
 
-        players_ordered = [rank1_name, rank2_name, rank3_name, rank4_name]
-        scores_ordered = [rank1_score, rank2_score, rank3_score, rank4_score]
+        wind_entries = [
+            {"seatWind": "E", "label": "East Wind", "name": east_name.strip(), "score": east_score},
+            {"seatWind": "S", "label": "South Wind", "name": south_name.strip(), "score": south_score},
+            {"seatWind": "W", "label": "West Wind", "name": west_name.strip(), "score": west_score},
+            {"seatWind": "N", "label": "North Wind", "name": north_name.strip(), "score": north_score},
+        ]
+        wind_order = {seat_wind: index for index, (seat_wind, _, _) in enumerate(WIND_FIELDS)}
+        ranked_entries = sorted(wind_entries, key=lambda entry: (-entry["score"], wind_order[entry["seatWind"]]))
+        players_ordered = [entry["name"] for entry in ranked_entries]
+        scores_ordered = [entry["score"] for entry in ranked_entries]
         player_names_lower = {name.lower() for name in players_ordered}
         yakuman_values = collect_yakuman(
             yakuman_1.value if yakuman_1 else None,
@@ -244,34 +327,106 @@ class RecordGame(commands.Cog):
             if manual_time:
                 final_time_str = manual_time
             else:
-                local_time = datetime.now(timezone.utc) - timedelta(hours=8)
+                from zoneinfo import ZoneInfo
+                from competition_time import site_timezone
+                local_time = datetime.now(ZoneInfo(site_timezone()))
                 final_time_str = local_time.strftime("%Y-%m-%d %H:%M:%S")
 
             status_msg = await interaction.followup.send("Reading current rankings...", wait=True)
             pre_status = get_players_status(players_ordered)
 
             await status_msg.edit(content="Writing game record to Google Sheets...")
+            pre_status = get_players_status(players_ordered)
+            yakuman_text = ", ".join(yakuman_values)
+            current_quarter = ""
+            sql_game_id = None
+            mmr_deltas = []
+            mmr_afters = []
+            with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
+                current_quarter = mahjong_store.latest_quarter(connection)
+                sql_game_id = mahjong_store.import_game(
+                    connection,
+                    players_ordered,
+                    scores_ordered,
+                    final_time_str,
+                    source="discord",
+                    sheet_row=None,
+                    created_by=str(interaction.user),
+                    quarter=current_quarter,
+                    yakuman={
+                        "winner": yakuman_winner or "",
+                        "deal_in": yakuman_deal_in or "",
+                        "text": yakuman_text,
+                        "names": yakuman_values,
+                    },
+                )
+                mmr_deltas = mahjong_store.game_mmr_deltas(connection, sql_game_id)
+                mmr_afters = mahjong_store.game_mmr_afters(connection, sql_game_id)
+
             sh = get_sheet()
 
             ws_pt = sh.worksheet("Games/pt")
-            ws_pt.append_row([final_time_str])
+            pt_row = len(ws_pt.get_all_values()) + 1
+            pt_values = [final_time_str]
+            ws_pt.append_row(pt_values)
 
             ws_riichi = sh.worksheet("Games Riichi")
             new_row = len(ws_riichi.get_all_values()) + 1
-            ws_riichi.append_row(players_ordered + scores_ordered)
+            riichi_values = players_ordered + scores_ordered
+            ws_riichi.append_row(riichi_values)
 
-            yakuman_text = ", ".join(yakuman_values)
             if yakuman_winner or yakuman_deal_in or yakuman_text:
                 ws_riichi.update(
                     values=[[yakuman_winner or "", yakuman_deal_in or "", yakuman_text]],
                     range_name=f"S{new_row}:U{new_row}",
                 )
 
-            await status_msg.edit(content=f"Recorded at {final_time_str}. Waiting for Google Sheet calculation...")
-            await asyncio.sleep(60)
+            if len(mmr_deltas) == 4 and len(mmr_afters) == 4:
+                ws_riichi.update(
+                    values=[[*mmr_deltas, *mmr_afters, "✅ Calculated", current_quarter]],
+                    range_name=f"I{new_row}:R{new_row}",
+                )
+                with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
+                    connection.execute(
+                        "UPDATE games SET sheet_row = ?, sync_status = 'synced' WHERE id = ?",
+                        (new_row, sql_game_id),
+                    )
+                    connection.commit()
+
+            narts_result = await asyncio.to_thread(submit_narts_match, sql_game_id, final_time_str, wind_entries)
+            narts_note = ""
+            if narts_result.get("enabled") and not narts_result.get("ok"):
+                narts_note = f" NARTS sync failed ({narts_result.get('status') or 'network'})."
+            elif narts_result.get("enabled"):
+                narts_note = " Sent to NARTS."
+
+            await status_msg.edit(content=f"Recorded at {final_time_str}. MMR calculated locally and synced.{narts_note}")
+
+            record_action(
+                user_id=interaction.user.id,
+                user_name=str(interaction.user),
+                action_type="record_game",
+                summary=f"Recorded game at {final_time_str}: {', '.join(players_ordered)}",
+                payload={
+                    "games_pt_row": pt_row,
+                    "games_pt_values": pt_values,
+                    "games_riichi_row": new_row,
+                    "games_riichi_values": riichi_values,
+                    "mmr_deltas": mmr_deltas,
+                    "mmr_afters": mmr_afters,
+                    "sql_game_id": sql_game_id,
+                    "quarter": current_quarter,
+                    "yakuman_winner": yakuman_winner or "",
+                    "yakuman_deal_in": yakuman_deal_in or "",
+                    "yakuman_text": yakuman_text,
+                    "wind_entries": wind_entries,
+                    "ranked_entries": ranked_entries,
+                    "narts_result": narts_result,
+                },
+            )
 
             post_status = get_players_status(players_ordered)
-            embed = discord.Embed(title="Game Summary", color=0x00FF00)
+            embed = discord.Embed(title="✅ 结算完成 (Game Summary)", color=0x00FF00)
             embed.description = f"**Time Recorded:** {final_time_str}"
 
             if yakuman_text:
@@ -281,7 +436,7 @@ class RecordGame(commands.Cog):
                 yakuman_line += f"\nYakuman: `{yakuman_text}`"
                 embed.add_field(name="Yakuman", value=yakuman_line, inline=False)
 
-            rank_emojis = ["1st", "2nd", "3rd", "4th"]
+            rank_emojis = ["🐶", "🥈", "🥉", "🪦"]
             for i, name in enumerate(players_ordered):
                 score = scores_ordered[i]
                 pre = pre_status.get(name, {})
@@ -297,11 +452,11 @@ class RecordGame(commands.Cog):
                 post_mmr_rank = safe_int(post.get("mmr_rank", 999))
                 mmr_rank_diff = pre_mmr_rank - post_mmr_rank
                 if mmr_rank_diff > 0:
-                    mmr_rank_icon = f"up {mmr_rank_diff}"
+                    mmr_rank_icon = f"🔺{mmr_rank_diff}"
                 elif mmr_rank_diff < 0:
-                    mmr_rank_icon = f"down {abs(mmr_rank_diff)}"
+                    mmr_rank_icon = f"🔻{abs(mmr_rank_diff)}"
                 else:
-                    mmr_rank_icon = "same"
+                    mmr_rank_icon = "➖"
                 mmr_rank = post_mmr_rank if post_mmr_rank != 999 else "??"
 
                 post_pt = safe_float(post.get("pt", 0))
@@ -314,11 +469,11 @@ class RecordGame(commands.Cog):
                 post_pt_rank = safe_int(post.get("pt_rank", 999))
                 pt_rank_diff = pre_pt_rank - post_pt_rank
                 if pt_rank_diff > 0:
-                    pt_rank_icon = f"up {pt_rank_diff}"
+                    pt_rank_icon = f"🔺{pt_rank_diff}"
                 elif pt_rank_diff < 0:
-                    pt_rank_icon = f"down {abs(pt_rank_diff)}"
+                    pt_rank_icon = f"🔻{abs(pt_rank_diff)}"
                 else:
-                    pt_rank_icon = "same"
+                    pt_rank_icon = "➖"
                 pt_rank = post_pt_rank if post_pt_rank != 999 else "??"
 
                 field_val = (

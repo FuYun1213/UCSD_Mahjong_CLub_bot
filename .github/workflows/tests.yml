@@ -1,0 +1,27 @@
+name: Web and API checks
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+      - run: python -m pip install -r requirements-api-dev.txt -r requirements-api-vision.txt
+      - run: npm ci
+      - run: npm run build:preview
+      - name: Check core seating, registration and competition behavior
+        run: python -m pytest tests/test_seat_cards.py tests/test_registration_v10.py tests/test_placement_challenge.py -q

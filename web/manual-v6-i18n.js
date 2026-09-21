@@ -1,0 +1,25 @@
+/* Manual scoring uses the site's current rule context and registered names. */
+Object.assign(window.MahjongI18n.entries, {
+manualUpload:["上传","Upload"],
+manualRecordAnother:["再录一局","Record Another Game"],
+manualUploadHelp:["从候选列表选择四位注册用户并填写分数。上传时自动核对规则、保存本地成绩并同步外部系统，无需照片。","Select four registered users and enter their scores. Upload checks the rules, saves the score locally and synchronizes it externally. No photo is needed."],
+manualRegisteredName:["注册名","Registered Name"],
+manualSelectionRequired:["请从候选列表选择一个注册用户。","Select a registered user from the suggestions."],
+manualDuplicateSelection:["四个风位必须选择不同的注册用户。","Choose a different registered user for each wind."],
+manualScoreRuleError:["请输入符合下方计分规则的整数分数。","Enter an integer score that follows the scoring rules below."],
+manualScoreRule:["分数单位为 {step}，绝对值上限为 {maximum}。","Scores use increments of {step}, with an absolute maximum of {maximum}."],
+manualCurrentTotal:["当前四人总分","Current Total"],
+manualExpectedTotal:["规则要求总分","Required Total"],
+manualTotalDifference:["差额","Difference"],
+manualLocalSaved:["本地保存成功。","Saved locally."],
+manualExternalSuccess:["外部上传成功。","External upload succeeded."],
+manualExternalFailed:["外部上传失败，本地成绩已保留。","External upload failed. Your local score is preserved."],
+manualExternalPending:["外部上传待重试。","External upload is pending retry."],
+manualExternalDisabled:["外部上传未启用。","External upload is not enabled."],
+manualRetryUpload:["重新上传","Retry Upload"],
+manualExternalRetryHelp:["临时网络或服务故障会自动重试，也可点击重新上传。","Temporary network or service failures retry automatically. You can also retry the upload here."],
+manualUploadUncertain:["尚未收到保存结果。再次点击上传将安全重试同一笔成绩；确认前暂时锁定输入。","The save response has not arrived. Click Upload again to safely retry the same score. Entries stay locked until the result is known."],
+invalid_player_ids:["请从候选列表选择有效注册用户。","Select valid registered users from the suggestions."],
+duplicate_player_ids:["不能重复选择同一注册用户。","Do not select the same registered user more than once."],
+submission_not_saved:["此成绩尚未保存，请先上传。","This score has not been saved. Upload it first."]
+});

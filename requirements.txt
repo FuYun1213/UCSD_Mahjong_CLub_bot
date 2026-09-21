@@ -1,0 +1,13 @@
+discord.py
+flask
+requests
+python-dotenv
+gspread
+google-auth
+google-auth-oauthlib
+google-auth-httplib2
+oauth2client
+pillow
+matplotlib
+pandas
+numpy

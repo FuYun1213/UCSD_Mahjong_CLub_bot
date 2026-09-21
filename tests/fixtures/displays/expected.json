@@ -1,0 +1,6 @@
+[
+  {"file":"photo_1.png","scores":{"bottom":"19200","right":"56700","top":"18000","left":"6100"},"multiplier":1},
+  {"file":"photo_2.png","scores":{"bottom":"22400","right":"17700","top":"39300","left":"20600"},"multiplier":1},
+  {"file":"photo_3.png","scores":{"bottom":"0335","right":"0415","top":"0144","left":"0106"},"multiplier":100},
+  {"file":"photo_4.png","scores":{"bottom":"0935","right":"0165","top":"-136","left":"0036"},"multiplier":100}
+]

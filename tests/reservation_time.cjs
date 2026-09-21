@@ -1,0 +1,24 @@
+const assert=require('node:assert/strict');
+const R=require('../web/reservation-time.js');
+const zone='America/Los_Angeles',initial=R.create(null,zone);
+const server={scheduled_at:'2027-01-01T08:00:00.000+00:00',end_at:'2027-01-01T09:00:00.000+00:00',local_month:1,local_day:1,local_time:'00:00',end_local_month:1,end_local_day:1,end_local_time:'01:00',timezone:zone};
+const ready=R.applyDefault(initial,server);
+assert.deepEqual([ready.month,ready.day,ready.time,ready.end_month,ready.end_day,ready.end_time],['1','1','00:00','1','1','01:00']);
+assert.deepEqual(R.payload(ready),{scheduled_at:server.scheduled_at,end_at:server.end_at});
+for(const field of ['month','day','time','end_time']){const edited=R.editDate(initial,field,field.includes('time')?'19:30':'8');assert.strictEqual(R.applyDefault(edited,server),edited);}
+let changed=R.editDate(ready,'time','23:30');
+const resolved={resolved_start_at:'2027-01-02T07:30:00.000+00:00',default_end_at:'2027-01-02T08:30:00.000+00:00',end_local_month:1,end_local_day:2,end_local_time:'00:30',timezone:zone};
+changed=R.applyResolved(changed,resolved,changed.revision);
+assert.deepEqual([changed.end_month,changed.end_day,changed.end_time],['1','2','00:30']);
+const manual=R.editDate(changed,'end_time','02:00'),later=R.editDate(manual,'time','22:00');
+const preserved=R.applyResolved(later,resolved,later.revision);assert.equal(preserved.end_time,'02:00');assert.equal(preserved.endTimeWasManuallyEdited,true);
+assert.strictEqual(R.applyResolved(later,resolved,later.revision-1),later);
+const reset=R.resetDuration(preserved);assert.equal(reset.end_time,'00:30');assert.equal(reset.endTimeWasManuallyEdited,false);
+const existing=R.create({scheduled_at:'2025-12-21T03:30:00.000+00:00',end_at:'2025-12-21T08:30:00.000+00:00'},zone);
+assert.deepEqual([existing.month,existing.day,existing.time,existing.end_month,existing.end_day,existing.end_time],['12','20','19:30','12','21','00:30']);
+assert.strictEqual(R.applyDefault(existing,server),existing);assert.equal(existing.reference_start,'2025-12-21T03:30:00.000+00:00');
+assert.equal(R.applyResolved(R.editDate(existing,'time','20:00'),resolved,1).end_time,'00:30');
+process.env.TZ='Asia/Tokyo';assert.deepEqual(R.dateParts({scheduled_at:'2027-01-01T07:30:00.000+00:00'},zone),{month:'12',day:'31',time:'23:30'});
+const fold=R.applyDefault(R.create(null,zone),{...server,scheduled_at:'2026-11-01T09:00:00.000+00:00',end_at:'2026-11-01T10:00:00.000+00:00',local_month:11,local_day:1,local_time:'01:00',end_local_month:11,end_local_day:1,end_local_time:'02:00'});
+assert.equal(R.payload(fold).scheduled_at,'2026-11-01T09:00:00.000+00:00');assert.equal(R.payload(fold).end_at,'2026-11-01T10:00:00.000+00:00');
+console.log('Reservation time state passed: start/end, midnight, edits, stale responses, reset and retained timezone/year/fold.');

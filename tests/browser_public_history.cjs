@@ -1,0 +1,21 @@
+const assert=require('assert'),{chromium}=require('playwright'),{prepare}=require('./browser_support.cjs');
+const base=process.env.NFC_TEST_URL;
+(async()=>{const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL || undefined,headless:true});try{
+ const context=await browser.newContext({viewport:{width:390,height:844}});await prepare(context,base);
+ await context.unroute('**/api/dashboard*');await context.unroute('**/api/players');
+ const page=await context.newPage(),errors=[],privateSearch=[];page.setDefaultTimeout(18000);page.on('pageerror',e=>errors.push(e.message));page.on('request',r=>{if(r.url().includes('/api/registered-users'))privateSearch.push(r.url());});
+ await page.goto(base+'/?page=matches');await page.locator('header a[href^="/register"]').waitFor();
+ const rows=page.locator('tbody tr').filter({has:page.locator('td')});await page.waitForFunction(()=>[...document.querySelectorAll('tbody tr')].filter(n=>n.textContent.includes('photo')).length===2);
+ assert.equal(await rows.count(),2);assert((await rows.allTextContents()).join(' ').includes('Legacy Visitor'));assert(!new URL(page.url()).pathname.includes('login'));
+ const search=page.getByRole('combobox',{name:'Find a Player',exact:true});await search.fill('Legacy Visitor');await page.getByRole('option',{name:'Legacy Visitor',exact:true}).click();
+ await page.waitForFunction(()=>document.querySelectorAll('tbody tr').length===1);assert((await rows.innerText()).includes('photo5'));
+ await page.getByRole('button',{name:'Clear',exact:true}).click();await page.waitForFunction(()=>document.querySelectorAll('tbody tr').length===2);
+ await page.getByRole('combobox',{name:'Player 1',exact:true}).fill('photo1');await page.getByRole('option',{name:'photo1',exact:true}).click();
+ await page.getByRole('combobox',{name:'Player 2',exact:true}).fill('photo2');await page.getByRole('option',{name:'photo2',exact:true}).click();
+ await page.waitForFunction(()=>document.querySelectorAll('tbody tr').length===1);assert((await rows.innerText()).includes('photo4'));
+ await page.reload();await page.locator('header a[href^="/register"]').waitFor();await page.getByRole('button',{name:'CN',exact:true}).click();await page.getByRole('combobox',{name:'查询玩家姓名',exact:true}).waitFor();assert.deepEqual(privateSearch,[]);
+ await page.goto(base+'/reservations?table=web');await page.locator('header a[href^="/register"]').waitFor();
+ assert.equal(await page.locator('input[type="datetime-local"]').count(),0);
+ const reserve=page.getByRole('button',{name:/预约|Reserve/}).last();await reserve.click();await page.waitForURL(u=>u.pathname==='/login');assert(new URL(page.url()).searchParams.get('redirect_url').includes('/reservations?table=web'));
+ assert.deepEqual(errors,[]);console.log('PASS: anonymous all-history, unregistered historical player search, four-player filter, Chinese, no private directory requests; reservations require global login.');
+}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});

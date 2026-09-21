@@ -1,0 +1,25 @@
+const assert=require("assert"),fs=require("fs"),path=require("path"),{chromium}=require("playwright");
+const {prepare,root}=require("./browser_support.cjs"),base=process.env.NFC_TEST_URL;
+(async()=>{const browser=await chromium.launch({channel:process.env.PLAYWRIGHT_CHANNEL || undefined,headless:true});try{
+ const context=await browser.newContext();await prepare(context,base);
+ await context.route("https://cdn.discordapp.com/**",r=>r.fulfill({status:404,body:"missing image"}));
+ const response=await context.request.post(base+"/api/login",{data:{username:"photo2",password:"photo-test-password"}});assert(response.ok());
+ const list=await(await context.request.get(base+"/api/club-tables")).json(),table=list.tables.find(t=>t.score_table_id==="web");
+ const created=await context.request.post(base+"/api/club-tables/"+table.id+"/reservations",{data:{start_at:new Date(Date.now()+1800000).toISOString(),participant_ids:["photo-user-2","photo-user-3"],request_id:"avatar-session"}});assert(created.ok(),await created.text());
+ const joined=await context.request.put(base+"/api/club-tables/web/my-seat",{data:{seat:"east"}});assert(joined.ok(),await joined.text());
+ const page=await context.newPage(),errors=[];page.setDefaultTimeout(15000);page.on("pageerror",e=>errors.push(e.message));
+ await page.goto(base+"/?page=record&table=web");const frame=page.frameLocator("#record-game iframe");
+ await frame.locator('[data-seat-card="east"] [data-account-avatar][data-avatar-state="image"]').waitFor();
+ await frame.locator('#reservation-reminders [data-account-avatar][data-avatar-state="image"]').first().waitFor();
+ await frame.locator('#reservation-reminders [data-account-avatar][data-avatar-state="fallback"]').first().waitFor();
+ assert(!(await frame.locator("body").innerText()).includes("123456789012345678"));
+ await page.goto(base+"/reservations?table="+table.id);
+ await page.locator('[data-reservation-form] [data-account-avatar]').first().waitFor();
+ const chooser=page.locator('[data-reservation-form] [data-registered-user-combobox]').first();
+ await chooser.locator('button').first().click();await chooser.getByRole('combobox').fill('photo3');
+ const option=chooser.getByRole('option',{name:'photo3',exact:true});await option.waitFor();
+ await option.locator('[data-account-avatar][data-avatar-state="fallback"]').waitFor();await option.click();
+ await chooser.locator('[data-account-avatar][data-avatar-state="fallback"]').waitFor();
+ const result={passed:true,checks:['uploaded avatar shown on occupied seat','current avatars shown in reservation participants','missing Discord avatar safely falls back','registered-name search and selected player show avatar','no Discord ID visible','no JavaScript errors'],errors};
+ assert.deepEqual(errors,[]);fs.mkdirSync(path.join(root,'.local_seat_cards/v9'),{recursive:true});fs.writeFileSync(path.join(root,'.local_seat_cards/v9/avatar-browser.json'),JSON.stringify(result,null,2));console.log(JSON.stringify(result));
+}finally{await browser.close();}})().catch(e=>{console.error(e);process.exitCode=1;});

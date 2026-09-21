@@ -1,0 +1,88 @@
+/* The only user-search implementation. IDs remain internal selection values. */
+// Generated from Python Unicode 16.0.0: lowercase code points whose casefold differs.
+// Name search only: opaque account and roster IDs never pass through this mapping.
+const registeredNameCaseFold=Object.freeze({"\u00b5":"\u03bc","\u00df":"ss","\u0149":"\u02bcn","\u017f":"s","\u01f0":"j\u030c","\u0345":"\u03b9","\u0390":"\u03b9\u0308\u0301","\u03b0":"\u03c5\u0308\u0301","\u03c2":"\u03c3","\u03d0":"\u03b2","\u03d1":"\u03b8","\u03d5":"\u03c6","\u03d6":"\u03c0","\u03f0":"\u03ba","\u03f1":"\u03c1","\u03f5":"\u03b5","\u0587":"\u0565\u0582","\u13f8":"\u13f0","\u13f9":"\u13f1","\u13fa":"\u13f2","\u13fb":"\u13f3","\u13fc":"\u13f4","\u13fd":"\u13f5","\u1c80":"\u0432","\u1c81":"\u0434","\u1c82":"\u043e","\u1c83":"\u0441","\u1c84":"\u0442","\u1c85":"\u0442","\u1c86":"\u044a","\u1c87":"\u0463","\u1c88":"\ua64b","\u1e96":"h\u0331","\u1e97":"t\u0308","\u1e98":"w\u030a","\u1e99":"y\u030a","\u1e9a":"a\u02be","\u1e9b":"\u1e61","\u1f50":"\u03c5\u0313","\u1f52":"\u03c5\u0313\u0300","\u1f54":"\u03c5\u0313\u0301","\u1f56":"\u03c5\u0313\u0342","\u1f80":"\u1f00\u03b9","\u1f81":"\u1f01\u03b9","\u1f82":"\u1f02\u03b9","\u1f83":"\u1f03\u03b9","\u1f84":"\u1f04\u03b9","\u1f85":"\u1f05\u03b9","\u1f86":"\u1f06\u03b9","\u1f87":"\u1f07\u03b9","\u1f90":"\u1f20\u03b9","\u1f91":"\u1f21\u03b9","\u1f92":"\u1f22\u03b9","\u1f93":"\u1f23\u03b9","\u1f94":"\u1f24\u03b9","\u1f95":"\u1f25\u03b9","\u1f96":"\u1f26\u03b9","\u1f97":"\u1f27\u03b9","\u1fa0":"\u1f60\u03b9","\u1fa1":"\u1f61\u03b9","\u1fa2":"\u1f62\u03b9","\u1fa3":"\u1f63\u03b9","\u1fa4":"\u1f64\u03b9","\u1fa5":"\u1f65\u03b9","\u1fa6":"\u1f66\u03b9","\u1fa7":"\u1f67\u03b9","\u1fb2":"\u1f70\u03b9","\u1fb3":"\u03b1\u03b9","\u1fb4":"\u03ac\u03b9","\u1fb6":"\u03b1\u0342","\u1fb7":"\u03b1\u0342\u03b9","\u1fbe":"\u03b9","\u1fc2":"\u1f74\u03b9","\u1fc3":"\u03b7\u03b9","\u1fc4":"\u03ae\u03b9","\u1fc6":"\u03b7\u0342","\u1fc7":"\u03b7\u0342\u03b9","\u1fd2":"\u03b9\u0308\u0300","\u1fd3":"\u03b9\u0308\u0301","\u1fd6":"\u03b9\u0342","\u1fd7":"\u03b9\u0308\u0342","\u1fe2":"\u03c5\u0308\u0300","\u1fe3":"\u03c5\u0308\u0301","\u1fe4":"\u03c1\u0313","\u1fe6":"\u03c5\u0342","\u1fe7":"\u03c5\u0308\u0342","\u1ff2":"\u1f7c\u03b9","\u1ff3":"\u03c9\u03b9","\u1ff4":"\u03ce\u03b9","\u1ff6":"\u03c9\u0342","\u1ff7":"\u03c9\u0342\u03b9","\uab70":"\u13a0","\uab71":"\u13a1","\uab72":"\u13a2","\uab73":"\u13a3","\uab74":"\u13a4","\uab75":"\u13a5","\uab76":"\u13a6","\uab77":"\u13a7","\uab78":"\u13a8","\uab79":"\u13a9","\uab7a":"\u13aa","\uab7b":"\u13ab","\uab7c":"\u13ac","\uab7d":"\u13ad","\uab7e":"\u13ae","\uab7f":"\u13af","\uab80":"\u13b0","\uab81":"\u13b1","\uab82":"\u13b2","\uab83":"\u13b3","\uab84":"\u13b4","\uab85":"\u13b5","\uab86":"\u13b6","\uab87":"\u13b7","\uab88":"\u13b8","\uab89":"\u13b9","\uab8a":"\u13ba","\uab8b":"\u13bb","\uab8c":"\u13bc","\uab8d":"\u13bd","\uab8e":"\u13be","\uab8f":"\u13bf","\uab90":"\u13c0","\uab91":"\u13c1","\uab92":"\u13c2","\uab93":"\u13c3","\uab94":"\u13c4","\uab95":"\u13c5","\uab96":"\u13c6","\uab97":"\u13c7","\uab98":"\u13c8","\uab99":"\u13c9","\uab9a":"\u13ca","\uab9b":"\u13cb","\uab9c":"\u13cc","\uab9d":"\u13cd","\uab9e":"\u13ce","\uab9f":"\u13cf","\uaba0":"\u13d0","\uaba1":"\u13d1","\uaba2":"\u13d2","\uaba3":"\u13d3","\uaba4":"\u13d4","\uaba5":"\u13d5","\uaba6":"\u13d6","\uaba7":"\u13d7","\uaba8":"\u13d8","\uaba9":"\u13d9","\uabaa":"\u13da","\uabab":"\u13db","\uabac":"\u13dc","\uabad":"\u13dd","\uabae":"\u13de","\uabaf":"\u13df","\uabb0":"\u13e0","\uabb1":"\u13e1","\uabb2":"\u13e2","\uabb3":"\u13e3","\uabb4":"\u13e4","\uabb5":"\u13e5","\uabb6":"\u13e6","\uabb7":"\u13e7","\uabb8":"\u13e8","\uabb9":"\u13e9","\uabba":"\u13ea","\uabbb":"\u13eb","\uabbc":"\u13ec","\uabbd":"\u13ed","\uabbe":"\u13ee","\uabbf":"\u13ef","\ufb00":"ff","\ufb01":"fi","\ufb02":"fl","\ufb03":"ffi","\ufb04":"ffl","\ufb05":"st","\ufb06":"st","\ufb13":"\u0574\u0576","\ufb14":"\u0574\u0565","\ufb15":"\u0574\u056b","\ufb16":"\u057e\u0576","\ufb17":"\u0574\u056d"});
+function normalizeRegisteredSearchName(value) {
+  const lower=String(value||"").normalize("NFKC").trim().replace(/\s+/gu," ").toLowerCase();
+  return Array.from(lower,character=>registeredNameCaseFold[character]||character).join("");
+}
+function RegisteredUserCombobox({value,onChange,language,label,placeholder,disabled=false,inputId,error,
+  required=false,excludeIds=[],allowedIds=null,options=null,searchUrl="/api/registered-users"}) {
+  const t=k=>MahjongI18n.t(language,k),generatedId=React.useId(),id=inputId||"registered-user-"+generatedId;
+  const [query,setQuery]=React.useState(value?.name||""),[open,setOpen]=React.useState(false),[rows,setRows]=React.useState([]);
+  const [loading,setLoading]=React.useState(false),[failed,setFailed]=React.useState(false),[cursor,setCursor]=React.useState(null),[active,setActive]=React.useState(-1),[retry,setRetry]=React.useState(0);
+  const root=React.useRef(null),input=React.useRef(null),edited=React.useRef(false),sequence=React.useRef(0),request=React.useRef(null),lastValue=React.useRef(value?.id||null);
+  const normalize=normalizeRegisteredSearchName;
+  const normalized=normalize(query),optionsSignature=options?JSON.stringify(options.map(p=>[p.id,p.name])):"";
+  const filterSignature=JSON.stringify([excludeIds,allowedIds]);
+  const excluded=new Set(excludeIds.map(String)),allowed=allowedIds===null?null:new Set(allowedIds.map(String));
+  const choices=rows.filter(person=>!excluded.has(String(person.id))&&(!allowed||allowed.has(String(person.id))));
+
+  React.useEffect(()=>{
+    if(value){setQuery(value.name||"");setOpen(false);setRows([]);setFailed(false);edited.current=false;}
+    else if(!edited.current&&lastValue.current){setQuery("");setRows([]);}
+    lastValue.current=value?.id||null;edited.current=false;
+  },[value?.id,value?.name]);
+  React.useEffect(()=>()=>request.current?.abort(),[]);
+  React.useEffect(()=>{input.current?.setCustomValidity((required||query.trim())&&!value?t("registeredNameSelectRequired"):"");},[required,value?.id,language,query]);
+
+  async function fetchPage(next=null,append=false,version=sequence.current) {
+    request.current?.abort();const controller=new AbortController();request.current=controller;
+    setLoading(true);setFailed(false);
+    try {
+      let result;
+      if(options!==null){
+        const matches=options.filter(person=>normalize(person.name).includes(normalized)&&!excluded.has(String(person.id))&&(!allowed||allowed.has(String(person.id)))),start=Number(next)||0;
+        result={users:matches.slice(start,start+10),next_cursor:start+10<matches.length?String(start+10):null};
+      } else {
+        const params=new URLSearchParams({q:normalized,limit:"10"});if(next)params.set("cursor",next);
+        const response=await fetch(searchUrl+(searchUrl.includes("?")?"&":"?")+params,{credentials:"same-origin",cache:"no-store",signal:controller.signal});
+        if(!response.ok)throw new Error("registeredNameSearchFailed");
+        result=await response.json();
+      }
+      if(version!==sequence.current||controller.signal.aborted)return;
+      const users=(result.users||[]).filter(p=>p&&typeof p.name==="string"&&p.name&&p.id!==undefined).map(p=>({id:String(p.id),name:p.name,...(p.participant_type?{participant_type:p.participant_type}:{}),...(p.avatar?{avatar:p.avatar}:{})}));
+      setRows(previous=>{const merged=append?[...previous,...users]:users;return [...new Map(merged.map(person=>[person.id,person])).values()];});
+      setCursor(result.next_cursor||null);setActive(append?active:0);
+    } catch(exception) {if(version===sequence.current&&!controller.signal.aborted){setFailed(true);if(!append)setRows([]);}}
+    finally {if(version===sequence.current&&!controller.signal.aborted)setLoading(false);}
+  }
+  React.useEffect(()=>{
+    const version=++sequence.current;request.current?.abort();
+    if(!open||disabled){setLoading(false);return;}
+    setRows([]);setCursor(null);setActive(-1);setLoading(true);setFailed(false);
+    const timer=setTimeout(()=>fetchPage(null,false,version),250);
+    return()=>{clearTimeout(timer);request.current?.abort();};
+  },[normalized,open,disabled,retry,searchUrl,optionsSignature,filterSignature]);
+  React.useEffect(()=>{if(active>=choices.length)setActive(choices.length?choices.length-1:-1);},[choices.length,active]);
+
+  function choose(person){input.current?.setCustomValidity("");edited.current=false;setQuery(person.name);setOpen(false);setRows([]);onChange(person);}
+  function clear(){input.current?.setCustomValidity(required?t("registeredNameSelectRequired"):"");edited.current=false;setQuery("");setRows([]);setOpen(false);setFailed(false);onChange(null);root.current?.querySelector("input")?.focus();}
+  function type(text){input.current?.setCustomValidity((required||text.trim())?t("registeredNameSelectRequired"):"");edited.current=true;setQuery(text);setOpen(true);setActive(-1);if(value)onChange(null);}
+  function keyDown(event){
+    if(event.key==="ArrowDown"||event.key==="ArrowUp"){
+      event.preventDefault();setOpen(true);
+      if(choices.length)setActive(old=>event.key==="ArrowDown"?(old+1)%choices.length:(old<=0?choices.length-1:old-1));
+    } else if(event.key==="Enter"&&open){event.preventDefault();if(!loading&&active>=0&&choices[active])choose(choices[active]);}
+    else if(event.key==="Escape"){event.preventDefault();setOpen(false);}
+  }
+  return <div ref={root} className="relative min-w-0" data-registered-user-combobox data-i18n-owned onBlur={()=>setTimeout(()=>{if(!root.current?.contains(document.activeElement))setOpen(false);},0)}>
+    <label className="mb-1 block text-sm font-semibold text-zinc-600" htmlFor={id}>{label||t("registeredName")}</label>
+    <div className="flex min-w-0 items-center gap-2">
+      {value&&<AccountAvatars.Avatar name={value.name} src={value.avatar} decorative/>}
+      <input ref={input} id={id} required={required} className="w-full min-w-0 rounded-xl border border-zinc-300 bg-white px-3 py-2 text-sm" role="combobox" aria-autocomplete="list" aria-haspopup="listbox" aria-expanded={open&&!disabled} aria-controls={id+"-options"} aria-activedescendant={open&&active>=0&&choices[active]?id+"-option-"+active:undefined} aria-describedby={id+"-status"} aria-invalid={Boolean(error)} aria-required={required} autoComplete="off" maxLength={128} disabled={disabled} value={query} placeholder={placeholder||t("registeredNamePlaceholder")} onChange={event=>type(event.target.value)} onFocus={()=>{if(!value)setOpen(true);}} onKeyDown={keyDown}/>
+      {(value||query)&&<button type="button" className="shrink-0 rounded-lg border border-zinc-300 px-2 py-2 text-sm" aria-label={(label||t("registeredName"))+" · "+t("registeredNameClear")} disabled={disabled} onClick={clear}>{t("registeredNameClear")}</button>}
+    </div>
+    <div id={id+"-status"} className="mt-1 text-sm" aria-live="polite">{error?<span className="text-red-700">{t(error)}</span>:value?<span className="text-emerald-800">{t("registeredNameSelected")}{value.participant_type==="guest"&&" · "+(language==="CN"?"临时":"Guest")}</span>:null}</div>
+    {open&&!disabled&&<div className="relative z-20 mt-1 rounded-xl border border-zinc-300 bg-white p-2 shadow-lg">
+      <ul id={id+"-options"} role="listbox" aria-label={label||t("registeredName")} className="max-h-60 overflow-auto">
+        {choices.map((person,index)=><li key={person.id} role="presentation"><button type="button" role="option" aria-label={person.name} id={id+"-option-"+index} aria-selected={active===index} className={"flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-sm "+(active===index?"bg-warm font-bold":"")} onMouseDown={event=>event.preventDefault()} onMouseEnter={()=>setActive(index)} onClick={()=>choose(person)}><AccountAvatars.Avatar name={person.name} src={person.avatar} decorative/><span>{person.name}{person.participant_type==="guest"?" · "+(language==="CN"?"临时":"Guest"):""}</span></button></li>)}
+      </ul>
+      {loading&&<p role="status" className="px-3 py-2 text-sm">{t("registeredNameLoading")}</p>}
+      {!loading&&!failed&&!choices.length&&<p role="status" className="px-3 py-2 text-sm">{t("registeredNameNone")}</p>}
+      {failed&&<div role="alert" className="px-3 py-2 text-sm text-red-700"><p>{t("registeredNameSearchFailed")}</p><button type="button" className="mt-1 underline" onMouseDown={event=>event.preventDefault()} onClick={()=>setRetry(n=>n+1)}>{t("registeredNameRetry")}</button></div>}
+      {cursor&&!failed&&<button type="button" className="mt-1 rounded-lg px-3 py-2 text-sm underline" disabled={loading} onMouseDown={event=>event.preventDefault()} onClick={()=>fetchPage(cursor,true)}>{t("registeredNameMore")}</button>}
+    </div>}
+  </div>;
+}
+window.RegisteredUserCombobox=RegisteredUserCombobox;

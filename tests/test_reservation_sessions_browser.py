@@ -19,7 +19,7 @@ def test_reservation_sessions_browser(website, monkeypatch, tmp_path):
     clock_file.write_text('2026-12-31T22:20:00-08:00',encoding='utf-8')
     monkeypatch.setattr(app.state.tables,'clock',lambda:clock_file.read_text(encoding='utf-8'))
     environment=os.environ.copy()
-    environment.update(NFC_TEST_URL=url,SESSION_TEST_CLOCK=str(clock_file),NODE_PATH=str(Path('.venv-api/browser-tests/node_modules').resolve()))
+    environment.update(NFC_TEST_URL=url,SESSION_TEST_CLOCK=str(clock_file),NODE_PATH=str(Path(os.environ.get('NODE_PATH') or '.venv-api/browser-tests/node_modules').resolve()))
     result=subprocess.run(['node','tests/browser_reservation_sessions.cjs'],env=environment,capture_output=True,text=True,encoding='utf-8',timeout=180)
     assert result.returncode==0,result.stdout+result.stderr
     print(result.stdout)

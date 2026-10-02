@@ -24,7 +24,7 @@ def test_browser_manual_score(website,monkeypatch):
     monkeypatch.setattr(web_server,"build_dashboard",lambda *a,**kw:{"stats":{"member_count":8},"rankings":[],"recent_yakuman":[]})
     environment=os.environ.copy()
     environment["NFC_TEST_URL"]=url
-    environment["NODE_PATH"]=str(Path(".venv-api/browser-tests/node_modules").resolve())
+    environment["NODE_PATH"]=str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve())
     result=subprocess.run(["node","tests/browser_manual_score.cjs"],env=environment,capture_output=True,text=True,encoding="utf-8",timeout=150)
     assert result.returncode==0,result.stdout+result.stderr
     assert len(history)==2

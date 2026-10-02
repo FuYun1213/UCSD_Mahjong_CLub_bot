@@ -13,7 +13,7 @@ from .tournament_flow import attach_penalties, penalty_dict, lock_tournament
 from .tournament_rules import require, number, normalized_name, scoring_value
 
 
-ADMIN_ACTIONS = {"penalty_add", "penalty_edit", "penalty_revoke", "bind_account", "reset_table"}
+ADMIN_ACTIONS = {"penalty_add", "penalty_edit", "penalty_revoke", "bind_account", "reset_table", "archive"}
 
 
 def require_admin(actor, user):
@@ -27,6 +27,11 @@ def admin_transition(db, state, action, data, actor, user, timestamp):
     if action not in ADMIN_ACTIONS:
         return None
     require_admin(actor, user)
+    if action == "archive":
+        require(state["status"] in {"ended", "locked"}, "invalid_state")
+        require(not state.get("archived_at"), "already_archived")
+        state["archived_at"], state["archived_by"] = timestamp, str(actor)
+        return {"archived_at": timestamp}
     require(state["status"] not in {"ended", "locked"}, "invalid_state")
     tid = state["id"]
     if action == "bind_account":

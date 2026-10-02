@@ -19,7 +19,9 @@ from test_tournament import tournament, command, round_complete, finals
 
 
 def test_free_score_failure_keeps_local_and_retries_identical_json(setup):
-    client, _, service = setup
+    from mahjong_api.auth import get_current_user
+    from mahjong_api.models import User
+    client, sheets, service = setup
     service.external.save_config({"enabled":True,"endpoint":"https://example.com/import","adapter":"json"},"admin")
     captured=[]
     def fail(endpoint,adapter,body,method):
@@ -28,19 +30,40 @@ def test_free_score_failure_keeps_local_and_retries_identical_json(setup):
     service.external.transport=fail
     match=fill(client)
     response=submit(client,match_id=match,key="one-free-score")
-    assert response.status_code==200
+    assert response.status_code == 202
     data=response.json()
-    assert data["local_saved"] is True and data["external_sync"]["status"]=="failed"
-    assert service.store.match(match)["scores"]==POINTS
+    assert data["local_saved"] and data["local_completed"]
+    assert data["external_sync"]["status"] == "pending" and data["external_sync"]["attempts"] == 0
+    assert service.store.match(match)["scores"] == POINTS
+    assert not any(service.table("1")["seats"].values())
+    assert captured == [] and not sheets.history
+    # Both workers are explicit: interactive submit did not execute either sink.
+    service.flush()
+    service.external.flush()
+    delivery_key = data["external_sync"]["request_id"]
+    failed = service.external.get(delivery_key)
+    assert failed["status"] == "failed" and failed["error_code"] == "network_error"
+    assert failed["attempts"] == 1 and "private provider" not in json.dumps(failed)
+    assert len(captured) == 1
     first=captured[0]
     assert first["matchId"]==match and len(first["players"])==4
     assert all({"id","name","seat","placement","rawScore","placementPoints","gameScore","cumulativeScore"} <= set(p) for p in first["players"])
     service.external.transport=lambda endpoint,adapter,body,method:(captured.append(copy.deepcopy(body)) or (200,{"ok":True}))
-    service.external.send(data["external_sync"]["request_id"],"admin",retry=True)
-    assert captured==[first,first]
+    client.app.dependency_overrides[get_current_user] = lambda:User(id="admin", name="Admin", role="admin")
+    retry = client.post("/api/external-deliveries/" + delivery_key + "/retry", json={})
+    assert retry.status_code == 200
+    assert retry.json()["status"] == "pending" and retry.json()["attempts"] == 1
+    assert captured == [first], "Retry HTTP must queue work without sending it"
+    service.external.flush()
+    assert captured == [first, first]
+    assert service.external.get(delivery_key)["status"] == "success"
     response=submit(client,match_id=match,key="one-free-score")
-    assert response.json()["replayed"] is True and response.json()["external_sync"]["status"]=="success"
-    assert len(captured)==2
+    assert response.status_code == 200
+    assert response.json()["replayed"] is True and response.json()["external_sync"]["status"] == "success"
+    assert response.json()["result"] == data["result"]
+    client.post("/api/external-deliveries/" + delivery_key + "/retry", json={})
+    service.external.flush()
+    assert len(captured) == 2 and len(sheets.history) == 1
 
 
 def test_disabled_configuration_does_not_backfill_or_contact_remote(setup):

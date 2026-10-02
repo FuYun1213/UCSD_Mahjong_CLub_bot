@@ -1,9 +1,11 @@
 import asyncio
 import json
 import os
+import re
 import traceback
 import urllib.error
 import urllib.request
+from contextlib import closing
 from datetime import datetime
 from typing import List, Optional
 
@@ -20,6 +22,7 @@ import player_directory
 SHEET_ID = "1Ce5k2Blbf5MYXbM4rSTeWHOf2uTHPrvZX6vm6Cdyc5Q"
 CREDENTIALS_FILE = "credentials.json"
 MAHJONG_DB_FILE = os.getenv("MAHJONG_DB_FILE") or mahjong_store.DEFAULT_DB_FILE
+DISCORD_SCORE_PAUSED_MESSAGE = "discord登分暂不可用，请使用doramj.org进行登分。"
 
 YAKUMAN_CHOICES = [
     app_commands.Choice(name="天和", value="天和"),
@@ -156,6 +159,17 @@ def safe_int(value):
         return 999
 
 
+def parse_score_input(value):
+    """Parse a signed whole score from Discord's text input."""
+    text = str(value).strip()
+    if not re.fullmatch(r"[+-]?[0-9]{1,16}", text):
+        raise ValueError("Score must be a whole number")
+    score = int(text)
+    if abs(score) > 9_007_199_254_740_991:
+        raise ValueError("Score is outside Discord's supported integer range")
+    return score
+
+
 def get_players_status(player_names):
     try:
         with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
@@ -272,13 +286,13 @@ class RecordGame(commands.Cog):
         self,
         interaction: discord.Interaction,
         east_name: str,
-        east_score: int,
+        east_score: str,
         south_name: str,
-        south_score: int,
+        south_score: str,
         west_name: str,
-        west_score: int,
+        west_score: str,
         north_name: str,
-        north_score: int,
+        north_score: str,
         manual_time: Optional[str] = None,
         yakuman_winner: Optional[str] = None,
         yakuman_deal_in: Optional[str] = None,
@@ -288,6 +302,27 @@ class RecordGame(commands.Cog):
         yakuman_4: Optional[app_commands.Choice[str]] = None,
     ):
         await interaction.response.defer()
+        try:
+            east_score, south_score, west_score, north_score = map(
+                parse_score_input, (east_score, south_score, west_score, north_score)
+            )
+        except ValueError:
+            await interaction.followup.send(
+                "Scores must be whole numbers. Use a leading - for a negative score."
+            )
+            return
+        try:
+            def scoring_paused():
+                with closing(mahjong_store.connect(MAHJONG_DB_FILE)) as connection:
+                    return mahjong_store.discord_score_paused(connection)
+            paused = await asyncio.to_thread(scoring_paused)
+        except Exception:
+            # A failed config lookup must never allow an unguarded score write.
+            traceback.print_exc()
+            paused = True
+        if paused:
+            await interaction.followup.send(DISCORD_SCORE_PAUSED_MESSAGE)
+            return
 
         wind_entries = [
             {"seatWind": "E", "label": "East Wind", "name": east_name.strip(), "score": east_score},
@@ -365,33 +400,16 @@ class RecordGame(commands.Cog):
 
             sh = get_sheet()
 
-            ws_pt = sh.worksheet("Games/pt")
-            pt_row = len(ws_pt.get_all_values()) + 1
-            pt_values = [final_time_str]
-            ws_pt.append_row(pt_values)
-
-            ws_riichi = sh.worksheet("Games Riichi")
-            new_row = len(ws_riichi.get_all_values()) + 1
+            from legacy_sheet_sync import append_game
+            new_row = append_game(sh, final_time_str, players_ordered, scores_ordered,
+                mmr_deltas, mmr_afters, current_quarter,
+                yakuman_winner or "", yakuman_deal_in or "", yakuman_text, record_id=sql_game_id)
+            pt_row, pt_values = new_row, [final_time_str]
             riichi_values = players_ordered + scores_ordered
-            ws_riichi.append_row(riichi_values)
-
-            if yakuman_winner or yakuman_deal_in or yakuman_text:
-                ws_riichi.update(
-                    values=[[yakuman_winner or "", yakuman_deal_in or "", yakuman_text]],
-                    range_name=f"S{new_row}:U{new_row}",
-                )
-
-            if len(mmr_deltas) == 4 and len(mmr_afters) == 4:
-                ws_riichi.update(
-                    values=[[*mmr_deltas, *mmr_afters, "✅ Calculated", current_quarter]],
-                    range_name=f"I{new_row}:R{new_row}",
-                )
-                with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
-                    connection.execute(
-                        "UPDATE games SET sheet_row = ?, sync_status = 'synced' WHERE id = ?",
-                        (new_row, sql_game_id),
-                    )
-                    connection.commit()
+            with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
+                connection.execute("UPDATE games SET sheet_row=?, sync_status='synced' WHERE id=?",
+                                   (new_row, sql_game_id))
+                connection.commit()
 
             narts_result = await asyncio.to_thread(submit_narts_match, sql_game_id, final_time_str, wind_entries)
             narts_note = ""
@@ -426,61 +444,10 @@ class RecordGame(commands.Cog):
             )
 
             post_status = get_players_status(players_ordered)
-            embed = discord.Embed(title="✅ 结算完成 (Game Summary)", color=0x00FF00)
-            embed.description = f"**Time Recorded:** {final_time_str}"
-
-            if yakuman_text:
-                yakuman_line = f"Winner: `{yakuman_winner}`"
-                if yakuman_deal_in:
-                    yakuman_line += f"\nDeal-in: `{yakuman_deal_in}`"
-                yakuman_line += f"\nYakuman: `{yakuman_text}`"
-                embed.add_field(name="Yakuman", value=yakuman_line, inline=False)
-
-            rank_emojis = ["🐶", "🥈", "🥉", "🪦"]
-            for i, name in enumerate(players_ordered):
-                score = scores_ordered[i]
-                pre = pre_status.get(name, {})
-                post = post_status.get(name, {})
-
-                post_mmr = safe_float(post.get("mmr", 0))
-                pre_mmr = safe_float(pre.get("mmr", 0))
-                mmr_diff = post_mmr - pre_mmr
-                mmr_sign = "+" if mmr_diff >= 0 else ""
-                mmr_str = f"{post_mmr:.1f} ({mmr_sign}{mmr_diff:.1f})"
-
-                pre_mmr_rank = safe_int(pre.get("mmr_rank", 999))
-                post_mmr_rank = safe_int(post.get("mmr_rank", 999))
-                mmr_rank_diff = pre_mmr_rank - post_mmr_rank
-                if mmr_rank_diff > 0:
-                    mmr_rank_icon = f"🔺{mmr_rank_diff}"
-                elif mmr_rank_diff < 0:
-                    mmr_rank_icon = f"🔻{abs(mmr_rank_diff)}"
-                else:
-                    mmr_rank_icon = "➖"
-                mmr_rank = post_mmr_rank if post_mmr_rank != 999 else "??"
-
-                post_pt = safe_float(post.get("pt", 0))
-                pre_pt = safe_float(pre.get("pt", 0))
-                pt_diff = post_pt - pre_pt
-                pt_sign = "+" if pt_diff >= 0 else ""
-                pt_str = f"{post_pt:.1f} ({pt_sign}{pt_diff:.1f})"
-
-                pre_pt_rank = safe_int(pre.get("pt_rank", 999))
-                post_pt_rank = safe_int(post.get("pt_rank", 999))
-                pt_rank_diff = pre_pt_rank - post_pt_rank
-                if pt_rank_diff > 0:
-                    pt_rank_icon = f"🔺{pt_rank_diff}"
-                elif pt_rank_diff < 0:
-                    pt_rank_icon = f"🔻{abs(pt_rank_diff)}"
-                else:
-                    pt_rank_icon = "➖"
-                pt_rank = post_pt_rank if post_pt_rank != 999 else "??"
-
-                field_val = (
-                    f"**MMR**: `{mmr_str}` | Rank #{mmr_rank} ({mmr_rank_icon})\n"
-                    f"**PT**: `{pt_str}` | Rank #{pt_rank} ({pt_rank_icon})"
-                )
-                embed.add_field(name=f"{rank_emojis[i]} {name} ({score})", value=field_val, inline=False)
+            from game_summary import build_game_summary
+            embed = discord.Embed.from_dict(build_game_summary(players_ordered, scores_ordered,
+                final_time_str, pre_status, post_status, yakuman_winner or "",
+                yakuman_deal_in or "", yakuman_text))
 
             await status_msg.edit(content="", embed=embed)
         except Exception as e:

@@ -1,3 +1,4 @@
+const v10 = (language, en, cn) => language === "CN" ? cn : en;
 ﻿const { Trophy, UserRound, ListChecks, Plus, LogIn, ScrollText, Camera } = lucideReactShim();
 
 const logoUrl = "/assets/UCSD_mermaid_whitebg.jpg";
@@ -9,7 +10,7 @@ const navLabels = {
     record: "Game Record",
     matches: "Recent Match",
     live: "Live",
-    tournament: "Tournament Mode",
+    tournament: "Competitions",
     account: "Account",
     admin: "Admin",
     refresh: "Refresh",
@@ -24,7 +25,7 @@ const navLabels = {
     record: "登分",
     matches: "最近对局",
     live: "实时对局",
-    tournament: "比赛模式",
+    tournament: "比赛",
     account: "账号",
     admin: "管理",
     refresh: "刷新",
@@ -47,6 +48,9 @@ const cnTextMap = {
   "Current Season": "当前学期",
   "Current quarter": "当前学期",
   "Total games": "总数据",
+  "Quarter Games": "季度对局数",
+  "Total Games": "总对局数",
+  "games": "对局",
   "View player": "查看玩家",
   "Data scope": "数据范围",
   "Key Metrics": "关键指标",
@@ -173,6 +177,8 @@ const rankingLabels = {
   quarter_mmr: "Quarter MMR",
   total_mmr: "Total MMR",
   total_pt: "Total PT",
+  quarter_games: "Quarter Games",
+  total_games: "Total Games",
   history_highest_mmr: "History Highest MMR",
 };
 
@@ -196,7 +202,10 @@ function currentAppPage() {
   const path=location.pathname, query=new URLSearchParams(location.search);
   if (/^\/(join|join-table)\//.test(path)) return "join-table";
   if(path.startsWith("/challenges/")) return "challenge";
-  if(path==="/login") return "account";
+  if(path==="/login"||path==="/account") return "account";
+  if(["/admin","/record","/ranking","/tournament"].includes(path))return path.slice(1);
+  if(path.startsWith("/tournaments/"))return "tournament";
+  if(path.startsWith("/tables/"))return "record";
   if(path==="/register") return "register";
   if(path==="/registration-complete") return "registration-complete";
   if(path==="/reservations") return "reservations";
@@ -204,17 +213,29 @@ function currentAppPage() {
   if(query.has("tournament")) return "tournament";
   return ["dashboard","ranking","record","reservations","matches","live","tournament","account","admin","result"].includes(query.get("page")) ? query.get("page") : "dashboard";
 }
-function globalLoginUrl(target=location.pathname+location.search+location.hash) {
-  return "/login?redirect_url="+encodeURIComponent(target);
-}
 function safeLoginReturn(raw) {
   try {
-    if(!raw || !raw.startsWith("/") || raw.startsWith("//") || /[\\\r\n]/.test(raw)) return "/";
-    const target=new URL(raw,location.origin);
-    if(target.origin!==location.origin || ["/login","/register"].includes(target.pathname)) return "/";
-    return target.pathname+target.search+target.hash;
-  } catch {return "/";}
+    if(typeof raw!=="string"||raw.length>2000||!raw.startsWith("/"))return "/";
+    let decoded=raw;
+    for(let i=0;i<4;i++){
+      if(decoded.startsWith("//")||/[\\\x00-\x1f\x7f]/.test(decoded))return "/";
+      const target=new URL(decoded,location.origin);
+      if(target.origin!==location.origin||["/login","/register"].includes(target.pathname.replace(/\/+$/,"").toLowerCase()))return "/";
+      const next=decodeURIComponent(decoded);if(next===decoded)return raw;decoded=next;
+    }
+  } catch {}
+  return "/";
 }
+function loginReturnTarget() {
+  const query=new URLSearchParams(location.search);
+  const target=safeLoginReturn(query.get("returnTo")??query.get("redirect_url"));
+  // HTTP redirects cannot see fragments. Browsers carry them to /login.
+  return safeLoginReturn(target+(!target.includes("#")&&location.hash&&location.hash!=="#reset-password"?location.hash:""));
+}
+function globalLoginUrl(target=location.pathname+location.search+location.hash) {
+  return "/login?returnTo="+encodeURIComponent(safeLoginReturn(target));
+}
+
 function App() {
   const [session, setSession] = React.useState(null);
   const [sessionLoaded, setSessionLoaded] = React.useState(false);
@@ -222,7 +243,6 @@ function App() {
   const [players, setPlayers] = React.useState([]);
   const [yakumanOptions, setYakumanOptions] = React.useState([]);
   const [matchPlayer, setMatchPlayer] = React.useState("");
-  const [tablePlayers, setTablePlayers] = React.useState("");
   const [viewQuarter, setViewQuarter] = React.useState("");
   const [profileQuarter, setProfileQuarter] = React.useState("");
   const [profilePlayer, setProfilePlayer] = React.useState("");
@@ -230,7 +250,7 @@ function App() {
   const [page, updatePage] = React.useState(currentAppPage);
   const [routeVersion,setRouteVersion] = React.useState(0);
   function setPage(next) {
-    const target=next==="reservations"?"/reservations":next==="manual-score"?"/manual-score":next==="account"?"/login":"/?page="+encodeURIComponent(next);
+    const target=appPageUrl(next);
     history.pushState(null,"",target);updatePage(next);setRouteVersion(v=>v+1);
   }
   React.useEffect(()=>{
@@ -242,33 +262,39 @@ function App() {
   const [dashboard, setDashboard] = React.useState(null);
   const [status, setStatus] = React.useState("");
 
+  const loadSequence=React.useRef(0),authRequest=React.useRef(null),dataAbort=React.useRef(null);
+  const [refreshVersion,setRefreshVersion]=React.useState(0),[assetsReady,setAssetsReady]=React.useState("");
   async function refresh() {
+    if(!authRequest.current)authRequest.current=(async()=>{
+      const response=await fetch("/api/session",{cache:"no-store"});
+      if(!response.ok)throw new Error("sessionUnavailable");
+      const data=await response.json();if(data.error)throw new Error("sessionUnavailable");return data;
+    })().finally(()=>{authRequest.current=null;});
     try {
-      const [sessionResponse, playersResponse, dashboardResponse, yakumanResponse] = await Promise.all([
-        fetch("/api/session", { cache: "no-store" }),
-        fetch("/api/players", { cache: "no-store" }),
-        fetch(`/api/dashboard?ranking=${encodeURIComponent(rankingType)}&match_player=${encodeURIComponent(matchPlayer)}&table_players=${encodeURIComponent(tablePlayers)}&quarter=${encodeURIComponent(viewQuarter)}&profile_quarter=${encodeURIComponent(profileQuarter)}&profile_player=${encodeURIComponent(profilePlayer)}`, { cache: "no-store" }),
-        fetch("/api/yakuman-options", { cache: "no-store" }),
-      ]);
-      const sessionData = await sessionResponse.json();
-      const playersData = await playersResponse.json();
-      const dashboardData = await dashboardResponse.json();
-      const yakumanData = await yakumanResponse.json();
-      setSession(sessionData.user || null);
-      setSessionLoaded(true);
-      setProfile(sessionData.profile || null);
-      setPlayers([...(playersData.players || [])].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: "base" })));
-      setDashboard(dashboardData);
-      setYakumanOptions(yakumanData.options || []);
-      setStatus("");
-    } catch (error) {
-      setStatus("Backend unavailable; showing demo data.");
-    }
+      const data=await authRequest.current;
+      setSession(data.user||null);setProfile(data.profile||null);setSessionLoaded(true);setStatus("");
+      setRefreshVersion(v=>v+1);
+    } catch {setStatus(language==="CN"?"暂时无法连接，请重试。":"Could not connect. Please retry.");}
   }
-
-  React.useEffect(() => {
-    refresh();
-  }, [rankingType, matchPlayer, tablePlayers, viewQuarter, profileQuarter, profilePlayer]);
+  React.useEffect(()=>{refresh();return()=>dataAbort.current?.abort();},[]);
+  React.useEffect(()=>{
+    let active=true;
+    Promise.resolve(window.MahjongAssets?.load(page)).then(()=>{if(active)setAssetsReady(page);})
+      .catch(()=>{if(active)setStatus(language==="CN"?"页面加载失败，请刷新。":"Page could not load. Please refresh.");});
+    return()=>{active=false;};
+  },[page]);
+  React.useEffect(()=>{
+    if(!sessionLoaded||!session)return;
+    const sequence=++loadSequence.current,controller=new AbortController();dataAbort.current?.abort();dataAbort.current=controller;
+    const get=url=>fetch(url,{cache:"no-store",signal:controller.signal}).then(r=>{if(!r.ok)throw new Error("requestFailed");return r.json();});
+    const work=[];
+    if(["dashboard","ranking","matches","admin","live"].includes(page))work.push(
+      get(`/api/dashboard?ranking=${encodeURIComponent(rankingType)}&match_player=${encodeURIComponent(matchPlayer)}&quarter=${encodeURIComponent(viewQuarter)}&profile_quarter=${encodeURIComponent(profileQuarter)}&profile_player=${encodeURIComponent(profilePlayer)}`)
+        .then(data=>{if(sequence===loadSequence.current)setDashboard(data);}));
+    if(page==="admin")work.push(get("/api/yakuman-options").then(data=>{if(sequence===loadSequence.current)setYakumanOptions(data.options||[]);}));
+    Promise.all(work).catch(()=>{if(!controller.signal.aborted)setStatus(language==="CN"?"暂时无法连接，请重试。":"Could not connect. Please retry.");});
+    return()=>controller.abort();
+  },[sessionLoaded,session,page,refreshVersion,rankingType,matchPlayer,viewQuarter,profileQuarter,profilePlayer]);
 
   const effectiveMatchPlayer = dashboard?.recent_match_player || matchPlayer;
   const ranking = normalizeRanking(dashboard?.rankings, session, dashboard?.profiles) || fallbackRanking;
@@ -279,7 +305,8 @@ function App() {
   }, [language, page, dashboard, profile, players, yakumanOptions, lastResult, status]);
 
   React.useEffect(()=>{
-    if(page==="admin"&&sessionLoaded&&!session&&new URLSearchParams(location.search).has("recovery_user"))location.replace(globalLoginUrl());
+    if(sessionLoaded&&!session&&!["/login","/register","/auth/callback","/discord/callback"].includes(location.pathname))location.replace(globalLoginUrl());
+    if(sessionLoaded&&session&&["/login","/register"].includes(location.pathname))location.replace("/");
   },[page,sessionLoaded,session]);
 
   function removeYakumanFromDashboard(yakumanId, responseData = {}) {
@@ -304,19 +331,26 @@ function App() {
     });
   }
 
+  const publicAuth=["/login","/register","/auth/callback","/discord/callback"].includes(location.pathname);
+  if(!sessionLoaded||(!session&&!publicAuth)||(session&&["/login","/register"].includes(location.pathname)))return <div data-i18n-owned className="auth-loading" role="status">{status||(language==="CN"?"正在检查登录状态…":"Checking your session…")}{status&&<button className="navigation-link" onClick={refresh}>{language==="CN"?"重试":"Retry"}</button>}</div>;
+  if(page==="admin"&&!profile?.is_admin)return <div data-i18n-owned className="auth-loading" role="alert">{language==="CN"?"需要管理员权限。":"Administrator access required."}<a href="/">{language==="CN"?"返回主页":"Home"}</a></div>;
+  if(assetsReady!==page)return <div className="auth-loading" role="status">{status||(language==="CN"?"正在加载…":"Loading…")}</div>;
   return (
-    <main className="min-h-screen px-5 py-8 sm:px-8">
-      <div className="mx-auto max-w-[1100px]">
-        <Header session={session} authReady={sessionLoaded} memberCount={dashboard?.stats?.member_count || players.length} currentQuarter={dashboard?.stats?.view_quarter || dashboard?.stats?.current_quarter} page={page} setPage={setPage} onRefresh={refresh} language={language} setLanguage={setLanguage} />
+    <main className={"app-shell min-h-screen "+(session?"club-member-shell":"club-public-shell")}>
+      <div className="club-page-container">
+        <Header session={session} profile={profile} authReady={sessionLoaded} memberCount={dashboard?.stats?.member_count || players.length} currentQuarter={dashboard?.stats?.view_quarter || dashboard?.stats?.current_quarter} page={page} setPage={setPage} onRefresh={refresh} language={language} setLanguage={setLanguage} />
+        {profile?.is_admin&&profile?.has_password===false&&<section role="status" className="mb-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900"><span><strong>{v10(language,"You are an administrator. Please register a password.","你是管理员，请注册密码。")}</strong> {v10(language,"Set it in Account Settings while this administrator session is active.","请在此管理员会话有效时到账号设置中注册。")}</span><button type="button" className="rounded-lg bg-navy px-3 py-2 font-bold text-white" onClick={()=>setPage("account")}>{v10(language,"Set password","设置密码")}</button></section>}
         {status && <p className="mb-4 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-800">{status}</p>}
 
         {page === "dashboard" && (
           <>
-            <CurrentChallenge language={language}/>
-            <section className="grid gap-5 lg:grid-cols-2">
+            <ClubLobby language={language} profile={profile} dashboard={dashboard} onNavigate={setPage}/>
+            <details open className="club-personal-details"><summary>{language==="CN"?"我的成绩与社团活动":"My stats & club activities"}</summary>
+            <CurrentChallenge language={language}/><section className="grid gap-5 lg:grid-cols-2">
               <ProfileCard session={session} profile={profile} summary={dashboard?.current_user_rank} players={players} profilePlayer={profilePlayer} setProfilePlayer={setProfilePlayer} quarters={dashboard?.quarters || []} profileQuarter={profileQuarter} setProfileQuarter={setProfileQuarter} onProfile={setProfile} onRefresh={refresh} language={language} />
             </section>
             <AnnualSummaryCard summary={dashboard?.annual_summary} session={session} />
+            </details>
           </>
         )}
 
@@ -356,8 +390,6 @@ function App() {
             matchPlayer={matchPlayer}
             effectiveMatchPlayer={effectiveMatchPlayer}
             setMatchPlayer={setMatchPlayer}
-            tablePlayers={tablePlayers}
-            setTablePlayers={setTablePlayers}
             currentQuarter={dashboard?.stats?.view_quarter || dashboard?.stats?.current_quarter}
             viewQuarter={dashboard?.stats?.view_quarter || viewQuarter}
             quarters={dashboard?.quarters || []}
@@ -375,7 +407,7 @@ function App() {
 
         {page === "admin" && (
           <>
-            <ChallengeAdmin language={language} profile={profile}/>
+            <DiscordScoringControl language={language}/>
             <AdminTables language={language} profile={profile} /><ExternalApiSettings language={language} profile={profile} />
             <QuarterControlCard
               language={language}
@@ -396,7 +428,7 @@ function App() {
 
         {page === "challenge" && <CurrentChallenge language={language} full/>}
         {page === "register" && <RegistrationPage language={language} session={session} authReady={sessionLoaded} onRefresh={refresh}/>}
-        {page === "registration-complete" && <Card><DiscordOptional complete language={language} target={new URLSearchParams(location.search).get("redirect_url")||"/"}/></Card>}
+        {page === "registration-complete" && <Card><DiscordOptional complete language={language} target={loginReturnTarget()}/></Card>}
         {page === "reservations" && <ReservationPage key={routeVersion} language={language} profile={profile}/>}
         {page === "manual-score" && (new URLSearchParams(location.search).has("tournament")?<CompetitionManualScore language={language} profile={profile}/>:<ManualScorePage key={routeVersion} language={language} profile={profile} onRefresh={refresh}/>)}
         {page === "join-table" && <TableJoinPage key={routeVersion} language={language} profile={profile} authReady={sessionLoaded}/>}
@@ -407,63 +439,10 @@ function App() {
   );
 }
 
-function Header({ session, authReady, memberCount, currentQuarter, page, setPage, onRefresh, language, setLanguage }) {
-  const labels = navLabels[language] || navLabels.EN;
-  const navItems = [
-    ["dashboard", labels.dashboard],
-    ["ranking", labels.ranking],
-    ["record", labels.record],
-    ["reservations", MahjongI18n.t(language,"reservations")],
-    ["matches", labels.matches],
-    ["live", labels.live],
-    ["tournament", labels.tournament],
-    ["account", labels.account],
-    ["admin", labels.admin],
-  ];
-  return (
-    <header className="mb-9 border-b border-zinc-200 pb-7">
-      <div className="flex flex-col justify-between gap-4 sm:flex-row sm:items-center">
-        <div className="flex items-center gap-4">
-          <img width="64" height="64" src={logoUrl} alt={window.MahjongBrand.name+" logo"} className="h-16 w-16 rounded-xl border border-zinc-200 bg-white object-cover" />
-          <div>
-            <h1 className="text-3xl font-extrabold tracking-tight text-zinc-950">{window.MahjongBrand.name}</h1>
-            <p className="mt-1 flex items-center gap-2 text-lg text-zinc-600">
-              <span className="h-2 w-2 rounded-full bg-gold" />
-              {currentQuarter || labels.currentSeason} - {memberCount || "--"} {labels.members}
-            </p>
-          </div>
-        </div>
-        <div className="flex flex-wrap items-center gap-3 sm:justify-end">
-          <span className="text-sm font-bold text-zinc-500">{session ? `${labels.loggedIn}: ${session}` : labels.notLoggedIn}</span>
-          <span data-i18n-owned>{authReady?(session?<button className="rounded-xl border border-zinc-300 px-4 py-2 text-sm font-bold" onClick={async()=>{await fetch("/api/logout",{method:"POST"});location.assign("/");}}>{MahjongI18n.t(language,"logOut")}</button>:<span className="flex gap-2"><a className="rounded-xl bg-navy px-4 py-2 text-sm font-bold text-white" href={globalLoginUrl()}>{MahjongI18n.t(language,"logIn")}</a><a className="rounded-xl border border-zinc-300 px-4 py-2 text-sm font-bold" href={"/register?redirect_url="+encodeURIComponent(new URLSearchParams(location.search).get("redirect_url")||location.pathname+location.search+location.hash)}>{v10(language,"Register","注册")}</a></span>):null}</span>
-          <button
-            onClick={() => {
-              const next = language === "EN" ? "CN" : "EN";
-              localStorage.setItem("mahjong_lang", next);
-              setLanguage(next);
-            }}
-            className="rounded-xl border border-zinc-300 bg-white px-4 py-2 text-sm font-black hover:bg-warm"
-          >
-            {language === "EN" ? "CN" : "EN"}
-          </button>
-          <button onClick={onRefresh} className="rounded-xl border border-zinc-300 bg-white px-4 py-2 text-sm font-bold hover:bg-warm">{labels.refresh}</button>
-        </div>
-      </div>
-      <nav className="mt-6 flex flex-wrap gap-2">
-        {navItems.map(([key, label]) => (
-          <button key={key} onClick={() => setPage(key)} className={`rounded-xl px-4 py-2 text-sm font-extrabold ${page === key ? "bg-navy text-white" : "border border-zinc-300 bg-white text-zinc-700 hover:bg-warm"}`}>
-            {label}
-          </button>
-        ))}
-      </nav>
-    </header>
-  );
-}
 
 function Card({ children, className = "", id }) {
   return (
-    <article id={id} className={`overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-soft ${className}`}>
-      <div className="h-1 bg-gradient-to-r from-navy via-zinc-600 to-gold" />
+    <article id={id} className={`club-card overflow-hidden rounded-2xl border border-zinc-200 bg-white shadow-soft ${className}`}>
       <div className="p-7">{children}</div>
     </article>
   );
@@ -852,7 +831,7 @@ function RankingCard({ ranking, rankingType, setRankingType, options, yakumanLea
                 <PlayerName name={player.name} icon={player.icon} className="text-lg font-semibold" />
                 {player.you && <span className="rounded-full bg-navy px-2 py-0.5 text-xs font-extrabold text-gold">you</span>}
               </div>
-              <p className="text-sm text-zinc-600">{player.wins || "Ranked"} wins</p>
+              <p className="text-sm text-zinc-600">{player.wins ?? 0} wins{player.games != null && <> · {player.games} games</>}</p>
             </div>
             <div className="text-right">
               <strong className="block text-lg font-black">{player.value}</strong>
@@ -979,7 +958,7 @@ function AnnualSummaryCard({ summary, session }) {
   );
 }
 
-function GameRecords({ language, records, history, players, matchPlayer, effectiveMatchPlayer, setMatchPlayer, tablePlayers, setTablePlayers, currentQuarter, viewQuarter, quarters, setViewQuarter, recentYakuman, yakumanOptions, profile, recentMatchCount, onRefresh, onYakumanDeleted }) {
+function GameRecords({ language, records, history, matchPlayer, effectiveMatchPlayer, setMatchPlayer, currentQuarter, viewQuarter, quarters, setViewQuarter, recentYakuman, yakumanOptions, profile, recentMatchCount, onRefresh, onYakumanDeleted }) {
   const [yakumanMessage, setYakumanMessage] = React.useState("");
   const [deletedYakumanIds, setDeletedYakumanIds] = React.useState([]);
   const [editingYakumanId, setEditingYakumanId] = React.useState(null);
@@ -995,15 +974,7 @@ function GameRecords({ language, records, history, players, matchPlayer, effecti
     return winner === normalizedPlayer || tablePlayers.includes(normalizedPlayer);
   });
   const canDeleteYakuman = Boolean(profile?.is_admin || profile?.is_super_admin);
-  const tablePlayerValues = splitPlayerFilter(tablePlayers, 4);
   // Match history is public; do not query the authenticated account directory.
-  const historyPlayers = React.useMemo(() => registeredRosterOptions(players), [players]);
-
-  function updateTablePlayer(index, value) {
-    const next = [...tablePlayerValues];
-    next[index] = value;
-    setTablePlayers(next.some(Boolean)?next.join(" / "):"");
-  }
 
   async function deleteYakuman(item) {
     if (!canDeleteYakuman || !item.id) return;
@@ -1103,11 +1074,8 @@ function GameRecords({ language, records, history, players, matchPlayer, effecti
               ))}
             </select>
           </label>
-          <RegisteredUserField value={matchPlayer} onChange={setMatchPlayer} language={language} options={historyPlayers} label={v10(language,"Find a Player","查询玩家姓名")}/>
-          <div className="grid gap-2 sm:grid-cols-2">
-            {tablePlayerValues.map((value,index)=><RegisteredUserField key={index} value={value} onChange={name=>updateTablePlayer(index,name)} language={language} options={historyPlayers} label={v10(language,`Player ${index+1}`,`玩家 ${index+1}`)}/>)}
-          </div>
-          <button type="button" onClick={() => { setMatchPlayer(""); setTablePlayers(""); }} className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-bold">Clear</button>
+          <RegisteredUserField value={matchPlayer} onChange={setMatchPlayer} language={language} searchUrl="/api/history-players" label={v10(language,"Find a Player","查询玩家姓名")}/>
+          <button type="button" onClick={() => setMatchPlayer("")} className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-sm font-bold">Clear</button>
         </div>
       </div>
 
@@ -1347,6 +1315,54 @@ function PasswordRecovery({language}) {
   </section>;
 }
 
+function AdminPasswordSetup({language}) {
+  const t=(en,cn)=>v10(language,en,cn),[busy,setBusy]=React.useState(false),[message,setMessage]=React.useState("");
+  if(location.hash!=="#admin-password-setup")return null;
+  async function submit(event){
+    event.preventDefault();if(busy)return;
+    const form=event.currentTarget,body=Object.fromEntries(new FormData(form));
+    if(body.new_password!==body.confirm_password){setMessage(t("Passwords must match.","两次输入的密码不一致。"));return;}
+    setBusy(true);setMessage("");
+    try{
+      const response=await fetch("/api/admin/password-setup",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+      const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.message||t("Could not set the password.","暂时无法设置密码。"));
+      location.assign("/");
+    }catch(error){setMessage(error.message||t("Could not set the password.","暂时无法设置密码。"));setBusy(false);}
+  }
+  return <section data-admin-password-setup className="mb-5 rounded-xl border border-amber-200 bg-amber-50 p-4" aria-labelledby="admin-password-setup-title">
+    <h2 id="admin-password-setup-title" className="text-lg font-black">{t("Set administrator password","设置管理员密码")}</h2>
+    <p className="my-2 text-sm text-zinc-700">{t("Discord verified this administrator account. Choose a password to finish and sign in.","Discord 已验证此管理员账号。设置密码后即可完成并登录。")}</p>
+    <form onSubmit={submit} className="grid gap-3">
+      <label className="grid gap-1 text-sm font-semibold">{t("New password","新密码")}<input name="new_password" type="password" autoComplete="new-password" required minLength={6} maxLength={1024} className={inputStyle}/></label>
+      <label className="grid gap-1 text-sm font-semibold">{t("Confirm password","确认密码")}<input name="confirm_password" type="password" autoComplete="new-password" required minLength={6} maxLength={1024} className={inputStyle}/></label>
+      <button disabled={busy} className="rounded-xl bg-navy px-4 py-3 font-bold text-white disabled:opacity-50">{busy?t("Saving…","正在保存……"):t("Set password and sign in","设置密码并登录")}</button>
+    </form>
+    {message&&<p role="alert" className="mt-3 text-sm text-red-700">{message}</p>}
+  </section>;
+}
+
+function DiscordScoringControl({language}) {
+  const [paused,setPaused]=React.useState(null),[busy,setBusy]=React.useState(false),[notice,setNotice]=React.useState("");
+  React.useEffect(()=>{let active=true;
+    fetch("/api/admin/discord-score",{cache:"no-store"}).then(async response=>{const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.message||"Could not load Discord scoring status.");return data;})
+      .then(data=>{if(active)setPaused(data.paused);}).catch(error=>{if(active)setNotice(error.message);});
+    return()=>{active=false;};
+  },[]);
+  const change=async()=>{if(busy||paused===null)return;setBusy(true);setNotice("");
+    try{const response=await fetch("/api/admin/discord-score",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({paused:!paused})});
+      const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.message||"Could not update Discord scoring.");
+      setPaused(data.paused);setNotice(v10(language,"Discord scoring setting saved.","Discord 登分设置已保存。"));
+    }catch(error){setNotice(error.message);}finally{setBusy(false);}
+  };
+  return <Card id="discord-score-control"><h2 className="text-lg font-black">{v10(language,"Discord scoring","Discord 登分")}</h2>
+    <p className="mt-2 text-sm text-zinc-600">{v10(language,"Pause score submission through the Discord /record_game command. Website scoring at doramj.org stays available.","暂停 Discord /record_game 命令登分。doramj.org 网页登分仍可使用。")}</p>
+    <p className="mt-3 font-semibold" role="status">{paused===null?v10(language,"Loading status…","正在读取状态……"):paused?v10(language,"Discord scoring is paused.","Discord 登分已暂停。") :v10(language,"Discord scoring is available.","Discord 登分可用。")}</p>
+    <button type="button" disabled={paused===null||busy} onClick={change} className="mt-3 rounded-xl bg-navy px-5 py-3 font-bold text-white disabled:opacity-50">{busy?v10(language,"Saving…","正在保存……"):paused?v10(language,"Resume Discord scoring","恢复 Discord 登分"):v10(language,"Pause Discord scoring","暂停 Discord 登分")}</button>
+    {notice&&<p className="mt-2 text-sm" role="alert">{notice}</p>}
+  </Card>;
+}
+
+
 function PasswordResetAdmin({language}) {
   const [person,setPerson]=React.useState(null),[issued,setIssued]=React.useState(null),[busy,setBusy]=React.useState(false),[error,setError]=React.useState(null),[copied,setCopied]=React.useState(false),pending=React.useRef(false);
   const t=(en,cn)=>v10(language,en,cn);
@@ -1390,13 +1406,54 @@ function PasswordResetAdmin({language}) {
   </section>;
 }
 
+function playerPickerCopy(language, recordedOnly=false) {
+  return {
+    registeredNameSelected:v10(language,"Player selected","已选择玩家"),
+    registeredNameClear:v10(language,"Clear selection","清除选择"),
+    registeredNameLoading:v10(language,"Searching players…","正在搜索玩家……"),
+    registeredNameNone:recordedOnly
+      ?v10(language,"No matching player with a recorded game was found.","未找到有对局记录的匹配玩家。")
+      :v10(language,"No matching historical player was found.","未找到匹配的历史玩家。"),
+    registeredNameSearchFailed:v10(language,"Player search is unavailable. Please retry.","玩家搜索暂不可用，请重试。"),
+    registeredNameRetry:v10(language,"Retry search","重试搜索"),
+    registeredNameMore:v10(language,"More results","更多结果"),
+    registeredNameSelectRequired:v10(language,"Select a player from the suggestions.","请从候选列表中选择玩家。"),
+  };
+}
+
 function AccountCard({ players, session, profile, onSession, onProfile, onRefresh, language }) {
   const [message, setMessage] = React.useState("");
+  const [loginBusy,setLoginBusy]=React.useState(false);
+  const [memberQuery,setMemberQuery]=React.useState("");
+  const [memberChoices,setMemberChoices]=React.useState([]);
+  const [memberLoading,setMemberLoading]=React.useState(false);
+  const [memberSearchError,setMemberSearchError]=React.useState(false);
+  const [adminUsername,setAdminUsername]=React.useState("");
+  const hasPassword=profile?.has_password!==false;
 
-  async function request(path, form) {
-    setMessage("Working...");
-    const payload = Object.fromEntries(new FormData(form).entries());
-    const response = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+  React.useEffect(()=>{
+    const query=memberQuery.trim();
+    if(session||!query){setMemberChoices([]);setMemberLoading(false);setMemberSearchError(false);return;}
+    const controller=new AbortController();let current=true;
+    setMemberChoices([]);setMemberLoading(true);setMemberSearchError(false);
+    const timer=setTimeout(async()=>{
+      try {
+        const response=await fetch("/api/login-players?"+new URLSearchParams({q:query,limit:"20"}),{cache:"no-store",signal:controller.signal});
+        if(!response.ok)throw new Error("search");
+        const result=await response.json();
+        if(current)setMemberChoices(Array.isArray(result.users)?result.users:[]);
+      } catch(error) {
+        if(current&&error.name!=="AbortError"){setMemberChoices([]);setMemberSearchError(true);}
+      } finally {if(current)setMemberLoading(false);}
+    },180);
+    return()=>{current=false;clearTimeout(timer);controller.abort();};
+  },[session,memberQuery]);
+
+  async function request(path, source) {
+    setMessage(v10(language,"Working…","正在处理……"));
+    const fields=source?.tagName==="FORM"?Object.fromEntries(new FormData(source).entries()):{...(source||{})};
+    const payload = {...fields,returnTo:loginReturnTarget()};
+    const response = await fetch(path, { method: "POST", credentials:"same-origin", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
     const data = await response.json();
     if (!response.ok || !data.ok) {
       const error = new Error(data.message || "Request failed.");
@@ -1406,21 +1463,51 @@ function AccountCard({ players, session, profile, onSession, onProfile, onRefres
     return data;
   }
 
-  async function submit(event) {
-    event.preventDefault();
-    try {
-      const data = await request("/api/login", event.currentTarget);
-      onSession(data.user);
-      onRefresh();
-      const destination = new URLSearchParams(location.search).get("redirect_url") || "";
-      location.assign(safeLoginReturn(destination));
-    } catch (error) {
-      setMessage(error.code === "website_registration_required"
+  function showLoginError(error) {
+    setMessage(error.code === "admin_password_setup_required"
+      ? v10(language,"You are an administrator. Please register a password. Use the Discord verification button below.","你是管理员，请注册密码。请使用下方 Discord 验证按钮设置。")
+      : error.code === "website_registration_required"
         ? MahjongI18n.t(language, "websiteRegistrationRequired")
+        : error.code === "password_required"
+          ? v10(language,"Choose your name above to sign in without a password.","请在上方选择自己的姓名，无需密码即可登录。")
         : error.message === "Incorrect username or password."
           ? MahjongI18n.t(language, "loginFailed")
           : error instanceof TypeError ? MahjongI18n.t(language, "loginRequestFailed") : error.message);
+  }
+
+  async function submit(event) {
+    event.preventDefault();
+    if(loginBusy)return;
+    setLoginBusy(true);
+    try {
+      const data = await request("/api/login", event.currentTarget);
+      location.assign(safeLoginReturn(data.redirect_url||loginReturnTarget()));
+    } catch (error) {showLoginError(error);}
+    finally {setLoginBusy(false);}
+  }
+
+  async function chooseMember(player) {
+    if(loginBusy)return;
+    setLoginBusy(true);setMessage("");
+    try {
+      const data=await request("/api/login",{player_id:player.id});
+      location.assign(safeLoginReturn(data.redirect_url||loginReturnTarget()));
+    } catch(error) {showLoginError(error);}
+    finally {setLoginBusy(false);}
+  }
+
+  async function startAdminPasswordSetup() {
+    if(loginBusy)return;
+    if(!adminUsername.trim()){
+      setMessage(v10(language,"Enter your administrator username first.","请先输入管理员用户名。"));
+      return;
     }
+    setLoginBusy(true);setMessage(v10(language,"Opening Discord verification…","正在打开 Discord 验证……"));
+    try{
+      const response=await fetch("/api/admin/password-setup/start",{method:"POST",credentials:"same-origin",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:adminUsername.trim()})});
+      const data=await response.json();if(!response.ok||!data.ok)throw new Error(data.message||"Could not start password setup.");
+      location.assign(data.url);
+    }catch(error){setMessage(error.message||v10(language,"Could not start password setup.","无法开始密码设置。"));setLoginBusy(false);}
   }
 
   async function logout() {
@@ -1436,13 +1523,14 @@ function AccountCard({ players, session, profile, onSession, onProfile, onRefres
     const form = event.currentTarget;
     const formData = new FormData(form);
     if (formData.get("new_password") !== formData.get("confirm_password")) {
-      setMessage("Please enter the new password twice.");
+      setMessage(v10(language,"Please enter the new password twice.","请重复输入相同的新密码。"));
       return;
     }
     try {
       const data = await request("/api/change-password", form);
-      setMessage(data.warning || data.message);
+      setMessage(data.warning || data.message || v10(language,"Password saved.","密码已保存。"));
       form.reset();
+      onRefresh();
     } catch (error) {
       setMessage(error.message);
     }
@@ -1462,80 +1550,103 @@ function AccountCard({ players, session, profile, onSession, onProfile, onRefres
     }
   }
 
+  if (session && profile?.session_mode === "member") {
+    return <Card><div data-i18n-owned>
+      <SectionTitle icon={LogIn}>{v10(language,"Member selected","已选择成员")}</SectionTitle>
+      <p className="mb-4 rounded-xl bg-warm px-4 py-3">{v10(language,"Using the club member profile for","当前使用成员资料：")} <strong>{profile?.name||session}</strong></p>
+      <p className="mb-4 text-sm text-zinc-600">{v10(language,"You can switch members at any time. No password or administrator approval is needed for an existing player.","随时可以切换成员。已有玩家无需密码，也无需管理员审批。")}</p>
+      <div className="flex flex-wrap gap-3"><a href="/reservations" className="rounded-xl bg-navy px-4 py-3 font-bold text-white">{v10(language,"Reserve a table","预约桌子")}</a><button type="button" onClick={logout} className="rounded-xl border border-zinc-300 bg-white px-4 py-3 font-bold">{v10(language,"Switch member / Log out","切换成员 / 退出登录")}</button></div>
+      <p className="mt-4 min-h-5 text-sm font-semibold text-zinc-600" role="status">{message}</p>
+    </div></Card>;
+  }
+
   if (session) {
     return (
       <Card>
-        <SectionTitle icon={LogIn}>Account Settings</SectionTitle>
-        <div data-i18n-owned className="mb-4 rounded-xl bg-warm px-4 py-3">
-          <label className="grid gap-1 text-sm font-bold text-zinc-700">{MahjongI18n.t(language,"ownRegisteredName")}<input readOnly value={profile?.name||session} className="rounded-lg border border-zinc-200 bg-white px-3 py-2"/></label>
-          <p className="mt-2 text-sm text-zinc-600">{MahjongI18n.t(language,"registeredNameReadOnlyHelp")}</p>
-        </div>
-        <div className="mb-5 rounded-xl border border-zinc-200 bg-white px-4 py-3">
-          <h3 className="text-sm font-black uppercase tracking-[0.14em] text-zinc-500">Discord binding</h3>
-          {profile?.discord_id ? (
-            <div className="mt-2 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
-              <p className="font-bold text-zinc-800">Bound to {profile.discord_name || MahjongI18n.t(language,"discordLinked")}</p>
-              <button type="button" onClick={unbindDiscord} className="rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm font-black text-red-700">Unbind</button>
-            </div>
-          ) : (
-            <p className="mt-2 text-sm font-semibold text-zinc-600">Not bound. In Discord, run <span className="font-black">/bind_web_account</span> with this web account name.</p>
-          )}
-        </div>
-        <div className="mb-5"><DiscordOptional language={language} target="/login"/></div>
-        <form onSubmit={changePassword} className="grid gap-4">
-          <label className="grid gap-2 text-sm font-bold text-zinc-600">
-            Current password
-            <input name="old_password" type="password" required className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
-          </label>
-          <label className="grid gap-2 text-sm font-bold text-zinc-600">
-            New password
-            <input name="new_password" type="password" required className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
-          </label>
-          <label className="grid gap-2 text-sm font-bold text-zinc-600">
-            Confirm new password
-            <input name="confirm_password" type="password" required className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
-          </label>
-          <div className="grid grid-cols-2 gap-3">
-            <button className="rounded-xl bg-navy px-4 py-3 font-bold text-white">Change password</button>
-            <button type="button" onClick={logout} className="rounded-xl border border-zinc-300 bg-white px-4 py-3 font-bold">Log out</button>
+        <div data-i18n-owned>
+          <SectionTitle icon={LogIn}>{v10(language,"Account Settings","账号设置")}</SectionTitle>
+          <div className="mb-4 rounded-xl bg-warm px-4 py-3">
+            <label className="grid gap-1 text-sm font-bold text-zinc-700">{MahjongI18n.t(language,"ownRegisteredName")}<input readOnly value={profile?.name||session} className="rounded-lg border border-zinc-200 bg-white px-3 py-2"/></label>
+            <p className="mt-2 text-sm text-zinc-600">{MahjongI18n.t(language,"registeredNameReadOnlyHelp")}</p>
           </div>
-        </form>
-        <p className="mt-4 min-h-5 text-sm font-semibold text-zinc-600">{message}</p>
+          <div id="discord-binding" className="mb-5 rounded-xl border border-zinc-200 bg-white px-4 py-3">
+            <h3 className="text-sm font-black uppercase tracking-[0.14em] text-zinc-500">{v10(language,"Discord binding","Discord 绑定")}</h3>
+            {profile?.discord_id ? (
+              <div className="mt-2 flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+                <p className="font-bold text-zinc-800">{v10(language,"Bound to","已绑定至")} {profile.discord_name || MahjongI18n.t(language,"discordLinked")}</p>
+                <button type="button" onClick={unbindDiscord} className="rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm font-black text-red-700">{v10(language,"Unbind","解除绑定")}</button>
+              </div>
+            ) : (
+              <p className="mt-2 text-sm font-semibold text-zinc-600">{v10(language,"Not bound. In Discord, run","尚未绑定。请在 Discord 中运行")} <span className="font-black">/bind_web_account</span> {v10(language,"with this player name.","并使用当前玩家名称。")}</p>
+            )}
+          </div>
+          <div className="mb-5"><DiscordOptional language={language} target="/account#discord-binding"/></div>
+          <form onSubmit={changePassword} className="grid gap-4">
+            <p className="text-sm text-zinc-600">{hasPassword
+              ?v10(language,"Use this password for future sign-ins. Your player ID and match history remain linked to this account.","后续可使用此密码登录；玩家 ID 和历史成绩仍与此账号关联。")
+              :v10(language,"A password is optional. Existing members can sign in by selecting their name.","密码为可选项。已有成员可直接选择姓名登录。")}</p>
+            {hasPassword&&<label className="grid gap-2 text-sm font-bold text-zinc-600">
+              {v10(language,"Current password","当前密码")}
+              <input name="old_password" type="password" required autoComplete="current-password" className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
+            </label>}
+            <label className="grid gap-2 text-sm font-bold text-zinc-600">
+              {v10(language,hasPassword?"New password":"Set a password",hasPassword?"新密码":"设置密码")}
+              <input name="new_password" type="password" required minLength={6} maxLength={1024} autoComplete="new-password" className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
+            </label>
+            <label className="grid gap-2 text-sm font-bold text-zinc-600">
+              {v10(language,"Confirm new password","确认新密码")}
+              <input name="confirm_password" type="password" required minLength={6} maxLength={1024} autoComplete="new-password" className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
+            </label>
+            <div className="grid grid-cols-2 gap-3">
+              <button className="rounded-xl bg-navy px-4 py-3 font-bold text-white">{v10(language,hasPassword?"Change password":"Set password",hasPassword?"修改密码":"设置密码")}</button>
+              <button type="button" onClick={logout} className="rounded-xl border border-zinc-300 bg-white px-4 py-3 font-bold">{v10(language,"Log out","退出登录")}</button>
+            </div>
+          </form>
+          <p className="mt-4 min-h-5 text-sm font-semibold text-zinc-600" role="status">{message}</p>
+        </div>
       </Card>
     );
   }
 
-  return (
-    <Card>
-      <SectionTitle icon={LogIn}>Account</SectionTitle>
-      <p data-i18n-owned className="mb-4 text-sm text-zinc-600">{v10(language,"Your username is your player name. Existing players sign in with the same name shown in the player list after their account is approved.","用户名就是你的玩家名称。已有玩家开通账号并通过审批后，使用名单中原来的名字登录。")}</p>
+  return <Card><div data-i18n-owned>
+    <SectionTitle icon={LogIn}>{v10(language,"Choose a member","选择成员")}</SectionTitle>
+    <p className="mb-4 text-sm text-zinc-600">{v10(language,"Search the club list by player name or ID. Select a member to continue; existing members do not need a password or administrator approval.","按玩家姓名或 ID 搜索俱乐部名单。选择成员即可进入；已有成员无需密码或管理员审批。")}</p>
+    <label className="grid gap-2 text-sm font-bold text-zinc-600">{v10(language,"Player name or ID","玩家姓名或 ID")}
+      <input value={memberQuery} onChange={event=>setMemberQuery(event.target.value)} autoComplete="off" role="combobox" aria-expanded={Boolean(memberQuery.trim())} aria-controls="member-login-results" className="h-12 rounded-xl border border-zinc-200 px-3 text-zinc-950" placeholder={v10(language,"Type a name or player ID","输入姓名或玩家 ID")}/>
+    </label>
+    {memberQuery.trim()&&<div className="mt-2 rounded-xl border border-zinc-200 bg-white p-2" id="member-login-results">
+      {memberLoading&&<p className="p-2 text-sm" role="status">{v10(language,"Searching members…","正在搜索成员……")}</p>}
+      {memberSearchError&&<p className="p-2 text-sm text-red-700" role="alert">{v10(language,"Member search is unavailable. Please retry.","成员搜索暂不可用，请重试。")}</p>}
+      {!memberLoading&&!memberSearchError&&!memberChoices.length&&<p className="p-2 text-sm text-zinc-600" role="status">{v10(language,"No matching member found.","没有找到匹配成员。")}</p>}
+      <ul className="max-h-64 overflow-y-auto" role="listbox">{memberChoices.map(player=><li key={player.id}><button type="button" disabled={loginBusy} onClick={()=>chooseMember(player)} className="flex w-full items-center justify-between gap-3 rounded-lg px-3 py-3 text-left hover:bg-warm disabled:opacity-50"><span className="break-words font-bold">{player.name}</span><span className="shrink-0 text-xs text-zinc-500">ID {player.display_id}</span></button></li>)}</ul>
+    </div>}
+    <a href={"/register?returnTo="+encodeURIComponent(loginReturnTarget())} className="mt-4 inline-block rounded-xl border border-zinc-300 bg-white px-4 py-3 text-center font-bold">{v10(language,"New member? Register","新成员？注册")}</a>
+    <details open={location.hash==="#admin-password-setup"} className="mt-5 rounded-xl border border-zinc-200 bg-zinc-50 p-4">
+      <summary className="cursor-pointer font-bold text-zinc-700">{v10(language,"Administrator entrance","管理员入口")}</summary>
+      <p className="mb-4 mt-3 text-sm text-zinc-600">{v10(language,"Administrators sign in separately with their username and password.","管理员请在此使用独立的用户名和密码登录。")}</p>
       <form onSubmit={submit} className="grid gap-4">
-        <label className="grid gap-2 text-sm font-bold text-zinc-600">
-          Username
-          <input name="username" required className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
-        </label>
-        <label className="grid gap-2 text-sm font-bold text-zinc-600">
-          Password
-          <input name="password" type="password" required className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
-        </label>
-        <div className="grid grid-cols-3 gap-3">
-          <button className="rounded-xl bg-navy px-4 py-3 font-bold text-white">Log in</button>
-          <a href={"/register?redirect_url="+encodeURIComponent(new URLSearchParams(location.search).get("redirect_url")||"/")} className="rounded-xl border border-zinc-300 bg-white px-4 py-3 font-bold text-center">Register</a>
-          <button type="button" onClick={logout} className="rounded-xl border border-zinc-300 bg-white px-4 py-3 font-bold">Log out</button>
-        </div>
+        <label className="grid gap-2 text-sm font-bold text-zinc-600">{v10(language,"Administrator username","管理员用户名")}<input name="username" value={adminUsername} onChange={e=>setAdminUsername(e.target.value)} autoComplete="username" required disabled={loginBusy} className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950"/></label>
+        <label className="grid gap-2 text-sm font-bold text-zinc-600">{v10(language,"Password","密码")}<input name="password" type="password" autoComplete="current-password" disabled={loginBusy} className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950"/></label>
+        <button disabled={loginBusy} className="rounded-xl bg-navy px-4 py-3 font-bold text-white disabled:opacity-50">{loginBusy?v10(language,"Signing in…","正在登录……"):v10(language,"Administrator sign in","管理员登录")}</button>
       </form>
+      <button type="button" disabled={loginBusy} onClick={startAdminPasswordSetup} className="mt-3 w-full rounded-xl border border-zinc-300 bg-white px-4 py-3 text-sm font-bold disabled:opacity-50">{v10(language,"No password yet? Verify Discord and set one","还没有密码？验证 Discord 后即可设置")}</button>
+      <AdminPasswordSetup language={language}/>
       <PasswordRecovery language={language}/>
-      <p className="mt-4 min-h-5 text-sm font-semibold text-zinc-600">{message || (session ? `Active account: ${session}` : MahjongI18n.t(language, "websiteRegistrationHelp"))}</p>
-    </Card>
-  );
+    </details>
+    <p className="mt-4 min-h-5 text-sm font-semibold text-zinc-600" role="status">{message}</p>
+  </div></Card>;
 }
 
 function RecordGameCard({ session, profile, authReady, onRefresh, language }) {
   const frame = React.useRef(null);
   const initialDraft = React.useRef(new URLSearchParams(location.search).get("draft_id")||"");
   const [height, setHeight] = React.useState(1100);
-  const [table,setTable] = React.useState(()=>new URLSearchParams(location.search).get("table") || "");
+  const [reviewOpen,setReviewOpen] = React.useState(false);
+  const [table,setTable] = React.useState("");
+  const requestedTable=React.useRef(new URLSearchParams(location.search).get("table")??(location.pathname.startsWith("/tables/")?location.pathname.split("/")[2]:null));
+  const entryToken=React.useRef(new URLSearchParams(location.hash.slice(1)).get("entry"));
   const pendingSeat = React.useRef(new URLSearchParams(location.search).get("pending_seat")||"");
+  const autoSelectFull=React.useRef(!initialDraft.current&&!pendingSeat.current&&!entryToken.current&&!location.pathname.startsWith("/tables/")&&!new URLSearchParams(location.search).has("match_id"));
   const sendContext = () => {
     const target=frame.current?.contentWindow;if(!target)return;
     target.postMessage({type:"mahjong-language",language},location.origin);
@@ -1543,11 +1654,23 @@ function RecordGameCard({ session, profile, authReady, onRefresh, language }) {
       table,entryToken:new URLSearchParams(location.hash.slice(1)).get("entry"),pendingSeat:pendingSeat.current},location.origin);
   };
   React.useEffect(sendContext, [language,authReady,profile?.id,profile?.name,table]);
+  React.useLayoutEffect(()=>{
+    if(!reviewOpen)return;
+    const previous=document.body.style.overflow;
+    document.body.style.overflow="hidden";
+    frame.current?.contentWindow?.postMessage({type:"mahjong-score-review-ready"},location.origin);
+    return ()=>{document.body.style.overflow=previous;};
+  },[reviewOpen,table]);
   React.useEffect(() => {
     function receive(event) {
       if (event.origin !== location.origin || event.source !== frame.current?.contentWindow) return;
       if (event.data?.type === "mahjong-score-ready") sendContext();
-      if (event.data?.type === "mahjong-seat-swap-open" && event.data.table===table) {
+      if (event.data?.type === "mahjong-score-review" && event.data.table===table) {
+        setReviewOpen(Boolean(event.data.open));
+        // Repeated recognition can update an already open correction dialog.
+        if(event.data.open&&reviewOpen)frame.current?.contentWindow?.postMessage({type:"mahjong-score-review-ready"},location.origin);
+      }
+      if (["mahjong-seat-swap-open","mahjong-seat-action-open"].includes(event.data?.type) && event.data.table===table) {
         const top=frame.current.getBoundingClientRect().top+window.scrollY;
         window.scrollTo({top:Math.max(0,top-112),behavior:"instant"});
       }
@@ -1570,18 +1693,21 @@ function RecordGameCard({ session, profile, authReady, onRefresh, language }) {
     }
     window.addEventListener("message", receive);
     return () => window.removeEventListener("message", receive);
-  }, [onRefresh,authReady,profile?.id,profile?.name,language,table]);
+  }, [onRefresh,authReady,profile?.id,profile?.name,language,table,reviewOpen]);
   return (
     <Card className="scroll-mt-8" id="record-game">
       <SectionTitle icon={Camera}>{MahjongI18n.t(language,"photoScore")}</SectionTitle>
       <div className="mb-4 flex flex-wrap gap-3" data-i18n-owned>
         <a className={buttonStyle} href={"/manual-score"+(table?"?table="+encodeURIComponent(table):"")}>{MahjongI18n.t(language,"manualScore")}</a>
-        <a className="px-2 py-2 text-sm underline" href={"/reservations"+(table?"?table="+encodeURIComponent(table):"")}>{MahjongI18n.t(language,"viewReservations")}</a>
+        {table&&<a className="px-2 py-2 text-sm underline" href={"/reservations?table="+encodeURIComponent(table)}>{MahjongI18n.t(language,"viewReservations")}</a>}
       </div>
-      <OrdinaryTables onChanged={()=>frame.current?.contentWindow?.postMessage({type:"mahjong-table-changed"},location.origin)} profile={profile} language={language} selected={table} onSelect={id=>{const url=new URL(location.href);if(id!==table){initialDraft.current="";pendingSeat.current="";url.searchParams.delete("draft_id");url.searchParams.delete("pending_seat");const fragment=new URLSearchParams(url.hash.slice(1));if(fragment.has("entry")){fragment.delete("entry");url.hash=fragment.toString();}}setTable(id);url.searchParams.set("page","record");url.searchParams.set("table",id);history.replaceState(null,"",url);}}/>
-      {table&&<iframe ref={frame} onLoad={sendContext} title={MahjongI18n.t(language,"photoFrame")}
-        src={"/score?embedded=1&table=" + encodeURIComponent(table)+(initialDraft.current?"&draft_id="+encodeURIComponent(initialDraft.current):"")}
-        className="w-full border-0" style={{height: height + "px"}} />}
+      <ScoringTableStatus profile={profile} language={language} requestedTable={requestedTable.current} entryToken={entryToken.current} autoSelectFull={autoSelectFull.current}
+        onChanged={()=>frame.current?.contentWindow?.postMessage({type:"mahjong-table-changed"},location.origin)}
+        onResolved={id=>{if(id!==table){const url=new URL(location.href);if(id)url.searchParams.set("table",id);else url.searchParams.delete("table");if(table){initialDraft.current="";pendingSeat.current="";url.searchParams.delete("draft_id");url.searchParams.delete("pending_seat");}history.replaceState(null,"",url);setTable(id);}}}/>
+
+      {table&&<div style={{height:height+"px"}}><iframe ref={frame} onLoad={sendContext} title={MahjongI18n.t(language,"photoFrame")}
+        key={table} src={"/score?embedded=1&table=" + encodeURIComponent(table)+(initialDraft.current?"&draft_id="+encodeURIComponent(initialDraft.current):"")}
+        className="w-full border-0" style={reviewOpen?{position:"fixed",inset:0,zIndex:1000,width:"100vw",height:"100dvh"}:{height:height+"px"}} /></div>}
     </Card>
   );
 }
@@ -1593,6 +1719,8 @@ function QuarterControlCard({ language, session, profile, players, yakumanOption
   const [playerMessage, setPlayerMessage] = React.useState("");
   const [yakumanMessage, setYakumanMessage] = React.useState("");
   const [yakumanCandidates, setYakumanCandidates] = React.useState([]);
+  const [mergeSource,setMergeSource]=React.useState(null);
+  const [mergeTarget,setMergeTarget]=React.useState(null);
   const canAdmin = Boolean(profile?.is_admin);
   const canSuperAdmin = Boolean(profile?.is_super_admin);
 
@@ -1665,14 +1793,27 @@ function QuarterControlCard({ language, session, profile, players, yakumanOption
     }
     const form = event.currentTarget;
     const payload = Object.fromEntries(new FormData(form).entries());
-    if (!window.confirm(`Merge ${payload.source_name || "source"} into ${payload.target_name || "target"} and recompute every SQL game?`)) return;
-    setPlayerMessage("Merging players and recomputing all games...");
+    if(!mergeSource||!mergeTarget||!payload.source_player_id||!payload.target_player_id){
+      setPlayerMessage(v10(language,"Select both historical players from the search results.","请从搜索结果中选择要合并的两个历史玩家。"));
+      return;
+    }
+    if(String(payload.source_player_id)===String(payload.target_player_id)){
+      setPlayerMessage(v10(language,"Choose two different player IDs.","请选择两个不同的玩家 ID。"));
+      return;
+    }
+    const describe=person=>`${person.name} (ID ${person.display_id||v10(language,"unavailable","不可用")})`;
+    const prompt=v10(language,
+      `Merge ${describe(mergeSource)} into ${describe(mergeTarget)} and recompute every SQL game?`,
+      `确认将 ${describe(mergeSource)} 合并到 ${describe(mergeTarget)}，并重新计算所有对局吗？`);
+    if (!window.confirm(prompt)) return;
+    setPlayerMessage(v10(language,"Merging players and recomputing all games…","正在合并玩家并重新计算所有对局……"));
     try {
       const response = await fetch("/api/admin/player-merge", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
       const data = await response.json();
       if (!response.ok || !data.ok) throw new Error(data.message || "Could not merge players.");
       setPlayerMessage(data.message);
       form.reset();
+      setMergeSource(null);setMergeTarget(null);
       onRefresh();
     } catch (error) {
       setPlayerMessage(error.message);
@@ -1830,12 +1971,15 @@ function QuarterControlCard({ language, session, profile, players, yakumanOption
             <input name="player_name" placeholder="New player name" required className="h-11 rounded-xl border border-zinc-200 px-3 text-zinc-950" />
             <button className="h-11 rounded-xl border border-zinc-300 bg-white px-5 font-bold">Create player</button>
           </form>
-          <ClaimAdmin language={language}/>
           <RegisteredNameAdmin language={language} onRefresh={onRefresh}/>
-          <form onSubmit={mergePlayers} className="grid gap-3 md:grid-cols-[1fr_1fr_auto]">
-            <RegisteredUserField name="source_name" label={MahjongI18n.t(language,"registeredMergeSource")} required language={language}/>
-            <RegisteredUserField name="target_name" label={MahjongI18n.t(language,"registeredMergeTarget")} required language={language}/>
-            <button className="h-11 rounded-xl border border-red-200 bg-red-50 px-5 font-extrabold text-red-700">Merge + recompute</button>
+          <form onSubmit={mergePlayers} data-i18n-owned className="grid gap-3 md:grid-cols-[1fr_1fr_auto]">
+            <RegisteredUserField idName="source_player_id" label={v10(language,"Player ID to merge","要合并的玩家 ID")} required language={language}
+              searchUrl="/api/history-players" placeholder={v10(language,"Search name or player ID…","搜索姓名或玩家 ID……")}
+              copy={playerPickerCopy(language)} onSelected={setMergeSource} excludeIds={mergeTarget?[mergeTarget.id]:[]}/>
+            <RegisteredUserField idName="target_player_id" label={v10(language,"Player ID to keep","要保留的玩家 ID")} required language={language}
+              searchUrl="/api/history-players" placeholder={v10(language,"Search name or player ID…","搜索姓名或玩家 ID……")}
+              copy={playerPickerCopy(language)} onSelected={setMergeTarget} excludeIds={mergeSource?[mergeSource.id]:[]}/>
+            <button disabled={!mergeSource||!mergeTarget} className="h-11 rounded-xl border border-red-200 bg-red-50 px-5 font-extrabold text-red-700 disabled:opacity-40">{v10(language,"Merge + recompute","合并并重算")}</button>
           </form>
           <form onSubmit={setPlayerIcon} className="grid gap-3 md:grid-cols-[1fr_160px_1fr_auto]">
             <RegisteredUserField name="username" label={MahjongI18n.t(language,"registeredName")} required language={language}/>
@@ -2067,8 +2211,9 @@ function MatchManagementPanel({ language, players, yakumanOptions, session, prof
                   {row.created_by && <p className="text-xs font-bold uppercase tracking-[0.14em] text-zinc-400">by {row.created_by}</p>}
                 </div>
                 <button disabled={!canUse} onClick={() => setOpenGameId(openGameId === row.game_id ? null : row.game_id)} className="rounded-xl border border-zinc-300 bg-white px-4 py-2 text-sm font-extrabold disabled:cursor-not-allowed disabled:opacity-40">Add yakuman</button>
-                <button disabled={!canUse} onClick={() => revert(row.game_id)} className="rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm font-extrabold text-red-700 disabled:cursor-not-allowed disabled:opacity-40">Revert game</button>
+                <button disabled={!canUse || row.can_revert === false} onClick={() => revert(row.game_id)} className="rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-sm font-extrabold text-red-700 disabled:cursor-not-allowed disabled:opacity-40">Revert game</button>
               </div>
+              {row.can_revert === false && <p className="mt-2 text-sm text-zinc-600">NFC scores require a coordinated correction and cannot be reverted here.</p>}
               {openGameId === row.game_id && (
                 <form onSubmit={(event) => addYakuman(event, row)} className="mt-4 grid gap-3 rounded-xl border border-zinc-200 bg-warm p-4">
                   <div className="grid gap-3 md:grid-cols-3">
@@ -2318,17 +2463,23 @@ function normalizeRecords(games, session) {
 function formatSheetDate(value) {
   if (!value) return "Recent";
   const text = String(value).trim();
+  // Game timestamps are stored with an explicit offset (usually UTC). Render
+  // them consistently in the club's Pacific time, regardless of browser locale.
+  if (/[zZ]|[+-]\d{2}:?\d{2}$/.test(text)) {
+    const date = new Date(text);
+    if (!Number.isNaN(date.getTime())) {
+      const parts = Object.fromEntries(new Intl.DateTimeFormat("en-US", {
+        timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit",
+        hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23", timeZoneName: "short",
+      }).formatToParts(date).map((part) => [part.type, part.value]));
+      return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} ${parts.timeZoneName}`;
+    }
+  }
   return text;
 }
 
 function normalizeName(value) {
   return String(value || "").trim().toLowerCase().replace(/\s+/g, " ");
-}
-
-function splitPlayerFilter(value, size = 4) {
-  const parts = String(value || "").split(/[,/]/).map((name) => name.trim()).slice(0, size);
-  while (parts.length < size) parts.push("");
-  return parts;
 }
 
 function formatShortDate(value) {
@@ -2482,3 +2633,5 @@ function lucideReactShim() {
 }
 
 ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+
+

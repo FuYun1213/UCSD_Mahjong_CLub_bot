@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import replace
+import threading
+import time
 from urllib.parse import parse_qs, urlsplit
 
 import pytest
@@ -25,22 +27,36 @@ class FakeSheets:
         self.fail_current = False
         self.fail_history = False
         self.lose_history_ack = False
+        self.current_calls = 0
+        self.history_calls = []
+        self.current_delay = 0
 
     def write_current(self, table):
+        self.current_calls += 1
+        if self.current_delay:
+            time.sleep(self.current_delay)
         if self.fail_current:
             raise ConnectionError("current unavailable")
         self.current[table["table_id"]] = deepcopy(table)
 
     def write_history(self, match):
+        self.history_calls.append(match["match_id"])
         if self.fail_history:
             raise ConnectionError("history unavailable")
         self.history[match["sequence"]] = deepcopy(match)
         if self.lose_history_ack:
             raise TimeoutError("write succeeded but acknowledgement was lost")
 
+    def reconcile_history(self, match):
+        stored = [row for row in self.history.values() if row["match_id"] == match["match_id"]]
+        if not stored:
+            return "absent"
+        return "matched" if len(stored) == 1 and stored[0]["result"] == match["result"] else "conflict"
+
 
 @pytest.fixture
-def settings(tmp_path):
+def settings(tmp_path, monkeypatch):
+    monkeypatch.setenv("TABLE_ACCOUNT_FILE", str(tmp_path / "accounts.json"))
     return Settings(database_path=tmp_path / "test.sqlite3", mock_auth_enabled=True, yolo_api_key=YOLO["X-API-Key"], sync_interval_seconds=3600)
 
 
@@ -137,20 +153,29 @@ def test_complete_round_and_next_round(setup):
     client, sheets, service = setup
     match_id = fill(client)
     response = submit(client, match_id=match_id, key="capture-1")
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
+    assert response.json()["local_saved"] and response.json()["local_completed"]
+    assert response.json()["history_sync"]["status"] == "pending"
     result = response.json()["result"]
     assert result["round"] == 1
     assert [result["players"][seat]["user"]["id"] for seat in SEATS] == ["u1", "u2", "u3", "u4"]
     assert [result["players"][seat]["net_score"] for seat in SEATS] == [10, -5, -10, 5]
     assert all(result["players"][seat]["initial_points"] == 25000 for seat in SEATS)
     assert not any(service.table("1")["seats"].values())
-    assert not any(sheets.current["1"]["seats"].values())
-    assert len(sheets.history) == 1
+    assert not sheets.history and not sheets.current and sheets.current_calls == 0
+    service.flush()
+    assert sheets.history_calls == [match_id]
+    assert service.history.status(match_id)["status"] == "synced"
     next_id = fill(client)
     assert next_id != match_id
     response = submit(client, match_id=next_id, key="capture-2")
+    assert response.status_code == 202 and response.json()["local_completed"]
     assert response.json()["result"]["round"] == 2
-    assert len(sheets.history) == 2
+    assert len(sheets.history) == 1
+    service.flush()
+    service.flush()
+    assert len(sheets.history) == 2 and sheets.history_calls == [match_id, next_id]
+    assert sheets.current_calls == 0
 
 
 def test_missing_seats_no_side_effects(setup):
@@ -203,7 +228,8 @@ def test_bad_total_and_wind(setup):
 def test_negative_scores_are_supported(setup):
     client, _, _ = setup
     fill(client)
-    assert submit(client, scores={"east": -5000, "south": 60000, "west": 15000, "north": 30000}).status_code == 200
+    response = submit(client, scores={"east": -5000, "south": 60000, "west": 15000, "north": 30000})
+    assert response.status_code == 202 and response.json()["local_completed"]
 
 
 def test_configurable_initial_points(settings):
@@ -226,78 +252,128 @@ def test_retries_do_not_score_new_occupants(setup):
     assert retry_by_id.json()["replayed"] is True
     assert service.table("1")["match_id"] == new_id
     assert all(service.table("1")["seats"].values())
-    assert len(sheets.history) == 1
+    assert not sheets.history
+    service.flush()
+    assert len(sheets.history) == 1 and sheets.history_calls == [old_id]
+    assert service.table("1")["match_id"] == new_id and all(service.table("1")["seats"].values())
+    assert sheets.current_calls == 0
     assert submit(client, scores={**POINTS, "east": 36000, "south": 19000}, key="same-capture").status_code == 409
     assert submit(client, match_id="unknown-old-id").status_code == 409
 
 
 def test_minimal_payload_supported_and_empty_table_blocks_immediate_repeat(setup):
-    client, sheets, _ = setup
+    client, sheets, service = setup
     fill(client)
-    assert submit(client).status_code == 200
+    response = submit(client)
+    assert response.status_code == 202 and response.json()["local_completed"]
     assert submit(client).status_code == 409
+    assert not sheets.history
+    service.flush()
     assert len(sheets.history) == 1
 
 
-def test_seat_sync_failure_is_persisted_and_retried(setup):
+@pytest.mark.parametrize("failure,delay", [(True, 0), (False, .25)])
+def test_seat_never_calls_retired_current_projection(setup, failure, delay):
     client, sheets, service = setup
-    sheets.fail_current = True
+    sheets.fail_current, sheets.current_delay = failure, delay
     response = sit(client)
-    assert response.status_code == 202
-    assert response.json()["sync_status"] == "pending"
+    assert response.status_code == 200
+    assert response.json()["sync_status"] == "not_required"
     assert service.table("1")["seats"]["east"] == "u1"
-    sheets.fail_current = False
+    assert sheets.current_calls == 0 and not sheets.current
     assert client.post("/api/sync", headers=YOLO).json()["status"] == "success"
-    assert sheets.current["1"]["seats"]["east"]["id"] == "u1"
+    assert sheets.current_calls == 0 and not sheets.current
 
 
 @pytest.mark.parametrize("lose_ack", [False, True])
-def test_history_failure_freezes_snapshot_until_retry(setup, lose_ack):
+def test_history_failure_preserves_snapshot_without_freezing_new_seats(setup, lose_ack):
     client, sheets, service = setup
     match_id = fill(client)
     sheets.fail_history = not lose_ack
     sheets.lose_history_ack = lose_ack
-    assert submit(client, match_id=match_id, key="retry").status_code == 202
-    assert all(service.table("1")["seats"].values())
-    assert service.table("1")["settlement_pending"]
-    assert sit(client, 5).status_code == 409
-    assert sit(client, 1, 2, "west").status_code == 409
-    assert submit(client, scores={**POINTS, "east": 36000, "south": 19000}).status_code == 409
-    sheets.fail_history = sheets.lose_history_ack = False
-    response = submit(client, match_id=match_id, key="retry")
-    assert response.status_code == 200
-    assert response.json()["replayed"] is True
-    assert len(sheets.history) == 1
+    submitted = submit(client, match_id=match_id, key="retry")
+    assert submitted.status_code == 202
+    assert submitted.json()["local_saved"] and submitted.json()["local_completed"]
+    saved_result = submitted.json()["result"]
     assert not any(service.table("1")["seats"].values())
+    assert not service.table("1")["settlement_pending"]
+    assert sheets.history_calls == []
+    service.flush()
+    assert service.history.status(match_id)["status"] == "delivery_unknown"
+    assert len(sheets.history) == int(lose_ack)
+    assert sit(client, 5).status_code == 200
+    next_id = service.table("1")["match_id"]
+    assert sit(client, 1, 2, "west").status_code == 200
+    # Submission retries read the immutable old result; they do not retry I/O.
+    response = submit(client, match_id=match_id, key="retry")
+    assert response.status_code == 202 and response.json()["replayed"]
+    assert response.json()["result"] == saved_result
+    assert sheets.history_calls == [match_id]
+    assert submit(client, match_id=match_id, scores={**POINTS, "east": 36000, "south": 19000}).status_code == 409
+    sheets.fail_history = sheets.lose_history_ack = False
+    service.history.retry(match_id)
+    service.flush()
+    replay = submit(client, match_id=match_id, key="retry")
+    assert replay.status_code == 200 and replay.json()["replayed"]
+    assert replay.json()["result"] == saved_result
+    assert len(sheets.history) == 1
+    assert sheets.history_calls == [match_id] * (1 if lose_ack else 2)
+    assert service.table("1")["match_id"] == next_id and service.table("1")["seats"]["east"] == "u5"
+    assert service.table("2")["seats"]["west"] == "u1"
+    assert sheets.current_calls == 0
 
 
-def test_failed_sheet_clear_then_new_seat_is_not_lost(setup):
+def test_old_history_delivery_never_clears_new_seat(setup):
     client, sheets, service = setup
     match_id = fill(client)
     sheets.fail_current = True
-    assert submit(client, match_id=match_id).status_code == 202
+    response = submit(client, match_id=match_id)
+    assert response.status_code == 202 and response.json()["local_completed"]
     assert not any(service.table("1")["seats"].values())
-    assert sit(client, 5, 1, "east").status_code == 202
-    sheets.fail_current = False
+    assert sit(client, 5, 1, "east").status_code == 200
+    next_id = service.table("1")["match_id"]
+    service.flush()
     assert submit(client, match_id=match_id).status_code == 200
     assert service.table("1")["seats"]["east"] == "u5"
-    assert sheets.current["1"]["seats"]["east"]["id"] == "u5"
+    assert service.table("1")["match_id"] == next_id
+    assert sheets.current_calls == 0 and not sheets.current
     assert len(sheets.history) == 1
 
 
-def test_restart_recovers_pending_history(settings):
+def test_restart_recovers_pending_history_without_blocking_readiness(settings):
     sheets = FakeSheets()
-    sheets.fail_history = True
     with TestClient(create_app(settings, sheets)) as client:
         match_id = fill(client)
-        assert submit(client, key="restart").status_code == 202
-    sheets.fail_history = False
-    with TestClient(create_app(settings, sheets)) as client:
-        state = client.get("/api/machine/tables/1", headers=YOLO).json()
-        assert not any(state["seats"].values())
-        assert state["round"] == 2
-        assert submit(client, key="restart").json()["result"]["match_id"] == match_id
-    assert len(sheets.history) == 1
+        response = submit(client, key="restart")
+        assert response.status_code == 202 and response.json()["local_completed"]
+        assert not sheets.history
+    entered, release = threading.Event(), threading.Event()
+    original_write = sheets.write_history
+    def blocked_write(match):
+        entered.set()
+        assert release.wait(5)
+        original_write(match)
+    sheets.write_history = blocked_write
+    try:
+        with TestClient(create_app(settings, sheets)) as client:
+            try:
+                assert entered.wait(3), "Restart worker should discover durable pending history"
+                assert client.get("/health").status_code == 200
+                state = client.get("/api/machine/tables/1", headers=YOLO).json()
+                assert not any(state["seats"].values()) and state["round"] == 2
+                assert submit(client, key="restart").json()["result"]["match_id"] == match_id
+                assert sit(client, 5).status_code == 200
+            finally:
+                release.set()
+            deadline = time.monotonic() + 3
+            while client.app.state.service.history.status(match_id)["status"] != "synced" and time.monotonic() < deadline:
+                time.sleep(.01)
+            assert client.app.state.service.history.status(match_id)["status"] == "synced"
+            assert client.app.state.service.table("1")["seats"]["east"] == "u5"
+    finally:
+        release.set()
+    assert len(sheets.history) == 1 and sheets.history_calls == [match_id]
+    assert sheets.current_calls == 0
 
 
 def test_concurrent_submits_settle_once(setup):
@@ -306,9 +382,11 @@ def test_concurrent_submits_settle_once(setup):
     payload = SubmitScores(table=1, scores=POINTS, match_id=match_id)
     with ThreadPoolExecutor(max_workers=8) as pool:
         results = list(pool.map(lambda _: service.submit(payload, "concurrent"), range(12)))
-    assert all(status == 200 for _, status in results)
+    assert all(status == 202 and body["local_saved"] and body["local_completed"] for body, status in results)
     assert sum(not body["replayed"] for body, _ in results) == 1
-    assert len(sheets.history) == 1
+    assert not sheets.history
+    service.flush()
+    assert len(sheets.history) == 1 and sheets.history_calls == [match_id]
     assert service.table("1")["round"] == 2
 
 
@@ -332,7 +410,7 @@ def test_second_process_for_same_database_is_rejected(settings):
                 pass
 
 
-def test_enabling_sheets_replays_local_history_without_clearing_new_round(settings):
+def test_enabling_sheets_does_not_replay_formerly_local_only_history(settings):
     with TestClient(create_app(settings, DisabledSheets())) as client:
         fill(client)
         assert submit(client).json()["sync_status"] == "disabled"
@@ -342,5 +420,15 @@ def test_enabling_sheets_replays_local_history_without_clearing_new_round(settin
         state = client.get("/api/machine/tables/1", headers=YOLO).json()
         assert state["round"] == 2
         assert state["seats"]["east"] == "u5"
-        assert len(sheets.history) == 1
-        assert sheets.current["1"]["seats"]["east"]["id"] == "u5"
+        client.app.state.service.flush()
+        assert not sheets.history and not sheets.current and sheets.current_calls == 0
+        assert client.app.state.service.table("1")["seats"]["east"] == "u5"
+        # Newly registered scores still enqueue their own history target.
+        for user, seat in zip((2, 3, 4), ("south", "west", "north")):
+            assert sit(client, user, 1, seat).status_code == 200
+        fresh = submit(client, key="enabled-new-history")
+        assert fresh.status_code == 202 and fresh.json()["local_completed"]
+        assert not sheets.history
+        client.app.state.service.flush()
+        assert list(sheets.history) == [2]
+        assert sheets.history_calls == [fresh.json()["result"]["match_id"]]

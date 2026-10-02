@@ -10,13 +10,18 @@ from .models import SEATS
 
 
 def migrate(engine):
-    from . import guest_models, tournament_models, table_models, manual_score_models, seat_swap_models, reservation_session_models, discord_reminder_models  # Register additive tables.
+    from . import guest_models, tournament_models, table_models, manual_score_models, seat_swap_models, reservation_session_models, discord_reminder_models, history_delivery_models, reservation_queue_models, game_round_models  # Register additive tables.
     inspector = inspect(engine)
     additions = {
+        "score_projection_jobs": {"completion_synced": "INTEGER NOT NULL DEFAULT 0", "source_priority": "INTEGER NOT NULL DEFAULT 1"},
+        "score_deliveries": {"source_priority": "INTEGER NOT NULL DEFAULT 1"},
         "tournaments": {"deleted_at": "VARCHAR(40)", "deleted_by": "VARCHAR(128)", "delete_reason": "TEXT"},
         "nfc_score_drafts": {"photo_sha256": "VARCHAR(64)"},
+        "table_reservations": {"plan_kind": "VARCHAR(16) NOT NULL DEFAULT 'legacy_unknown'", "planned_games": "INTEGER"},
+        "table_reservation_participants": {"queue_position": "INTEGER"},
         "nfc_tables": {"started_at": "VARCHAR(40)"},
         "nfc_matches": {
+            "local_finalized": "INTEGER NOT NULL DEFAULT 0",
             "started_at": "VARCHAR(40)", "ended_at": "VARCHAR(40)",
             "duration_seconds": "INTEGER", "uploader_id": "VARCHAR(128)",
             "seat_order": "VARCHAR(16) NOT NULL DEFAULT 'ESWN'",
@@ -49,6 +54,10 @@ def migrate(engine):
     from .table_migrations import migrate_tables
     migrate_tables(engine)
     migrate_reservation_sessions(engine)
+    from .game_round_migrations import migrate_game_rounds
+    migrate_game_rounds(engine)
+    from .reservation_queue_migrations import migrate_reservation_queue
+    migrate_reservation_queue(engine)
     from .discord_reminder_migrations import migrate_discord_reminders
     migrate_discord_reminders(engine)
     from .manual_score_migrations import migrate_manual_scores
@@ -77,3 +86,5 @@ def migrate(engine):
                         source_position=position))
 
         db.add(Metadata(key="orm_v2_migrated", value="1"))
+
+

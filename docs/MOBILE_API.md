@@ -8,7 +8,7 @@
 
 ## 当前认证约定
 
-登录使用 `POST /api/login`：
+普通成员使用 `GET /api/players` 搜索本人条目后，向 `POST /api/login` 提交返回的 `player_id`，无需重新注册或管理员审核。管理员使用用户名和密码单独登录。以下用户名密码请求仍可用于本地演示和管理员入口：
 
 ```json
 {"username":"Alice","password":"LocalTest!2026"}
@@ -18,10 +18,10 @@
 
 - `GET /api/session` 返回 `user` 和 `profile`；未登录时二者为 null。使用 `profile.id` 作为稳定账号身份，界面显示 `profile.name`。
 - `POST /api/logout` 注销会话。
-- 当前使用内存会话，服务重启后需要重新登录；尚无供原生 App 使用的 JWT/access-token/refresh-token 签发流程。
+- 当前为统一 Cookie 会话；尚无供原生 App 使用的 JWT/access-token/refresh-token 签发流程。
 - 生产身份来自服务端会话。不要传任意 `user_id` 充当登录身份，也不要使用测试专用 `Bearer demo-1`。
 - 网站写接口有同源检查。浏览器/WebView 应保持同源；跨域移动 Web 前端需另行设计允许来源与 Cookie/CSRF 策略，不能仅添加 `Access-Control-Allow-Origin: *`。
-- 已有账号 ID、俱乐部 Player ID、Guest ID 是不同概念，不要自行合并。旧玩家认领必须走服务器审核流程。
+- 已有账号 ID、俱乐部 Player ID、Guest ID 是不同概念，不要自行合并。已有成员选择原玩家记录登录；旧玩家重新注册与认领的公开入口已移除。
 
 ## 常用接口
 
@@ -29,14 +29,11 @@
 
 | 方法和路径 | 用途 | 权限 |
 | --- | --- | --- |
-| `GET /api/dashboard` | 排行榜、Recent Match 等 | 公开；私人部分按会话返回 |
+| `GET /api/dashboard` | 排行榜、Recent Match 等 | 登录 |
 | `GET /api/players` | 历史玩家姓名，包括尚未注册者 | 公开 |
 | `GET /api/competitions/featured` | 当前展示活动及榜单 | 公开 |
 | `GET /api/competitions/{slug}` | 活动详情、榜单 | 公开 |
-| `GET /api/register/players?q=…` | 查找可认领的原有玩家 | 公开 |
 | `POST /api/register` | 新玩家注册 | 无需登录 |
-| `POST /api/register/claim` | 申请认领原有玩家 | 无需登录；随后管理员审核 |
-| `POST /api/register/resume` | 查询认领结果并恢复会话 | 认领 Cookie |
 | `POST /api/forgot-password` | 请求管理员发放重置码，专用 Discord 频道通知 | 无需登录；账号冷却与接口限流 |
 | `POST /api/admin/password-reset` | 生成一次性码，不接受新密码 | 管理员；特权账号须超级管理员 |
 | `POST /api/reset-password` | 用重置码自行设置新密码 | 无需登录；必须持有有效码 |
@@ -54,9 +51,9 @@
 | `POST /api/manual-score/confirm` | 确认手动登分 | 登录及业务权限 |
 | `GET /api/tournaments` | 比赛列表 | 以服务端权限检查为准 |
 
-Recent Match 筛选参数：`quarter`、`match_player`、`table_players`。后者可用 `/` 或逗号分隔姓名。响应中的 `recent_games` 是对局列表；匿名请求不应转而调用需要登录的 `/api/registered-users`。
+Recent Match 筛选参数：`quarter`、`match_player`、`table_players`。后者可用 `/` 或逗号分隔姓名。响应中的 `recent_games` 是对局列表；历史成绩页和该接口均要求登录。
 
-新玩家注册字段为 `username`、`password`、`confirm_password`，可传本地安全路径 `redirect_url`。这里 `username` 是玩家唯一注册名。已有玩家认领通过搜索结果选择 `player_id`，再传密码及确认密码，姓名取原玩家记录，不另造第二个用户名。认领响应 202 表示等待审核，需要保存 `mahjong_claim` Cookie。
+新成员注册使用 `POST /api/register`，`username` 为玩家名称，可传本地安全路径 `redirect_url`；创建账号无需先设置密码。已有成员选择原有姓名登录，不通过注册创建第二个玩家记录。`/api/register/players`、`/api/register/claim`、`/api/register/resume` 和 `/api/public-player-history` 已停用并返回 410。
 
 ## 座位、下桌和重试
 
@@ -78,7 +75,7 @@ Content-Type: application/json
 {"reason":"seat_card","match_id":"从当前桌次状态读取的 match_id"}
 ```
 
-底部下桌按钮使用 `reason: "leave_button"`。成功后使用响应的 `table_state` 刷新。已开始、待结算和过期桌次会被拒绝。点击他人的位置若要交换，使用独立的双方同意换座流程，详见 `mahjong_api/seat_swap_routes.py`；不得覆盖对方。
+底部本人下桌按钮使用 `reason: "leave_button"`。成功后使用响应的 `table_state` 刷新。未开始对局时，普通登录成员也可通过 `POST /api/club-tables/{tableId}/seats/{userId}/remove` 帮他人下桌，请求携带当前 `match_id` 和目标 `seat`；操作者无需先入座。已开始、待结算和过期桌次会被拒绝。点击他人的位置若要交换，使用独立的双方同意换座流程，详见 `mahjong_api/seat_swap_routes.py`；不得覆盖对方。
 
 创建预约使用唯一 `request_id`，时间字段 `scheduled_at`、`end_at` 传带时区的 ISO 8601 值。不同接口分别使用 `request_id` 或 `Idempotency-Key`，请遵照各自请求模型；一次操作重试时复用原请求标识。不要在超时后创建新的登分或预约请求。
 
@@ -86,7 +83,7 @@ Content-Type: application/json
 
 ## 接口源码和测试
 
-- 全站登录/公开历史：`web_server.py`、`account_registration.py`
+- 全站登录/历史记录：`web_server.py`、`account_registration.py`
 - 网页转发白名单：`mahjong_api/web_proxy.py`
 - 认证：`mahjong_api/auth.py`
 - 座位/预约：`mahjong_api/table_routes.py`、`table_service.py`、`reservation_operations.py`

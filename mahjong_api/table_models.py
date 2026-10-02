@@ -102,6 +102,9 @@ class TableReservation(Base):
         (datetime.fromisoformat(context.get_current_parameters()["scheduled_at"].replace("Z", "+00:00"))
          + timedelta(hours=1)).isoformat(timespec="milliseconds"))
     session_id: Mapped[str | None] = mapped_column(ForeignKey("reservation_sessions.id"))
+    # None is reserved for legacy rows awaiting an explicit administrator choice.
+    plan_kind: Mapped[str] = mapped_column(String(16), default="finite")
+    planned_games: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[str] = mapped_column(String(40))
     status: Mapped[str] = mapped_column(String(16), default="active", index=True)
     note: Mapped[str] = mapped_column(Text, default="")
@@ -118,6 +121,8 @@ class ReservationParticipant(Base):
     user_id: Mapped[str] = mapped_column(String(128), primary_key=True)
     user_name: Mapped[str] = mapped_column(String(128))
     added_at: Mapped[str] = mapped_column(String(40))
+    # Stable manual order; NULL retains original scheduled-time ordering.
+    queue_position: Mapped[int | None] = mapped_column(Integer)
 
 
 class TableCommand(Base):

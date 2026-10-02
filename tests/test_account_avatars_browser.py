@@ -15,6 +15,6 @@ def test_real_browser_avatars_in_reservations_seats_and_registered_search(websit
     data["users"]["photo3"].update(avatar="https://cdn.discordapp.com/avatars/test/missing.png",discord_id="234567890123456789")
     path.write_text(json.dumps(data),encoding="utf-8")
     env=os.environ.copy()
-    env.update(NFC_TEST_URL=url,NODE_PATH=str(Path(".venv-api/browser-tests/node_modules").resolve()))
+    env.update(NFC_TEST_URL=url,NODE_PATH=str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve()))
     result=subprocess.run(["node","tests/browser_account_avatars.cjs"],env=env,capture_output=True,text=True,encoding="utf-8",timeout=120)
     assert result.returncode==0,result.stdout+result.stderr

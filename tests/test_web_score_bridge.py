@@ -21,6 +21,8 @@ from test_mahjong_api import FakeSheets
 def website(tmp_path, monkeypatch):
     """Real website/session process + real ASGI server, with isolated data only."""
     monkeypatch.setenv("DISCORD_RESERVATION_REMINDERS_ENABLED", "false")
+    for key in ("NARTS_EXTERNAL_API_KEY", "NARTS_EXTERNAL_API_KEY_FILE", "NARTS_EXTERNAL_API_ENDPOINT"):
+        monkeypatch.delenv(key, raising=False)
     accounts = {}
     for i in range(1, 9):
         salt, digest = web_server.password_hash("photo-test-password")
@@ -56,7 +58,7 @@ def website(tmp_path, monkeypatch):
     api_url = f"http://127.0.0.1:{listener.getsockname()[1]}"
     monkeypatch.setenv("NFC_API_URL", api_url)
     settings = Settings(database_path=tmp_path / "scores.sqlite3", mock_auth_enabled=False,
-                        auth_profile_url=url + "/api/session", vision_enabled=True)
+                        auth_profile_url=url + "/api/session", vision_enabled=True, sync_interval_seconds=0.05)
     sink = FakeSheets()
     app = create_app(settings, sink)
     server = uvicorn.Server(uvicorn.Config(app, log_level="error"))
@@ -102,18 +104,42 @@ def test_cookie_photo_upload_through_existing_website(website):
         response = session.post(url + f"/api/sit?table=web&seat={seat}", headers={"Origin": url}, timeout=10)
         assert response.status_code == 200, response.text
         match_id = response.json()["match_id"]
+    assert sink.current_calls == 0
+    history_entered, history_release = threading.Event(), threading.Event()
+    original_history = sink.write_history
+    def blocked_history(match):
+        history_entered.set()
+        assert history_release.wait(10), "The HTTP response waited for its history worker"
+        original_history(match)
+    sink.write_history = blocked_history
     photo = Path(__file__).parent / "fixtures/displays/photo_4.png"
-    response = sessions[1].post(url + "/api/recognize_photo", data={"table": "web", "match_id": match_id},
+    try:
+        response = sessions[1].post(url + "/api/recognize_photo", data={"table": "web", "match_id": match_id},
                                 files={"file": ("negative.png", photo.read_bytes(), "image/png")},
                                 headers={"Origin": url, "Idempotency-Key": "web-negative"}, timeout=10)
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["status"] == "success"
-    assert body["result"]["players"]["south"]["final_points"] == 93500
-    assert body["result"]["players"]["north"]["final_points"] == -13600
-    assert body["normalization"]["multiplier"] == 100
-    assert len(sink.history) == 1
-    assert not any(app.state.service.table("web")["seats"].values())
+        assert response.status_code == 202, response.text
+        body = response.json()
+        assert body["status"] == "pending" and body["local_saved"] and body["local_completed"]
+        assert body["result"]["players"]["south"]["final_points"] == 93500
+        assert body["result"]["players"]["north"]["final_points"] == -13600
+        assert body["normalization"]["multiplier"] == 100
+        assert history_entered.wait(2)
+        assert len(sink.history) == 0
+        current = app.state.service.table("web")
+        assert not any(current["seats"].values())
+        assert current["match_id"] != match_id and current["round"] == 2
+    finally:
+        history_release.set()
+    deadline = time.monotonic() + 5
+    while app.state.service.history.status(match_id)["status"] != "synced" and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert app.state.service.history.status(match_id)["status"] == "synced"
+    assert len(sink.history) == 1 and sink.current_calls == 0
+    saved = next(iter(sink.history.values()))
+    assert saved["match_id"] == match_id
+    assert saved["result"] == app.state.service.store.match(match_id)["result"]
+    assert saved["result"] == {key: body["result"][key] for key in saved["result"]}
+    assert body["result"]["uploader_name"] == "photo2"
     # Exact-origin checking must survive the proxy, even for a prefix lookalike.
     rejected = sessions[0].post(url + "/api/sit?table=web&seat=east", headers={"Origin": url + ".evil.invalid"}, timeout=10)
     assert rejected.status_code == 403
@@ -127,8 +153,8 @@ def test_real_browser_photo_flow(website):
     url, _, sink = website
     env = os.environ.copy()
     env["NFC_TEST_URL"] = url
-    env["NODE_PATH"] = str(Path(".venv-api/browser-tests/node_modules").resolve())
+    env["NODE_PATH"] = str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve())
     result = subprocess.run(["node", "tests/browser_photo.cjs"], env=env, capture_output=True, text=True,
                             encoding="utf-8", timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert len(sink.history) == 4
+    assert len(sink.history) == 5

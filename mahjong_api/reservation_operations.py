@@ -2,7 +2,7 @@
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from uuid import uuid4
-from sqlalchemy import select
+from sqlalchemy import func, select
 from .table_models import ClubTable, TableReservation
 from .table_membership import check, admin, table_open, lock_table, membership_lock
 from .reservation_sessions import lock_scope, assign_session, recalculate_session, instant, candidates
@@ -28,11 +28,26 @@ def range_values(service, data, previous=None):
         anchor = datetime(year,1,1,tzinfo=zone).astimezone(timezone.utc).isoformat()
         end = service.reservation_time({"month":month,"day":day,"time":data.get("end_time")}, anchor)
     elif previous:
-        end = previous.end_at
+        # The new form has no end-time input. When its start changes, move the
+        # deprecated compatibility window too; the prior value remains in the
+        # reservation update audit instead of blocking a valid edit.
+        end = ((instant(start)+timedelta(hours=1)).isoformat(timespec="milliseconds")
+               if instant(start) != instant(previous.scheduled_at)
+               and previous.plan_kind in {"finite","any"} else previous.end_at)
     else:
         end = (instant(start)+timedelta(hours=1)).isoformat(timespec="milliseconds")
     check(instant(end) > instant(start), "invalid_reservation_end")
     return start, end
+
+
+def planned_value(data, previous=None):
+    if "planned_games" not in data:
+        return (previous.plan_kind, previous.planned_games) if previous else ("finite", 1)
+    value = data["planned_games"]
+    if value == "any":
+        return "any", None
+    check(type(value) is int and value > 0, "invalid_planned_games")
+    return "finite", value
 
 
 def resolve_table(service, db, table_id):
@@ -44,6 +59,7 @@ def resolve_table(service, db, table_id):
 def reserve(service, table_id, data, user):
     check(user is not None,"not_authenticated")
     start, end = range_values(service,data)
+    plan_kind, planned_games = planned_value(data)
     note = data.get("note","")
     check(isinstance(note,str) and len(note)<=500,"invalid_note")
     check("seat" not in data and "user_id" not in data,"invalid_reservation")
@@ -57,15 +73,19 @@ def reserve(service, table_id, data, user):
         check(1<=len(profiles)<=table.capacity,"reservation_capacity_exceeded")
         stamp = service.clock()
         row = TableReservation(id=str(uuid4()),table_id=table.id,user_id=str(user.id),user_name=user.name,
-            scheduled_at=start,end_at=end,created_at=stamp,updated_at=stamp,updated_by=str(user.id),
+            scheduled_at=start,end_at=end,plan_kind=plan_kind,planned_games=planned_games,
+            created_at=stamp,updated_at=stamp,updated_by=str(user.id),
             status="active",note=note,version=1)
         db.add(row); db.flush()
         service._store_participants(db,row,profiles,stamp)
         assign_session(db,row,table,stamp)
+        from .reservation_queue import next_batch
+        next_batch(db,table.id,stamp)
         service._remember(db,key,fingerprint,row.id)
         audit(db,table.tournament_id or "",user.id,"table_reservation_created",
             {"table_id":table.id,"reservation_id":row.id,"session_id":row.session_id,
-             "scheduled_at":start,"end_at":end,"participant_ids":[p["id"] for p in profiles]})
+             "scheduled_at":start,"end_at":end,"planned_games":data.get("planned_games",1),
+             "participant_ids":[p["id"] for p in profiles]})
         return service._reservation(db,row)
 
 
@@ -95,11 +115,22 @@ def update_reservation(service,reservation_id,data,user):
         check(row.status=="active","reservation_not_active")
         check(type(data.get("version")) is int,"reservation_version_required")
         check(data["version"]==row.version,"stale_version")
-        if status=="completed":
-            admin(user)
+        # Completion is derived only from a confirmed linked game.
+        check(status!="completed", "score_confirmation_required")
         if status=="active":
             table_open(db,target)
         start,end=range_values(service,data,row)
+        if row.plan_kind == "legacy_unknown" and "planned_games" in data:
+            admin(user)
+        plan_kind,planned_games=planned_value(data,row)
+        if plan_kind == "finite":
+            from .reservation_queue import participant_progress
+            counts=participant_progress(db,[row])
+            from .reservation_sessions import reservation_participants
+            existing_people=reservation_participants(db,[row])[row.id]
+            check(all(counts.get((row.id,p["user_id"]),{}).get("completed",0)
+                      +counts.get((row.id,p["user_id"]),{}).get("occupied",0)
+                      <=planned_games for p in existing_people), "planned_games_below_progress")
         note=data.get("note",row.note)
         check(isinstance(note,str) and len(note)<=500,"invalid_note")
         before=service._reservation(db,row)
@@ -109,6 +140,7 @@ def update_reservation(service,reservation_id,data,user):
         check(1<=len(profiles)<=target.capacity,"reservation_capacity_exceeded")
         old_session_id=row.session_id
         row.scheduled_at,row.end_at,row.table_id=start,end,target.id
+        row.plan_kind,row.planned_games=plan_kind,planned_games
         row.status,row.note,row.version=status,note,row.version+1
         row.updated_at,row.updated_by=service.clock(),str(user.id)
         if status=="cancelled":
@@ -117,10 +149,28 @@ def update_reservation(service,reservation_id,data,user):
             service._store_participants(db,row,profiles,row.updated_at)
         else:
             db.flush()
+        if target.id != original_table.id:
+            from .table_models import ReservationParticipant
+            persons=list(db.scalars(select(ReservationParticipant).where(
+                ReservationParticipant.reservation_id==row.id)
+                .order_by(ReservationParticipant.queue_position,
+                          ReservationParticipant.added_at,ReservationParticipant.user_id)))
+            last=db.scalar(select(func.max(ReservationParticipant.queue_position))
+                .join(TableReservation,TableReservation.id==ReservationParticipant.reservation_id)
+                .where(TableReservation.table_id==target.id,
+                       ReservationParticipant.reservation_id!=row.id))
+            position=0 if last is None else last+1
+            for person in persons:
+                person.queue_position=position
+                position+=1
+            db.flush()
         if status=="active":
             assign_session(db,row,target,row.updated_at,old_session_id)
         elif old_session_id:
             recalculate_session(db,old_session_id,row.updated_at)
+        from .reservation_queue import next_batch
+        for affected in sorted({original_table.id,target.id}):
+            next_batch(db,affected,row.updated_at)
         after=service._reservation(db,row)
         audit(db,target.tournament_id or "",user.id,"table_reservation_updated",
             {"reservation_id":row.id,"before":before,"after":after})

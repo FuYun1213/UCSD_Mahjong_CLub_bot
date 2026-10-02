@@ -82,7 +82,7 @@ class DiscordReminderSender:
         request = urllib.request.Request("https://discord.com/api/v10" + path,
             data=json.dumps(payload,ensure_ascii=False).encode("utf-8") if payload is not None else None,
             headers={"Authorization":"Bot " + self.config.token,
-                     "Content-Type":"application/json", "User-Agent":"DiscordBot (https://ucsdmj.org, 1.0)"}, method=method)
+                     "Content-Type":"application/json", "User-Agent":"DiscordBot (https://doramj.org, 1.0)"}, method=method)
         try:
             with self._open(request, timeout=8) as response:
                 return json.loads(response.read().decode("utf-8"))
@@ -177,7 +177,7 @@ class DiscordReminderSender:
             connection.request("POST", "/api/v10/channels/" + channel_id + "/messages",
                 body=json.dumps(payload,ensure_ascii=False).encode("utf-8"),
                 headers={"Authorization":"Bot " + self.config.token,"Content-Type":"application/json",
-                         "User-Agent":"DiscordBot (https://ucsdmj.org, 1.0)"})
+                         "User-Agent":"DiscordBot (https://doramj.org, 1.0)"})
             response = connection.getresponse()
             raw = response.read(65537)
             if expired.is_set():
@@ -219,6 +219,22 @@ class DiscordReminderSender:
         message_id = discord_id(result.get("id"))
         if not message_id:
             raise DiscordReminderError("invalid_message_response",uncertain=True)
+        return message_id
+
+    def edit(self, destination, message_id, payload):
+        """Idempotent content update; edits carry no allowed user mentions."""
+        channel_id = discord_id(destination.get("channel_id"))
+        message_id = discord_id(message_id)
+        if not channel_id or not message_id:
+            raise DiscordReminderError("invalid_message_id")
+        value = {key: item for key, item in payload.items()
+                 if key not in {"nonce", "enforce_nonce"}}
+        value["allowed_mentions"] = {"parse": [], "users": [],
+                                     "roles": [], "replied_user": False}
+        result = self._request("PATCH", "/channels/" + channel_id +
+                               "/messages/" + message_id, value)
+        if discord_id(result.get("id")) != message_id:
+            raise DiscordReminderError("invalid_message_response")
         return message_id
 
     def reconcile(self, channel_id, bot_user_id, nonce, since):

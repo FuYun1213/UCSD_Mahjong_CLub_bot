@@ -140,7 +140,7 @@ def test_browser_discord_id_first_website_login(website, directory, tmp_path, mo
     registered_names.write_accounts(web_server.USERS_FILE,accounts)
     environment = os.environ.copy()
     environment["NFC_TEST_URL"] = url
-    environment["NODE_PATH"] = str(Path(".venv-api/browser-tests/node_modules").resolve())
+    environment["NODE_PATH"] = str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve())
     result = subprocess.run(["node", "tests/browser_account_sync.cjs"], env=environment,
                             capture_output=True, text=True, encoding="utf-8", timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr

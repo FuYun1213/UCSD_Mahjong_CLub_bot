@@ -15,6 +15,8 @@ class ReservationSession(Base):
         CheckConstraint("status IN ('active','cancelled')"),
         CheckConstraint("end_at > start_at"),
         Index("ix_reservation_session_table_start_status", "table_id", "start_at", "status"),
+        Index("ix_reservation_window", "table_id", "status", "end_at", "start_at", "id"),
+        Index("ix_reservation_candidate", "scope", "status", "start_at"),
     )
     id: Mapped[str] = mapped_column(String(64), primary_key=True)
     scope: Mapped[str] = mapped_column(String(128), index=True)

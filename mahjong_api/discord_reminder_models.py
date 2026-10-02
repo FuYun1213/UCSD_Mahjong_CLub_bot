@@ -15,6 +15,10 @@ class DiscordReminder(Base):
     # Deliberately no cascading FK: deletion must preserve delivery evidence.
     session_id: Mapped[str] = mapped_column(String(64), index=True)
     scope: Mapped[str] = mapped_column(String(128), index=True)
+    batch_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    predecessor_game_id: Mapped[str | None] = mapped_column(String(64), index=True)
+    member_version: Mapped[int | None] = mapped_column(Integer)
+    member_ids_json: Mapped[str | None] = mapped_column(String(2048))
     start_at_snapshot: Mapped[str] = mapped_column(String(40))
     notification_type: Mapped[str] = mapped_column(String(32), default="one_hour")
     status: Mapped[str] = mapped_column(String(16), default="pending", index=True)

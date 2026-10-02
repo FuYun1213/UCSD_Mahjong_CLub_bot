@@ -11,7 +11,7 @@ from mahjong_api.models import User
 from mahjong_api.store import Conflict, Store
 from mahjong_api.tournament_models import Tournament, TournamentAudit
 from mahjong_api.tournament_flow import lock_tournament
-from mahjong_api.tournament_rules import PLACEMENT_FIELDS, settings_value, score_table, standings
+from mahjong_api.tournament_rules import PLACEMENT_FIELDS, placement_game_points, settings_value, score_table, standings
 from test_tournament import rig, tournament, command, round_complete
 from test_table_v3 import setup
 
@@ -25,6 +25,15 @@ def placement_cup(service):
     command(service,state['id'],'settings',settings=RULES)
     command(service,state['id'],'start')
     return state['id']
+
+
+def test_date_window_scoring_uses_the_tournament_placement_calculator():
+    from competition_service import game_score
+    rules={"placements":[5,3,1,0],"participation":2}
+    settings={**dict(zip(PLACEMENT_FIELDS,rules["placements"])),"game_participation_score":rules["participation"]}
+    for place in range(1,5):
+        placement,participation=placement_game_points(place,settings)
+        assert game_score(place,rules)==(str(placement),str(participation),str(placement+participation))
 
 
 def persisted(service,tid):

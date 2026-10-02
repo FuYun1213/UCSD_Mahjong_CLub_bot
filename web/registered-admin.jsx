@@ -3,9 +3,9 @@ function registeredRosterOptions(roster) {
   const rows=(roster||[]).map(p=>typeof p==="string"?{name:p}:p).filter(p=>p?.name);
   return [...new Map(rows.map(p=>[p.name,{id:String(p.user_id||p.account_id||p.id||"historical:"+p.name),name:p.name}])).values()];
 }
-function RegisteredUserField({name,label,defaultValue="",value,required=false,language,options,onSelected,onChange,excludeIds,disabled=false}) {
+function RegisteredUserField({name,idName,label,defaultValue="",value,required=false,language,options,onSelected,onChange,excludeIds,disabled=false,searchUrl="/api/registered-users",placeholder,copy}) {
   const lang=language||localStorage.getItem("mahjong_lang")||"EN",initial=value===undefined?defaultValue:value;
-  const [person,setPerson]=React.useState(()=>options?.find(p=>p.name===initial)||null),hidden=React.useRef(null),selection=React.useRef(null);
+  const [person,setPerson]=React.useState(()=>options?.find(p=>p.name===initial)||null),root=React.useRef(null),selection=React.useRef(null);
   selection.current=person;
   const optionsSignature=options?JSON.stringify(options.map(p=>[p.id,p.name])):"";
   React.useEffect(()=>{
@@ -14,13 +14,13 @@ function RegisteredUserField({name,label,defaultValue="",value,required=false,la
     if(selection.current?.name===initial)return;
     if(options){setPerson(options.find(p=>p.name===initial)||null);return;}
     (async()=>{let cursor=null;do{const query=new URLSearchParams({q:initial,limit:25});if(cursor)query.set("cursor",cursor);
-      const result=await tournamentApi("/api/registered-users?"+query);if(!active)return;
+      const result=await tournamentApi(searchUrl+"?"+query);if(!active)return;
       const found=(result.users||[]).find(p=>p.name===initial);if(found){setPerson(found);return;}cursor=result.next_cursor;
     }while(cursor);setPerson(null);})().catch(()=>{});
     return()=>{active=false;};
-  },[initial,optionsSignature]);
-  React.useEffect(()=>{const form=hidden.current?.form;if(!form)return;const reset=()=>{setPerson(null);onSelected?.(null);onChange?.("");};form.addEventListener("reset",reset);return()=>form.removeEventListener("reset",reset);},[]);
-  return <div data-i18n-owned><RegisteredUserCombobox value={person} onChange={p=>{setPerson(p);onSelected?.(p);onChange?.(p?.name||"");}} label={label||MahjongI18n.t(lang,"registeredName")} language={lang} options={options} excludeIds={excludeIds} required={required} disabled={disabled}/><input ref={hidden} type="hidden" name={name} value={person?.name||""}/></div>;
+  },[initial,optionsSignature,searchUrl]);
+  React.useEffect(()=>{const form=root.current?.closest("form");if(!form)return;const reset=()=>{setPerson(null);onSelected?.(null);onChange?.("");};form.addEventListener("reset",reset);return()=>form.removeEventListener("reset",reset);},[]);
+  return <div ref={root} data-i18n-owned><RegisteredUserCombobox value={person} onChange={p=>{setPerson(p);onSelected?.(p);onChange?.(p?.name||"");}} label={label||MahjongI18n.t(lang,"registeredName")} language={lang} options={options} searchUrl={searchUrl} excludeIds={excludeIds} required={required} disabled={disabled} placeholder={placeholder} copy={copy}/>{name&&<input type="hidden" name={name} value={person?.name||""}/>} {idName&&<input type="hidden" name={idName} value={person?.id||""}/>}</div>;
 }
 function RegisteredNameAdmin({language,onRefresh}) {
   const t=(key,values)=>MahjongI18n.t(language,key,values),pending=React.useRef(false);

@@ -87,6 +87,6 @@ def test_anonymous_history_filters_work_but_reservation_and_account_search_stay_
 
 def test_public_recent_match_and_private_reservations_in_real_browser(history_website):
     url,_,_=history_website
-    env=os.environ.copy();env['NFC_TEST_URL']=url;env['NODE_PATH']=str(Path('.venv-api/browser-tests/node_modules').resolve())
+    env=os.environ.copy();env['NFC_TEST_URL']=url;env['NODE_PATH']=str(Path(os.environ.get('NODE_PATH') or '.venv-api/browser-tests/node_modules').resolve())
     result=subprocess.run(['node','tests/browser_public_history.cjs'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=100)
     assert result.returncode==0,result.stdout+result.stderr

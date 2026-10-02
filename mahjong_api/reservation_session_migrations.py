@@ -29,6 +29,8 @@ def migrate_reservation_sessions(engine):
                 _backfill(db)
                 db.add(Metadata(key="reservation_sessions_v9_migrated", value="1"))
     with engine.begin() as connection:
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_reservation_window ON reservation_sessions(table_id,status,end_at,start_at,id)"))
+        connection.execute(text("CREATE INDEX IF NOT EXISTS ix_reservation_candidate ON reservation_sessions(scope,status,start_at)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_reservation_session_status ON table_reservations (session_id,status)"))
         connection.execute(text("CREATE INDEX IF NOT EXISTS ix_reservation_start_status ON table_reservations (scheduled_at,status)"))
         if engine.dialect.name == "sqlite":

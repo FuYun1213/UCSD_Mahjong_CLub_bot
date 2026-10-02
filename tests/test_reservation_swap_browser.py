@@ -53,7 +53,7 @@ def test_reservation_reminders_and_two_party_swap_browser(website, monkeypatch, 
                     user_name=f"old snapshot {number}", added_at=stamp))
     environment = os.environ.copy()
     environment.update(NFC_TEST_URL=url, SWAP_TEST_CLOCK=str(clock_file), SWAP_TEST_ACCOUNTS=str(web_server.USERS_FILE),
-                       NODE_PATH=str(Path(".venv-api/browser-tests/node_modules").resolve()))
+                       NODE_PATH=str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve()))
     result = subprocess.run(["node", "tests/browser_reservation_swap.cjs"], env=environment, capture_output=True,
                             text=True, encoding="utf-8", timeout=180)
     assert result.returncode == 0, result.stdout + result.stderr

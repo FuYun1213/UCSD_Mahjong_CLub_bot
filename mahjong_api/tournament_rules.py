@@ -56,6 +56,14 @@ def rounded(value, settings):
     return float((number(value) / unit).quantize(Decimal("1"), rounding=ROUND_HALF_UP) * unit)
 
 
+def placement_game_points(placement, settings):
+    """Return the shared placement and game-count points for one completed game."""
+    require(type(placement) is int and placement in {1, 2, 3, 4}, "invalid_placement")
+    require(isinstance(settings, dict) and all(key in settings for key in (*PLACEMENT_FIELDS, "game_participation_score")),
+            "placement_scores_required")
+    return number(settings[PLACEMENT_FIELDS[placement - 1]]), number(settings["game_participation_score"])
+
+
 def settings_value(data, previous=None):
     # Older clients may still send retired fields: ignore them. Preserve only
     # existing legacy values for compatibility; new tournaments do not save them.
@@ -112,10 +120,9 @@ def placement_result(settings, players):
     require(settings.get("scoring_mode") == PLACEMENT_MODE, "invalid_action")
     require(len(players) == 4 and len({p["id"] for p in players}) == 4 and
             {p["placement"] for p in players} == {1, 2, 3, 4}, "invalid_roster")
-    participation = number(settings["game_participation_score"])
     scored = []
     for player in players:
-        placement = number(settings[PLACEMENT_FIELDS[player["placement"] - 1]])
+        placement, participation = placement_game_points(player["placement"], settings)
         scored.append({**{key: player[key] for key in ("id", "name", "seat", "placement", "rawScore")},
             "placementGameScore": float(placement), "gameParticipationScore": float(participation),
             "gameScore": float(placement + participation)})

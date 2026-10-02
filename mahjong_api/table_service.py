@@ -96,37 +96,128 @@ class TableService:
             check(not table.tournament_id, "fixed_tournament_seating")
             return table.score_table_id
 
+    def _prime_views(self, db, rows, include_admin=False):
+        """Batch read projections scoped to the returned tables, never per person."""
+        from .reservation_session_models import ReservationSession
+        from sqlalchemy.orm import aliased
+        ids=[row.id for row in rows]
+        cache={"tables":{row.id:row for row in rows},"members":{},"names":{},"reservations":{},
+               "sessions":{},"session_rows":{},"participants":{},"tokens":{},"scores":{}}
+        if not ids:
+            db.info["table_views"]=cache;return
+        members=list(db.scalars(select(ActiveTableMember).where(ActiveTableMember.table_id.in_(ids))))
+        for member in members:cache["members"].setdefault(member.table_id,[]).append(member)
+        user_ids={member.user_id for member in members}
+        if user_ids:cache["names"]={row.id:row.name for row in db.scalars(select(Account).where(Account.id.in_(user_ids)))}
+        ranked=select(TableReservation,func.row_number().over(partition_by=TableReservation.table_id,
+            order_by=(TableReservation.scheduled_at.desc(),TableReservation.id)).label("rn")).where(
+                TableReservation.table_id.in_(ids),TableReservation.status=="active").subquery()
+        reservation=aliased(TableReservation,ranked)
+        records=list(db.scalars(select(reservation).where(ranked.c.rn<=100).order_by(reservation.scheduled_at.desc())))
+        for row in records:cache["reservations"].setdefault(row.table_id,[]).append(row)
+        if include_admin:
+            cache["reservation_history"]={}
+            history=list(db.scalars(select(TableReservation).where(
+                TableReservation.table_id.in_(ids),TableReservation.status!="active")
+                .order_by(TableReservation.updated_at.desc(),TableReservation.id.desc()).limit(100)))
+            records.extend(history)
+            for row in history:cache["reservation_history"].setdefault(row.table_id,[]).append(row)
+        active=list(db.scalars(select(ReservationSession).where(ReservationSession.table_id.in_(ids),
+            ReservationSession.status=="active").order_by(ReservationSession.start_at,ReservationSession.id)))
+        for row in active:cache["sessions"].setdefault(row.table_id,[]).append(row)
+        session_ids={row.session_id for row in records if row.session_id}|{row.id for row in active}
+        all_sessions={row.id:row for row in active}
+        if session_ids:
+            all_sessions.update({row.id:row for row in db.scalars(select(ReservationSession).where(ReservationSession.id.in_(session_ids)))})
+            for row in db.scalars(select(TableReservation).where(TableReservation.session_id.in_(session_ids),
+                    TableReservation.status=="active").order_by(TableReservation.scheduled_at,TableReservation.id)):
+                cache["session_rows"].setdefault(row.session_id,[]).append(row);records.append(row)
+        cache["all_sessions"]=all_sessions
+        reservation_ids={row.id for row in records}
+        if reservation_ids:
+            for person in db.scalars(select(ReservationParticipant).where(ReservationParticipant.reservation_id.in_(reservation_ids))
+                    .order_by(ReservationParticipant.added_at,ReservationParticipant.user_id)):
+                cache["participants"].setdefault(person.reservation_id,[]).append(person)
+        from .reservation_queue import participant_progress
+        cache["progress"]=participant_progress(db,records)
+        if include_admin:
+            for row in db.scalars(select(TableJoinToken).where(TableJoinToken.table_id.in_(ids)).order_by(TableJoinToken.created_at.desc())):
+                cache["tokens"].setdefault(row.table_id,[]).append(row)
+        cache["scores"]={row.table_id:row for row in db.scalars(select(TableState).where(TableState.table_id.in_([r.score_table_id for r in rows if r.score_table_id])))}
+        db.info["table_views"]=cache
+
     def _view(self, db, row, include_admin=False):
-        people = list(db.scalars(select(ActiveTableMember).where(ActiveTableMember.table_id == row.id)))
-        names = {p.id: p.name for p in db.scalars(select(Account).where(Account.id.in_([m.user_id for m in people])))}
-        reserved = list(db.scalars(select(TableReservation).where(TableReservation.table_id == row.id)
-            .order_by(TableReservation.scheduled_at.desc()).limit(100)))
-        tokens = list(db.scalars(select(TableJoinToken).where(TableJoinToken.table_id == row.id).order_by(TableJoinToken.created_at.desc())))
+        if "table_views" not in db.info:
+            self._prime_views(db,[row],include_admin)
+        cache=db.info["table_views"]
+        people=cache["members"].get(row.id,[])
+        names=cache["names"]
+        reserved=cache["reservations"].get(row.id,[])
+        tokens=cache["tokens"].get(row.id,[])
         value = {k: getattr(row, k) for k in ("id", "number", "display_name", "scope", "tournament_id",
             "score_table_id", "status", "capacity", "nfc_configured", "nfc_label")}
         value["members"] = [{"user_id": p.user_id, "name": names.get(p.user_id, "Unavailable player"),
             "join_method": p.join_method, "added_by_user_id": p.added_by_user_id,
             "joined_at": p.joined_at, "seat": p.seat, "status": p.status, "left_at": p.left_at} for p in people]
-        value["player_count"] = len(people)
+        value["player_count"] = sum(p.status == "active" and not p.left_at for p in people)
         value["reservations"] = [self._reservation(db, r) for r in reserved]
         from .reservation_session_models import ReservationSession
-        value["reservation_sessions"] = [self._reservation_session(db, session) for session in db.scalars(
-            select(ReservationSession).where(ReservationSession.table_id == row.id, ReservationSession.status == "active")
-                .order_by(ReservationSession.start_at, ReservationSession.id))]
+        value["reservation_sessions"] = [view for session in cache["sessions"].get(row.id,[])
+            if (view:=self._reservation_session(db,session)) and view["participant_count"]>0]
         value["timezone"] = self.timezone
         if include_admin:
+            value["reservation_history"]=[self._reservation(db,r) for r in
+                cache.get("reservation_history",{}).get(row.id,[])]
             value["tokens"] = [self._token_view(r, row) for r in tokens]
-        score = db.scalar(select(TableState).where(TableState.table_id == row.score_table_id)) if row.score_table_id else None
+        score = cache["scores"].get(row.score_table_id)
         value["started_at"] = score.started_at if score else None
         value["current_match_id"] = score.current_match_id if score else None
         value["can_leave"] = bool(score and not score.started_at and not score.pending_match_id)
+        value["can_join"] = bool(row.status == "open" and score and not score.started_at
+                                 and not score.pending_match_id and value["player_count"] < row.capacity)
         return value
+
+    def resolve_scoring_table(self, user, requested_table=None, entry_token=None, current_table=None,
+                              auto_select_full=False):
+        from .scoring_table import resolve_scoring_table
+        # Token identity is revalidated on every request, including after login.
+        if entry_token is not None:
+            info = self.token_info(entry_token)
+            check(requested_table is None or requested_table in (info["table_id"], info["score_table_id"]),
+                  "invalid_join_token")
+            requested_table = info["table_id"]
+            auto_select_full = False
+        with self.store.connect() as db:
+            # Selection needs only registry, occupancy and current game state.
+            # Never expand reservation history, tokens or account profiles here.
+            rows = list(db.scalars(select(ClubTable).where(ClubTable.tournament_id.is_(None))))
+            ids = [row.id for row in rows]
+            members = {}
+            if ids:
+                for member in db.scalars(select(ActiveTableMember).where(ActiveTableMember.table_id.in_(ids),
+                        ActiveTableMember.status == "active", ActiveTableMember.left_at.is_(None))):
+                    members.setdefault(member.table_id, []).append({"user_id":member.user_id,
+                        "status":member.status,"left_at":member.left_at,"seat":member.seat})
+            scores = {row.table_id:row for row in db.scalars(select(TableState).where(
+                TableState.table_id.in_([row.score_table_id for row in rows if row.score_table_id])))} if rows else {}
+            candidates = []
+            for row in rows:
+                score = scores.get(row.score_table_id)
+                people = members.get(row.id, [])
+                value = {key:getattr(row,key) for key in ("id","number","display_name","score_table_id","status","capacity")}
+                value.update(members=people,player_count=len(people),started_at=score.started_at if score else None,
+                    can_join=bool(row.status == "open" and score and not score.started_at and
+                                  not score.pending_match_id and len(people) < row.capacity))
+                candidates.append(value)
+            return resolve_scoring_table(candidates, user.id,
+                requested_table=requested_table, current_table=current_table, auto_select_full=auto_select_full)
 
     def list(self, user, include_admin=False):
         if include_admin:
             admin(user)
         with self.store.connect() as db:
             rows = list(db.scalars(select(ClubTable).order_by(ClubTable.scope, ClubTable.number)))
+            self._prime_views(db,rows,include_admin)
             output = []
             for row in rows:
                 if row.tournament_id and db.get(Tournament, row.tournament_id).deleted_at:
@@ -346,8 +437,6 @@ class TableService:
                     wind = ordinary_join(db, score, user, user.id, method, wind)
                     token.last_used_at, token.use_count = self.clock(), token.use_count + 1
                     target = self._target(table)
-            if not tid:
-                self.matches.flush()
             return {"table_id": table_id, "target": target, "join_method": method,
                     "purpose": purpose, "seat": wind, "joined": True}
 
@@ -357,7 +446,6 @@ class TableService:
             check(not table.tournament_id, "fixed_tournament_seating")
             score = db.scalar(select(TableState).where(TableState.table_id == table.score_table_id))
             wind = ordinary_join(db, score, user, user.id, "manual", seat)
-        self.matches.flush()
         return {"table_id": table_id, "seat": wind}
 
     def _ordinary_table_reference(self, db, table_id):
@@ -394,7 +482,6 @@ class TableService:
             if method == "qr_entry" and action == "joined":
                 token.last_used_at, token.use_count = self.clock(), token.use_count + 1
             score_id = table.score_table_id
-        self.matches.flush()
         state = self.matches.table(score_id)
         state.update(seat_action=action, my_seat=data["seat"], previous_seat=previous)
         return state
@@ -405,7 +492,6 @@ class TableService:
             table = self._ordinary_table_reference(db, table_id)
             changed = ordinary_leave(db, table, user, reason, expected_match_id)
             score_id = table.score_table_id
-        self.matches.flush()
         return self.display_names({"table_id": table_id, "left": True, "changed": changed,
                                    "table_state": self.matches.table(score_id)})
 
@@ -433,7 +519,8 @@ class TableService:
         """Project current registered names without rewriting historical identity keys."""
         from .registered_display import with_registered_names
         try:
-            profiles = self._account_rows()
+            from .registered_display import referenced_account_ids
+            profiles = self._account_rows(referenced_account_ids(value))
         except Conflict:
             profiles = []
         return with_registered_names(value, profiles)
@@ -464,11 +551,11 @@ class TableService:
         return [{"id": str(by_id[uid]["id"]), "name": by_id[uid]["name"], "avatar": by_id[uid].get("avatar", "")} for uid in normalized]
 
     def _can_add(self, db, table, user):
+        check(user is not None, "not_authenticated")
         check(not table.tournament_id, "fixed_tournament_seating")
-        member = db.get(ActiveTableMember, str(user.id))
-        check(user.role in {"admin", "super_admin"} or member is not None and member.table_id == table.id, "must_join_first")
         score = db.scalar(select(TableState).where(TableState.table_id == table.score_table_id))
         check(score.started_at is None, "table_already_started")
+        check(not score.pending_match_id, "settlement_pending")
         return score
 
     def preview_players(self, table_id, value, user):
@@ -514,7 +601,6 @@ class TableService:
                 ordinary_join(db, score, User(id=person["id"], name=person["name"]), user.id, method, seat=seats.get(person["id"]))
             self._remember(db, key, fingerprint, table_id)
             audit(db, "", user.id, "table_players_added", {"table_id": table_id, "user_ids": ids, "join_method": method})
-        self.matches.flush()
         return {"table_id": table_id, "added": ids, "replayed": False}
 
     def reset(self, table_id, data, user):
@@ -531,41 +617,42 @@ class TableService:
             if old:
                 return {"table_id": table_id, "reset": True}
             score = db.scalar(select(TableState).where(TableState.table_id == table.score_table_id))
-            check(not score.pending_match_id and not db.scalar(select(MatchHistory.match_id).where(MatchHistory.match_id == score.current_match_id)), "score_exists")
-            roster = [{"id": s.user_id, "name": s.user_name, "seat": s.seat}
-                for s in db.scalars(select(SeatRecord).where(SeatRecord.table_id == score.table_id))]
-            snapshot = {"match_id": score.current_match_id, "started_at": score.started_at, "roster": roster}
-            for draft in db.scalars(select(ScoreDraft).where(ScoreDraft.match_id == score.current_match_id)):
-                check(draft.status != "submitted", "score_exists")
-                draft.status = "void"
-            from .seat_swap_state import invalidate_swaps
-            invalidate_swaps(db, table_id, reason="admin_reset", actor=user.id, timestamp=self.clock())
-            release_table(db, table_id, user.id, "admin_reset", score.current_match_id)
-            for seat in list(db.scalars(select(SeatRecord).where(SeatRecord.table_id == score.table_id))):
-                db.delete(seat)
-            score.current_match_id, score.started_at = str(uuid4()), None
-            score.round_no += 1
-            score.updated_at, score.dirty = self.clock(), 1
+            check(score is not None, "table_not_found")
+            from .game_flow import abort_current_ordinary_game
+            abort_current_ordinary_game(db, table, score, str(user.id),
+                                        reason, self.clock())
             self._remember(db, key, fingerprint, table_id)
-            audit(db, "", user.id, "table_match_aborted", {"table_id": table_id, "reason": reason, "snapshot": snapshot})
-        self.matches.flush()
         return {"table_id": table_id, "reset": True}
 
     def _reservation(self, db, row, include_session=True):
         result = {k: getattr(row, k) for k in ("id", "table_id", "user_id", "user_name", "scheduled_at",
             "created_at", "status", "note", "cancelled_at", "updated_at", "version", "updated_by", "cancelled_by", "end_at", "session_id")}
+        result["planned_games"] = ("any" if row.plan_kind == "any" else
+                                   row.planned_games if row.plan_kind == "finite" else None)
+        result["plan_status"] = row.plan_kind
         result["created_by"] = row.user_id
         result["start_at"] = row.scheduled_at
-        result["participants"] = [{"id": p.user_id, "user_id": p.user_id, "name": p.user_name}
-            for p in db.scalars(select(ReservationParticipant).where(ReservationParticipant.reservation_id == row.id)
-                .order_by(ReservationParticipant.added_at, ReservationParticipant.user_id))]
+        cache=db.info.get("table_views")
+        participants=(cache["participants"].get(row.id,[]) if cache else db.scalars(select(ReservationParticipant)
+            .where(ReservationParticipant.reservation_id==row.id).order_by(ReservationParticipant.added_at,ReservationParticipant.user_id)))
+        from .reservation_queue import participant_progress
+        counts=cache["progress"] if cache and "progress" in cache else participant_progress(db,[row])
+        result["participants"]=[]
+        for p in participants:
+            progress=counts.get((row.id,p.user_id),{"completed":0,"occupied":0})
+            remaining=(None if row.plan_kind=="any" else
+                       max(0,(row.planned_games or 0)-progress["completed"]-progress["occupied"])
+                       if row.plan_kind=="finite" else None)
+            result["participants"].append({"id":p.user_id,"user_id":p.user_id,"name":p.user_name,
+                "completed_games":progress["completed"],"occupied_games":progress["occupied"],
+                "remaining_games":remaining,"queue_key":row.id+":"+p.user_id})
         local = datetime.fromisoformat(row.scheduled_at).astimezone(ZoneInfo(self.timezone))
         result.update(local_month=local.month, local_day=local.day, local_time=local.strftime("%H:%M"), timezone=self.timezone)
         end_local = datetime.fromisoformat(row.end_at).astimezone(ZoneInfo(self.timezone))
         result.update(end_local_month=end_local.month, end_local_day=end_local.day, end_local_time=end_local.strftime("%H:%M"))
         if include_session and row.session_id:
             from .reservation_session_models import ReservationSession
-            result["session"] = self._reservation_session(db, db.get(ReservationSession, row.session_id), include_reservations=False)
+            result["session"] = self._reservation_session(db, cache["all_sessions"].get(row.session_id) if cache else db.get(ReservationSession, row.session_id), include_reservations=False)
         return result
 
     def _reservation_session(self, db, session, include_reservations=True):
@@ -573,8 +660,24 @@ class TableService:
         from .reservation_reminders import _local_fields, _zone, _utc
         if session is None:
             return None
-        table = db.get(ClubTable, session.table_id)
-        people = session_participants(db, session.id)
+        cache=db.info.get("table_views")
+        table = cache["tables"].get(session.table_id) if cache else db.get(ClubTable, session.table_id)
+        if cache and session.id in cache["session_rows"]:
+            people_by_id={}
+            progress=cache.get("progress",{})
+            for row in cache["session_rows"][session.id]:
+                persons=cache["participants"].get(row.id,[])
+                for person in persons:
+                    count=progress.get((row.id,person.user_id),{"completed":0,"occupied":0})
+                    eligible=(row.plan_kind=="any" or row.plan_kind=="finite" and
+                              row.planned_games is not None and
+                              count["completed"]+count["occupied"]<row.planned_games)
+                    if eligible:
+                        people_by_id.setdefault(person.user_id,{"id":person.user_id,
+                            "user_id":person.user_id,"name":person.user_name})
+            people=list(people_by_id.values())
+        else:
+            people = session_participants(db, session.id)
         result = {key: getattr(session,key) for key in ("id","table_id","start_at","end_at","status","created_at","updated_at")}
         result.update(session_id=session.id, table_number=table.number, capacity=table.capacity,
             scheduled_at=session.start_at, participant_count=len(people), remaining_capacity=max(0,table.capacity-len(people)),
@@ -582,7 +685,15 @@ class TableService:
             **_local_fields(_utc(session.start_at),_zone(self.timezone)),
             **{"end_"+key:value for key,value in _local_fields(_utc(session.end_at),_zone(self.timezone)).items()})
         if include_reservations:
-            result["reservations"] = [self._reservation(db,row,False) for row in active_reservations(db,session.id)]
+            reservations=[]
+            for row in (cache["session_rows"].get(session.id,[]) if cache else active_reservations(db,session.id)):
+                detail=self._reservation(db,row,False)
+                detail["participants"]=[person for person in detail["participants"]
+                    if (detail["plan_status"]=="any" or
+                        detail["plan_status"]=="finite" and person["remaining_games"]>0)]
+                if detail["participants"]:
+                    reservations.append(detail)
+            result["reservations"]=reservations
         return result
 
     def reservation_time(self, data, previous=None):
@@ -623,9 +734,29 @@ class TableService:
 
     @staticmethod
     def _store_participants(db, row, profiles, stamp):
-        db.execute(delete(ReservationParticipant).where(ReservationParticipant.reservation_id == row.id))
-        for profile in profiles:
-            db.add(ReservationParticipant(reservation_id=row.id, user_id=profile["id"], user_name=profile["name"], added_at=stamp))
+        from .reservation_queue_models import ReservationGameLink
+        existing={p.user_id:p for p in db.scalars(select(ReservationParticipant).where(
+            ReservationParticipant.reservation_id==row.id))}
+        requested={profile["id"]:profile for profile in profiles}
+        for uid, person in existing.items():
+            if uid not in requested:
+                check(not db.scalar(select(ReservationGameLink.game_id).where(
+                    ReservationGameLink.reservation_id==row.id,
+                    ReservationGameLink.user_id==uid,
+                    ReservationGameLink.status.in_(["started","confirmed"])).limit(1)),
+                    "participant_has_games")
+                db.delete(person)
+        next_position=db.scalar(select(func.max(ReservationParticipant.queue_position))
+            .join(TableReservation,TableReservation.id==ReservationParticipant.reservation_id)
+            .where(TableReservation.table_id==row.table_id))
+        next_position=0 if next_position is None else next_position+1
+        for uid, profile in requested.items():
+            if uid in existing:
+                existing[uid].user_name=profile["name"]
+            else:
+                db.add(ReservationParticipant(reservation_id=row.id, user_id=uid,
+                    user_name=profile["name"], added_at=stamp,queue_position=next_position))
+                next_position+=1
         db.flush()
 
     def reserve(self, table_id, data, user):
@@ -639,3 +770,36 @@ class TableService:
     def reservation_candidates(self, table_id, data, user):
         from .reservation_operations import reservation_candidates
         return reservation_candidates(self, table_id, data, user)
+
+    def reservation_queue(self, table_id, user):
+        check(user is not None, "not_authenticated")
+        from .reservation_operations import resolve_table
+        from .reservation_queue import queue_view
+        from .reservation_sessions import lock_scope
+        with membership_lock, self.store.connect() as db:
+            table=resolve_table(self,db,table_id)
+            lock_scope(db,table.scope); lock_table(db,table.id)
+            db.refresh(table); table_open(db,table)
+            return queue_view(db,table.id,self.clock(),self._queue_reorder_allowed(user))
+
+    @staticmethod
+    def _queue_reorder_allowed(user):
+        return user is not None
+
+    def reorder_reservation_queue(self, table_id, data, user):
+        check(user is not None, "not_authenticated")
+        check(self._queue_reorder_allowed(user), "queue_reorder_forbidden")
+        from .reservation_operations import resolve_table
+        from .reservation_queue import queue_view, reorder
+        from .reservation_sessions import lock_scope
+        with membership_lock, self.store.connect() as db:
+            table=resolve_table(self,db,table_id)
+            lock_scope(db,table.scope); lock_table(db,table.id)
+            db.refresh(table); table_open(db,table)
+            key,fingerprint,old=self._command(db,user,"queue_reorder:"+table.id,data)
+            if old:
+                return queue_view(db,table.id,self.clock(),True)
+            result=reorder(db,table.id,user.id,data.get("version"),
+                           data.get("ordered_keys"),self.clock())
+            self._remember(db,key,fingerprint,table.id)
+            return result

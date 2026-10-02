@@ -1,8 +1,9 @@
 """Restartable reservation-session reminders with a durable pre-send fence.
 
 The score DB stores intent before the POST. An uncertain attempt is reconciled
-using Discord history, never posted again. The scope/table locks linearize each
-send against cancellation, regrouping, table closure and capacity changes.
+using Discord history, never posted again. A short scope/table transaction validates the dispatch snapshot against current
+reservation state. All network I/O runs after that transaction commits; changes
+after dispatch cannot retract a message already in flight.
 """
 import hashlib
 import logging
@@ -51,12 +52,28 @@ class DiscordReminderService:
         self.clock = lambda: tables.clock()
         self.lease_seconds = 120
 
+    @staticmethod
+    def _legacy_sessions_enabled():
+        return os.getenv("DISCORD_LEGACY_SESSION_REMINDERS_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
     def plan(self):
-        """Discover all future active sessions; unique keys survive every restart."""
+        """Plan current queue notices; retire unsent pre-V19 session reminders."""
         current = instant(self.clock())
+        if not self._legacy_sessions_enabled():
+            with self.store.connect() as db:
+                db.execute(update(DiscordReminder).where(
+                    DiscordReminder.notification_type == "one_hour",
+                    DiscordReminder.status.in_(["pending", "retrying"]),
+                    DiscordReminder.delivery_uncertain == 0,
+                    DiscordReminder.discord_message_id.is_(None),
+                ).values(status="cancelled", last_error="legacy_schedule_retired",
+                         updated_at=stamp(current)))
+            from .queue_notifications import plan_queue_notices
+            plan_queue_notices(self)
+            return 0
         created = 0
         with self.store.connect() as db:
-            sessions = list(db.scalars(select(ReservationSession).where(ReservationSession.status=="active")))
+            sessions = list(db.scalars(select(ReservationSession).where(ReservationSession.status=="active",ReservationSession.start_at>stamp(current))))
             for session in sessions:
                 start = instant(session.start_at)
                 if start <= current:
@@ -87,6 +104,7 @@ class DiscordReminderService:
                     pass
             # Stale unsent versions can be retired immediately, even before due.
             for job in db.scalars(select(DiscordReminder).where(DiscordReminder.status.in_(["pending","retrying"]),
+                    DiscordReminder.notification_type=="one_hour",
                     DiscordReminder.delivery_uncertain==0)):
                 session = db.get(ReservationSession,job.session_id)
                 if (session is None or session.status!="active" or session.scope!=job.scope or
@@ -94,6 +112,8 @@ class DiscordReminderService:
                     db.execute(update(DiscordReminder).where(DiscordReminder.id==job.id,
                         DiscordReminder.status.in_(["pending","retrying"]),DiscordReminder.delivery_uncertain==0)
                         .values(status="cancelled",last_error="session_no_longer_due",updated_at=stamp(current)))
+        from .queue_notifications import plan_queue_notices
+        plan_queue_notices(self)
         return created
 
     def _claim(self, identifier):
@@ -144,6 +164,17 @@ class DiscordReminderService:
         row.delivery_uncertain = 0
 
     def _recover(self, identifier, token, evidence):
+        # A PATCH-only update is idempotent and has no new nonce to reconcile.
+        # Retrying the same edit is safe after an uncertain local commit.
+        with self.store.connect() as db:
+            row = db.get(DiscordReminder, identifier)
+            if (row and row.claim_token == token and row.status == "processing"
+                    and row.batch_id and row.discord_message_id):
+                row.status, row.delivery_uncertain = "retrying", 0
+                row.send_started_at = None
+                row.claim_token, row.lease_until = None, None
+                row.next_attempt_at = stamp(instant(self.clock()))
+                return
         # Do not revalidate current reservation here: an already delivered message
         # remains sent even if the session was cancelled after the failed commit.
         try:
@@ -221,6 +252,12 @@ class DiscordReminderService:
 
     def _send_locked(self, identifier, token, destination=None):
         with self.store.connect() as db:
+            queue_notice = db.get(DiscordReminder, identifier)
+            if queue_notice is not None and queue_notice.batch_id:
+                from .queue_notifications import send_queue_locked
+                return send_queue_locked(self, identifier, token, destination)
+        dispatch=None
+        with self.store.connect() as db:
             # Scope first, then tournament/table rows, then delivery row. No
             # remote mutation occurs until the exact current membership is read.
             seed = db.get(DiscordReminder,identifier)
@@ -228,6 +265,12 @@ class DiscordReminderService:
             db.refresh(seed)
             row = db.scalar(select(DiscordReminder).where(DiscordReminder.id==identifier).with_for_update())
             if row.claim_token!=token or row.status!="processing":
+                return
+            if not self._legacy_sessions_enabled():
+                row.status, row.last_error = "cancelled", "legacy_schedule_retired"
+                row.delivery_uncertain, row.send_started_at = 0, None
+                row.claim_token, row.lease_until = None, None
+                row.updated_at = stamp(instant(self.clock()))
                 return
             session = db.get(ReservationSession,row.session_id)
             table = db.get(ClubTable,session.table_id) if session else None
@@ -285,12 +328,25 @@ class DiscordReminderService:
                     if throttle and instant(throttle.not_before)>instant(self.clock()):
                         raise DiscordReminderError("rate_limited",retryable=True,
                             retry_after=(instant(throttle.not_before)-instant(self.clock())).total_seconds())
-                    message_id=self.sender.send(destination or {"channel_id":row.channel_id,"bot_user_id":row.bot_user_id},payload)
-                    self._record_sent(db,row,message_id)
+                    # The committed validation is the dispatch boundary. Release
+                    # account and DB locks before any network I/O. Cancellation
+                    # after this point cannot retract an already dispatched message.
+                    dispatch=(destination or {"channel_id":row.channel_id,"bot_user_id":row.bot_user_id},payload)
             except (TimeoutError,BlockingIOError):
                 self._error(row,DiscordReminderError("account_directory_busy",retryable=True))
             except DiscordReminderError as error:
                 self._error(row,error)
+                logger.warning("Discord reservation reminder: %s",error.code)
+
+        if dispatch is not None:
+            try:
+                message_id=self.sender.send(*dispatch)
+                with self.store.connect() as db:
+                    row=db.get(DiscordReminder,identifier)
+                    if row and row.claim_token==token and row.status=="processing":
+                        self._record_sent(db,row,message_id)
+            except DiscordReminderError as error:
+                self._finish_error(identifier,token,error)
                 logger.warning("Discord reservation reminder: %s",error.code)
 
     def _process(self, identifier, token):
@@ -303,6 +359,13 @@ class DiscordReminderService:
         if uncertain:
             self._recover(identifier,token,evidence)
             return
+        with self.store.connect() as db:
+            row = db.get(DiscordReminder, identifier)
+            if row and row.notification_type == "one_hour" and not self._legacy_sessions_enabled():
+                row.status, row.last_error = "cancelled", "legacy_schedule_retired"
+                row.claim_token, row.lease_until = None, None
+                row.updated_at = stamp(instant(self.clock()))
+                return
         try:
             if not self.config.enabled:
                 raise DiscordReminderError("reminders_disabled",retryable=True,retry_after=60)

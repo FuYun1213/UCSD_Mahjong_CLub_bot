@@ -10,12 +10,74 @@ async function manualScoreApi(url, body) {
   if(!response.ok) throw Object.assign(new Error(data.detail?.code||"requestFailed"),{fieldErrors:data.detail?.field_errors||{},totals:data.detail?.score_totals,status:response.status});
   return data;
 }
+function ManualScoreComposer({language,form,edit,errors,disabled}) {
+  const t=k=>MahjongI18n.t(language,k);
+  const fields=manualWinds.flatMap((wind,index)=>[{wind,index,kind:"players"},{wind,index,kind:"scores"}]);
+  const [active,setActive]=React.useState(0),[editing,setEditing]=React.useState(false),[names,setNames]=React.useState({});
+  const input=React.useRef(null);
+  const dock=React.useRef(null),[dockHeight,setDockHeight]=React.useState(230);
+  const previousErrors=React.useRef(errors);
+  const measure=()=>{const view=window.visualViewport;return {left:view?.offsetLeft||0,width:view?.width||innerWidth,height:view?.height||innerHeight,bottom:(view?.offsetTop||0)+(view?.height||innerHeight)};};
+  const [viewport,setViewport]=React.useState(measure);
+  const field=fields[active],score=field.kind==="scores",key=field.kind+"."+field.wind;
+  const query=score?form.scores[field.wind]:names[field.wind]??form.players[field.wind]?.name??"";
+  const label=t("wind"+field.index)+" "+t(score?"manualPoints":"manualRegisteredName");
+  const completed=fields.filter(item=>item.kind==="players"?form.players[item.wind]?.id:/^-?\d+$/.test(form.scores[item.wind])).length;
+  React.useLayoutEffect(()=>{
+    const update=()=>setDockHeight(dock.current?.getBoundingClientRect().height||230);
+    const observer=new ResizeObserver(update);observer.observe(dock.current);update();return()=>observer.disconnect();
+  },[]);
+  React.useEffect(()=>{
+    const view=window.visualViewport,update=()=>setViewport(measure());
+    view?.addEventListener("resize",update);view?.addEventListener("scroll",update);window.addEventListener("resize",update);update();
+    return()=>{view?.removeEventListener("resize",update);view?.removeEventListener("scroll",update);window.removeEventListener("resize",update);};
+  },[]);
+  React.useLayoutEffect(()=>{if(editing&&!disabled){input.current?.focus({preventScroll:true});input.current?.select();}},[active,editing]);
+  React.useEffect(()=>{
+    const invalid=fields.findIndex(item=>errors[item.kind+"."+item.wind]&&!previousErrors.current[item.kind+"."+item.wind]);
+    previousErrors.current=errors;
+    if(invalid>=0&&!disabled){setActive(invalid);setEditing(true);}
+  },[errors]);
+  function activate(index){if(disabled)return;setActive(index);setEditing(true);input.current?.focus({preventScroll:true});if(index===active)input.current?.select();}
+  function finish(){input.current?.blur();setEditing(false);}
+  function next(){if(active<7)activate(active+1);else finish();}
+  const keepFocus=event=>event.preventDefault();
+  const floating=editing&&viewport.width<=767;
+  return <section className="manual-quick-entry" data-quick-entry>
+    <div className="manual-command-heading"><code>/record_game</code><span>{completed}/8 · {t("manualEightFields")}</span><p>{t("manualQuickHelp")}</p></div>
+    <div className="manual-composer-space">
+      <div ref={dock} className="manual-composer-dock" data-floating={floating} data-editing={editing} data-compact={viewport.height<360} data-active-field={key} style={{"--manual-visible-height":viewport.height+"px","--manual-menu-height":Math.max(0,viewport.height-dockHeight-8)+"px",...(floating?{position:"fixed",top:viewport.bottom+"px",left:viewport.left+"px",width:viewport.width+"px",transform:"translateY(-100%)"}:{})}}>
+        <div className="manual-composer-heading"><span>{label}</span><div>
+          {score&&<button type="button" disabled={disabled} onPointerDown={keepFocus} aria-label={t("manualToggleSign")} onClick={()=>{edit("scores",field.wind,query.startsWith("-")?query.slice(1):"-"+query);input.current?.focus({preventScroll:true});}}>±</button>}
+          <button type="button" disabled={disabled} onPointerDown={keepFocus} onClick={next}>{t(active===7?"manualInputDone":"manualInputNext")}</button>
+          {editing&&active!==7&&<button type="button" onPointerDown={keepFocus} onClick={finish}>{t("manualInputDone")}</button>}
+        </div></div>
+        <RegisteredUserCombobox language={language} inputId="manual-command-input" inputRef={input} fieldKey={key}
+          value={score?null:form.players[field.wind]} queryValue={query} textMode={score} label={label}
+          placeholder={t(score?"manualQuickScorePlaceholder":"registeredNamePlaceholder")} disabled={disabled} required={!score}
+          error={errors[key]||""} retainFocus enterKeyHint={active===7?"done":"next"}
+          onQueryChange={value=>{if(score)edit("scores",field.wind,value);else setNames(old=>({...old,[field.wind]:value}));}}
+          onChange={person=>{edit("players",field.wind,person);if(person){setNames(old=>({...old,[field.wind]:person.name}));activate(active+1);}}}
+          onNext={next} onInputFocus={()=>{setViewport(measure());setEditing(true);}}
+          onInputBlur={()=>setTimeout(()=>{if(document.activeElement!==input.current)setEditing(false);},0)}/>
+        <div className="manual-field-shortcuts" role="group" aria-label={t("manualQuickFields")}>{fields.map((item,index)=>{
+          const itemKey=item.kind+"."+item.wind,isScore=item.kind==="scores",value=isScore?form.scores[item.wind]:form.players[item.wind]?.name||names[item.wind];
+          return <button type="button" key={itemKey} data-quick-field={itemKey} aria-pressed={active===index} aria-label={t("wind"+item.index)+" "+t(isScore?"manualPoints":"manualRegisteredName")} className={errors[itemKey]?"has-error":""} disabled={disabled} onPointerDown={keepFocus} onClick={()=>activate(index)}><span>{t("manualShortWind"+item.index)} · {t(isScore?"manualPoints":"manualQuickPlayer")}</span><strong>{value||"…"}</strong></button>;
+        })}</div>
+      </div>
+    </div>
+    <p className="manual-quick-note">{t("manualQuickNote")}</p>
+  </section>;
+}
 function ManualScorePage({language,profile,onRefresh}) {
   const t=(k,vars)=>MahjongI18n.t(language,k,vars), safeMessage=k=>t(MahjongI18n.entries[k]?k:"requestFailed");
-  const table=new URLSearchParams(location.search).get("table")||"";
-  const storageKey=profile?"manual-score-upload-v6:"+profile.id+":"+table:null;
+  const params=new URLSearchParams(location.search),table=params.get("table")||"",selectedMatchId=params.get("match_id")||"";
+  const storageKey=profile?"manual-score-upload-v6:"+profile.id+":"+table+":"+selectedMatchId:null;
   const emptyForm=()=>({played_at:"",players:Object.fromEntries(manualWinds.map(w=>[w,null])),scores:Object.fromEntries(manualWinds.map(w=>[w,""]))});
   const [form,setForm]=React.useState(emptyForm),[context,setContext]=React.useState(null),[errors,setErrors]=React.useState({});
+  const [availableTables,setAvailableTables]=React.useState([]);
+  const [entryMode,setEntryMode]=React.useState(()=>sessionStorage.getItem("manual-score-entry-mode")||"command");
+  function chooseEntryMode(mode){sessionStorage.setItem("manual-score-entry-mode",mode);setEntryMode(mode);}
   const [message,setMessage]=React.useState(""),[busy,setBusy]=React.useState(false),[result,setResult]=React.useState(null);
   const [uncertain,setUncertain]=React.useState(false),[loadedKey,setLoadedKey]=React.useState(null);
   const attempt=React.useRef(null),pending=React.useRef(false),formRef=React.useRef(form),resultRef=React.useRef(result);
@@ -32,7 +94,8 @@ function ManualScorePage({language,profile,onRefresh}) {
     const restored=saved?.form?.players&&saved?.form?.scores?saved.form:emptyForm();
     setForm(restored);setResult(saved?.result||null);attempt.current=saved?.attempt||null;setUncertain(Boolean(saved?.attempt?.uncertain));
     if(!profile)return;
-    manualScoreApi("/api/manual-score/context"+(table?"?table="+encodeURIComponent(table):"")).then(async data=>{
+    manualScoreApi("/api/club-tables").then(data=>{if(active)setAvailableTables(data.tables||[]);}).catch(()=>{});
+    manualScoreApi("/api/manual-score/context?"+new URLSearchParams({...table?{table}:{},...selectedMatchId?{match_id:selectedMatchId}:{}})).then(async data=>{
       if(!active)return;setContext(data);
       const players=Object.fromEntries(manualWinds.map(w=>[w,restored.players[w]||data.players[w]||null]));
       const ids=[...new Set(Object.values(players).filter(Boolean).map(p=>p.id))];
@@ -50,8 +113,29 @@ function ManualScorePage({language,profile,onRefresh}) {
       if(active){setForm({...restored,players,played_at:restored.played_at||data.played_at_default});setLoadedKey(storageKey);}
     }).catch(e=>{if(active)setMessage(e.message);});
     return()=>{active=false;};
-  },[table,profile?.id]);
+  },[table,selectedMatchId,profile?.id]);
   React.useEffect(()=>{if(storageKey&&loadedKey===storageKey)remember();},[form,storageKey,loadedKey]);
+  // Delivery status is read separately from the acknowledged local save.
+  // One visible-page request at a time, capped at two minutes per state.
+  React.useEffect(()=>{
+    if(!profile||!result?.local_saved||!result?.draft_id)return;
+    const outstanding=result.status==="pending"||["pending","sending","failed"].includes(result.external_sync?.status);
+    if(!outstanding)return;
+    let active=true,timer=null,reads=0;
+    async function poll(){
+      if(!active||reads>=40)return;
+      if(document.visibilityState==="visible"&&!pending.current){
+        reads++;
+        try{
+          const data=await manualScoreApi("/api/manual-score/drafts/"+encodeURIComponent(result.draft_id));
+          if(active&&data.submission){setResult(data.submission);remember(attempt.current,data.submission);}
+        }catch{} // Preserve the successful local save through a transient read failure.
+      }
+      if(active)timer=setTimeout(poll,3000);
+    }
+    timer=setTimeout(poll,1000);
+    return()=>{active=false;clearTimeout(timer);};
+  },[profile?.id,result?.draft_id,result?.status,result?.external_sync?.status]);
   function edit(kind,wind,value) {
     if(uncertain||busy)return;
     setForm(old=>({...old,[kind]:{...old[kind],[wind]:value}}));
@@ -84,7 +168,7 @@ function ManualScorePage({language,profile,onRefresh}) {
     // After an uncertain response, retry the exact saved payload even when a
     // selected account has since changed or been disabled. The server owns it.
     if(!uncertain&&Object.keys(fieldErrors).length)return;
-    const body={table_id:context?.table_id||table||null,players,scores,played_at:form.played_at};
+    const body={table_id:context?.table_id||table||null,match_id:selectedMatchId||context?.match_id||null,players,scores,played_at:form.played_at};
     const signature=JSON.stringify(body);
     let next=attempt.current;
     if(!uncertain&&next?.signature!==signature)next={signature,body,request_id:MahjongI18n.key()};
@@ -115,26 +199,37 @@ function ManualScorePage({language,profile,onRefresh}) {
     attempt.current=null;
     location.reload();
   }
+  function chooseTable(tableId) {
+    if(busy||uncertain)return;
+    const url=new URL(location.href);
+    if(tableId)url.searchParams.set("table",tableId);else url.searchParams.delete("table");
+    if(tableId!==context?.table_id)url.searchParams.delete("match_id");
+    location.assign(url.pathname+url.search);
+  }
   const externalStatus=result?.external_sync?.status;
   const externalLabel=externalStatus==="success"?"manualExternalSuccess":externalStatus==="disabled"||!externalStatus?"manualExternalDisabled":externalStatus==="failed"||externalStatus==="unsupported"||externalStatus==="manual_review"?"manualExternalFailed":"manualExternalPending";
   const retryNeeded=result&&(result.status==="pending"||["failed","pending","sending"].includes(externalStatus));
-  return <div data-i18n-owned><Card>
+  return <div data-i18n-owned className="manual-score-page"><Card>
     <div className="mb-5 flex flex-wrap items-center justify-between gap-3"><h2 className="text-xl font-bold">{t("manualScore")}</h2>
       <a href={"/?page=record"+(table?"&table="+encodeURIComponent(context?.table||table):"")} className="text-sm underline">{t("manualBack")}</a></div>
+    {profile&&<label className="mb-4 block text-sm font-bold">{t("selectTable")}<select aria-label={t("selectTable")} className={inputClass} value={context?.table_id||""} disabled={busy||uncertain||!availableTables.length} onChange={event=>chooseTable(event.target.value)}>
+      <option value="">{t("manualStandalone")}</option>{availableTables.map(item=><option key={item.id} value={item.id}>{t("tableNumber",{number:item.number})}{item.display_name&&" · "+item.display_name}</option>)}
+    </select></label>}
     {table&&context?.table_name&&<p className="mb-3 text-sm">{t("table")} · {context.table_name}</p>}
     <p className="mb-4 text-sm text-zinc-600">{t("manualUploadHelp")}</p>
-    {!result&&<form onSubmit={upload} noValidate>
-      <label className="mb-4 block text-sm font-bold">{t("competitionPlayedAt")} ({context?.timezone||"America/Los_Angeles"})<input aria-label={t("competitionPlayedAt")} type="datetime-local" className={inputClass} value={form.played_at||""} disabled={busy||uncertain} onChange={e=>setForm(old=>({...old,played_at:e.target.value}))}/><span className="block font-normal text-zinc-600">{t("competitionPlayedAtHelp")}</span>{errors.played_at&&<span className="text-red-700">{t(errors.played_at)}</span>}</label>
-      <div className="space-y-4">{manualWinds.map((wind,index)=><fieldset key={wind} className="rounded-xl border border-zinc-200 p-3" data-wind={wind}>
+    {!result&&<form onSubmit={upload} noValidate className={entryMode==="command"?"manual-command-form":"manual-standard-form"}>
+      <div className="manual-entry-modes" role="group" aria-label={t("manualEntryMode")}>{["command","standard"].map(mode=><button type="button" key={mode} aria-pressed={entryMode===mode} onClick={()=>chooseEntryMode(mode)}>{t(mode==="command"?"manualCommandMode":"manualStandardMode")}</button>)}</div>
+      <details className="manual-score-time" open={errors.played_at?true:undefined}><summary>{t("competitionPlayedAt")} · {form.played_at?.replace("T"," ")||"—"}</summary><label className="mb-4 block text-sm font-bold">{t("competitionPlayedAt")} ({context?.timezone||"America/Los_Angeles"})<input aria-label={t("competitionPlayedAt")} type="datetime-local" className={inputClass} value={form.played_at||""} disabled={busy||uncertain} onChange={e=>setForm(old=>({...old,played_at:e.target.value}))}/><span className="block font-normal text-zinc-600">{t("competitionPlayedAtHelp")}</span>{errors.played_at&&<span className="text-red-700">{t(errors.played_at)}</span>}</label></details>
+      {entryMode==="command"?<ManualScoreComposer language={language} form={form} edit={edit} errors={errors} disabled={busy||uncertain}/>:<div className="manual-eight-fields space-y-4">{manualWinds.map((wind,index)=><fieldset key={wind} className="rounded-xl border border-zinc-200 p-3" data-wind={wind}>
         <legend className="px-2 font-bold">{t("wind"+index)}</legend>
         <div className="grid gap-3 sm:grid-cols-2">
-          <div className="min-w-0 text-sm font-semibold"><RegisteredUserCombobox language={language} value={form.players[wind]} onChange={person=>edit("players",wind,person)} disabled={busy||uncertain} label={t("wind"+index)+" "+t("manualRegisteredName")} inputId={"manual-player-"+wind} required error={errors["players."+wind]?(MahjongI18n.entries[errors["players."+wind]]?errors["players."+wind]:"requestFailed"):""}/></div>
+          <div className="manual-command-player min-w-0 text-sm font-semibold">{entryMode==="command"&&<code className="manual-parameter">{wind}_name</code>}<RegisteredUserCombobox language={language} value={form.players[wind]} onChange={person=>edit("players",wind,person)} disabled={busy||uncertain} label={t("wind"+index)+" "+t("manualRegisteredName")} inputId={"manual-player-"+wind} required error={errors["players."+wind]?(MahjongI18n.entries[errors["players."+wind]]?errors["players."+wind]:"requestFailed"):""}/></div>
           <label className="min-w-0 text-sm font-semibold"><span className="mb-1 block">{t("manualPoints")}</span>
-            <input className={inputClass} type="text" inputMode="numeric" aria-label={t("wind"+index)+" "+t("manualPoints")} aria-describedby={"score-error-"+wind} aria-invalid={Boolean(errors["scores."+wind])} value={form.scores[wind]} onChange={e=>edit("scores",wind,e.target.value)} disabled={busy||uncertain}/>
+            {entryMode==="command"&&<code className="manual-parameter">{wind}_score</code>}<input className={inputClass} type="text" inputMode="text" enterKeyHint={index===3?"done":"next"} aria-label={t("wind"+index)+" "+t("manualPoints")} aria-describedby={"score-error-"+wind} aria-invalid={Boolean(errors["scores."+wind])} value={form.scores[wind]} onChange={e=>edit("scores",wind,e.target.value)} disabled={busy||uncertain}/>
             <span id={"score-error-"+wind} role={errors["scores."+wind]?"alert":undefined} className="mt-1 block text-red-700">{errors["scores."+wind]?safeMessage(errors["scores."+wind]):""}</span>
           </label>
         </div>
-      </fieldset>)}</div>
+      </fieldset>)}</div>}
       {rules&&<div className="mt-4 rounded-xl bg-warm p-3" aria-live="polite" data-testid="manual-score-totals">
         <p>{t("manualCurrentTotal")}: {total===null?"—":total}</p><p>{t("manualExpectedTotal")}: {rules.expected_total}</p><p>{t("manualTotalDifference")}: {difference===null?"—":difference>0?"+"+difference:difference}</p>
         <p className="mt-1 text-sm">{t("manualScoreRule",{step:rules.step,maximum:rules.max_absolute})}</p>
@@ -146,7 +241,7 @@ function ManualScorePage({language,profile,onRefresh}) {
       <h3 className="font-bold text-emerald-900">{t("manualSaved")}</h3>
       {manualWinds.map((wind,index)=>{const p=result.result.players[wind];return <p key={wind}>{t("wind"+index)} · {p.user.name||form.players[wind]?.name} · {p.final_points} {t("pPoints")}</p>;})}
       <p className="mt-2 text-sm">{t("manualLocalSaved")}</p>
-      {result.status==="pending"&&<p className="mt-2 text-sm">{t("manualSyncPending")}</p>}
+      {result.status==="pending"&&<p className="mt-2 text-sm">{t(result.history_sync?.status==="failed"?"manualHistoryReview":"manualSyncPending")}</p>}
       <p className={externalLabel==="manualExternalFailed"?"mt-2 text-red-700":"mt-2 text-sm"}>{t(externalLabel)}</p>
       {externalLabel==="manualExternalFailed"&&<p className="mt-1 text-sm">{t("manualExternalRetryHelp")}</p>}
       {retryNeeded&&<button className={buttonStyle+" mt-3"} disabled={busy} onClick={retry}>{t(busy?"manualWorking":"manualRetryUpload")}</button>}

@@ -16,7 +16,7 @@ def test_manual_game_lost_response_then_reload_is_not_duplicated(website):
     registered_names.write_accounts(web_server.USERS_FILE, directory)
     state = app.state.tournaments.create({"name": "Retry Test", "settings": RULES, "request_id": str(uuid4())}, "photo-user-1")
     env = {**os.environ, "NFC_TEST_URL": url, "V10_TID": state["id"],
-           "NODE_PATH": str(Path(".venv-api/browser-tests/node_modules").resolve())}
+           "NODE_PATH": str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve())}
     result = subprocess.run(["node", "tests/browser_manual_v10.cjs"], env=env,
                             capture_output=True, text=True, encoding="utf-8", timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr

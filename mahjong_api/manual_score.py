@@ -14,6 +14,7 @@ from sqlalchemy.exc import IntegrityError
 
 from .database_models import User as Account, MatchHistory
 from .external_sync import audit, dump, queue_free_match
+from .discord_score_notify import schedule_score_notification
 from .manual_score_models import ManualScoreDraft, ManualScorePlayer, ManualScoreRequest
 from .models import SEATS, Scores, SCORE_STEP, SCORE_MAX_ABSOLUTE
 from .scoring import calculate_match_result
@@ -68,7 +69,7 @@ class ManualScoreService:
             unique.setdefault(uid.strip(), uid.strip())
         return {"players": self.tables.lookup_accounts(list(unique.values()))}
 
-    def _context(self, table_id, user, writable=False, session=None):
+    def _context(self, table_id, user, writable=False, session=None, match_id=None):
         if not table_id:
             return {"table_id": None, "table": None, "match_id": None,
                     "players": dict.fromkeys(SEATS), "score_rules": self.rules(), "timezone": site_timezone(), "played_at_default": datetime.now(ZoneInfo(site_timezone())).strftime("%Y-%m-%dT%H:%M")}
@@ -82,18 +83,22 @@ class ManualScoreService:
             check(not registered.tournament_id, "fixed_tournament_seating")
             table = self.store._table(db, registered.score_table_id)
             check(table is not None, "table_not_found")
+            if match_id and match_id != table["current_match_id"]:
+                from .game_round_models import GameRound
+                prior = db.get(GameRound, match_id)
+                check(prior is not None and prior.table_id == registered.id and
+                      prior.status == "awaiting_score", "stale_match")
+                table = {**table, "current_match_id": prior.game_id,
+                         "seats": json.loads(prior.roster_json), "pending_match_id": None}
             if writable:
-                if user.role not in {"admin", "super_admin"} and not any(
-                        person and str(person["id"]) == str(user.id) for person in table["seats"].values()):
-                    raise HTTPException(403, detail={"code": "must_join_first"})
                 check(not table["pending_match_id"], "settlement_pending")
             return {"table_id": registered.id, "table": registered.score_table_id,
                     "match_id": table["current_match_id"], "players": table["seats"], "table_name": registered.display_name,
                     "score_rules": self.rules(), "timezone": site_timezone(), "played_at_default": datetime.now(ZoneInfo(site_timezone())).strftime("%Y-%m-%dT%H:%M")}
 
-    def context(self, table_id, user):
+    def context(self, table_id, user, match_id=None):
         with membership_lock:
-            return self._context(table_id, user)
+            return self._context(table_id, user, match_id=match_id)
 
     def validate(self, players, scores):
         errors, normalized, seen = {}, {}, set()
@@ -154,12 +159,16 @@ class ManualScoreService:
 
     def get_draft(self, draft_id, user):
         with self.store.connect() as db:
-            return self._view(self._draft(db, draft_id, user))
+            draft = self._draft(db, draft_id, user)
+            view, submitted = self._view(draft), draft.status == "submitted"
+        if submitted:
+            view["submission"] = self._response(draft_id, True)[0]
+        return view
 
     def preview(self, data, user):
         players, scores = self.validate(data.get("players"), data.get("scores"))
         with membership_lock:
-            context = self._context(data.get("table_id"), user, writable=True)
+            context = self._context(data.get("table_id"), user, writable=True, match_id=data.get("match_id"))
             errors = {"players." + seat: "seat_player_mismatch" for seat in SEATS
                       if context["players"][seat] and context["players"][seat]["id"] != players[seat]["id"]}
             if errors:
@@ -194,7 +203,7 @@ class ManualScoreService:
         # The stable draft exists before confirmation. A crash or lost HTTP
         # response at either boundary resumes this draft instead of making one.
         draft_id = str(uuid5(NAMESPACE_URL, dump(["manual-score-upload-v1", str(user.id), request_id])))
-        with membership_lock:
+        with self.tables.account_guard(), membership_lock:
             with self.store.connect() as db:
                 previous = db.get(ManualScoreRequest, request_id)
                 check(previous is None or previous.draft_id == draft_id and previous.uploader_id == str(user.id), "submission_conflict")
@@ -205,7 +214,7 @@ class ManualScoreService:
                 try:
                     players, scores = self.validate(data.get("players"), data.get("scores"))
                     with self.store.connect() as db:
-                        context = self._context(data.get("table_id"), user, writable=True, session=db)
+                        context = self._context(data.get("table_id"), user, writable=True, session=db, match_id=data.get("match_id"))
                         errors = {"players." + seat: "seat_player_mismatch" for seat in SEATS
                                   if context["players"][seat] and context["players"][seat]["id"] != players[seat]["id"]}
                         if errors:
@@ -231,8 +240,9 @@ class ManualScoreService:
             check(draft.status == "submitted", "submission_not_saved")
             key = "nfc-" + draft.match_id
         # Reuse the durable endpoint/body/idempotency key from ExternalSync.
+        self.matches.history.retry(draft.match_id)
         if self.matches.external.get(key):
-            self.matches.external.send(key, actor=str(user.id), retry=True)
+            self.matches.external.schedule_retry(key, actor=str(user.id))
         return self._response(draft_id, True)
 
     def confirm(self, data, user):
@@ -240,7 +250,7 @@ class ManualScoreService:
         check(isinstance(request_id, str) and 1 <= len(request_id) <= 128, "request_id_required")
         check(isinstance(draft_id, str) and 1 <= len(draft_id) <= 64, "invalid_draft_id")
         try:
-            with membership_lock, self.store.connect() as db:
+            with self.tables.account_guard(), membership_lock, self.store.connect() as db:
                 # Serialize this draft before reading its status. SQLite acquires
                 # its write lock with the UPDATE; PostgreSQL locks the row.
                 if db.bind.dialect.name == "sqlite":
@@ -261,7 +271,7 @@ class ManualScoreService:
                     players, scores = self.validate({s: saved_players[s]["id"] for s in SEATS}, json.loads(draft.scores_json))
                     points = calculate_match_result(scores, self.matches.settings.initial_points)
                     if draft.table_id:
-                        context = self._context(draft.table_id, user, writable=True, session=db)
+                        context = self._context(draft.table_id, user, writable=True, session=db, match_id=draft.match_id)
                         check(context["match_id"] == draft.match_id, "stale_match")
                         old_roster = json.loads(draft.roster_json)
                         check({s: p["id"] if p else None for s, p in context["players"].items()} ==
@@ -293,6 +303,13 @@ class ManualScoreService:
                           "match_id": result["match_id"], "table_id": draft.table_id, "players": players, "scores": scores})
                     if not draft.table_id:
                         queue_free_match(db, result)
+                    # Bound manual scores and NFC submissions share one game and
+                    # one set of delivery tasks, with both source aliases retained.
+                    self.matches.history.enqueue_history(db, {
+                        "sequence": draft.sequence, "match_id": draft.match_id,
+                        "table_id": draft.score_table_id, "round_no": result.get("round"),
+                        "scores": scores, "result": result,
+                    }, source_kind="manual", source_id=draft.id)
         except IntegrityError:
             # Two different drafts may race for one request ID. Its unique key
             # rolls back the entire losing transaction, including any scores.
@@ -302,30 +319,13 @@ class ManualScoreService:
                     raise Conflict("submission_conflict", "submission_conflict") from None
                 check(self._draft(db, draft_id, user).status == "submitted", "submission_conflict")
                 replayed = True
+        if not replayed:
+            schedule_score_notification(result)
         return self._response(draft_id, replayed)
 
     def flush(self):
-        with membership_lock:
-            with self.store.connect() as db:
-                rows = list(db.scalars(select(ManualScoreDraft).where(ManualScoreDraft.status == "submitted",
-                            ManualScoreDraft.table_id.is_(None), ManualScoreDraft.history_synced == 0)
-                            .order_by(ManualScoreDraft.sequence)))
-            for draft in rows:
-                try:
-                    match = {"sequence": draft.sequence, "match_id": draft.match_id, "table_id": None,
-                             "round_no": None, "scores": json.loads(draft.scores_json), "result": json.loads(draft.result_json)}
-                    # Production sinks explicitly support the generic history path.
-                    writer = getattr(self.matches.sheets, "write_manual_history", None)
-                    if writer:
-                        writer(match)
-                    elif self.matches.sheets.enabled:
-                        raise RuntimeError("The configured history sink does not support manual scoring")
-                    with self.store.connect() as db:
-                        row = db.scalar(select(ManualScoreDraft).where(ManualScoreDraft.id == draft.id))
-                        row.history_synced = 1
-                except Exception:
-                    logger.exception("Manual history sync failed for %s; retained for retry", draft.id)
-                    break
+        # Compatibility worker entry: history delivery is independent of seat locks.
+        self.matches.history.flush(limit=10)
 
         # The existing background worker calls flush(). Retry only transient
         # manual delivery failures, with bounded exponential backoff; permanent
@@ -348,13 +348,13 @@ class ManualScoreService:
         if table:
             body, status = self.matches._match_response(match_id, replayed)
         else:
-            self.flush()
-            delivery = self.matches.external.get("nfc-" + match_id)
-            external = self.matches.external.send("nfc-" + match_id) if delivery else None
+            history = self.matches.history.status(match_id)
+            external = self.matches.external.get("nfc-" + match_id)
             with self.store.connect() as db:
                 draft = db.scalar(select(ManualScoreDraft).where(ManualScoreDraft.id == draft_id))
-                pending = not draft.history_synced
-                body = {"status": "pending" if pending else "success", "local_saved": True,
+                pending = history["status"] != "synced"
+                body = {"status": "pending" if pending else "success", "local_saved": True, "local_completed": True,
+                        "history_sync": history,
                         "sync_status": "pending" if pending else ("synced" if self.matches.sheets.enabled else "disabled"),
                         "replayed": replayed, "result": json.loads(draft.result_json), "external_sync": external}
                 status = 202 if pending else 200

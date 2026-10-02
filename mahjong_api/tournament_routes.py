@@ -79,6 +79,7 @@ def public_state(state):
     # Public standings/seating links do not expose operator identities or audit data.
     state.pop("audit", None)
     state.pop("deliveries", None)
+    state.pop("archived_by", None)
     for penalty in state.get("penalties", []):
         penalty.pop("created_by", None)
         penalty.pop("revoked_by", None)
@@ -161,6 +162,8 @@ def delivery_status(request: Request, key: str, user: Current):
 @router.post("/api/external-deliveries/{key}/retry", dependencies=[Depends(check_cookie_origin)])
 def retry(request: Request, key: str, user: Current):
     authorize_delivery(request, key, user)
+    if key.startswith("nfc-"):
+        return request.app.state.external.schedule_retry(key, actor=user.id)
     return request.app.state.external.send(key, user.id, retry=True)
 
 

@@ -10,12 +10,13 @@ import os
 import socket
 import threading
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit
 from pathlib import Path
 
 import requests
+import request_performance as perf
 from sqlalchemy import select
 from .database_models import Metadata
 from .store import Conflict, now
@@ -243,6 +244,23 @@ class ExternalSync:
             return self.config()
 
     def request(self, endpoint, adapter, payload=None, method=METHOD):
+        # HTTP callers contribute to their request. The background worker has no
+        # request context, so create a fixed-label metric without endpoint/body/ID.
+        metric, token = (None, None)
+        if perf.current.get() is None:
+            metric, token = perf.start("WORKER", "/internal/narts-request" if adapter == "narts" else "/internal/external-request")
+        try:
+            stage = perf.measure("nartsDurationMs", "nartsCallCount") if adapter == "narts" else nullcontext()
+            with stage:
+                status, body = self._request(endpoint, adapter, payload, method)
+            if metric is not None:
+                metric["status"] = status
+            return status, body
+        finally:
+            if metric is not None:
+                perf.finish(metric, token)
+
+    def _request(self, endpoint, adapter, payload=None, method=METHOD):
         if self.transport:
             return self.transport(endpoint, adapter, payload, method)
         validate_endpoint(endpoint, resolve=True)
@@ -291,6 +309,18 @@ class ExternalSync:
             if tournament_id is not None:
                 query = query.where(ExternalDelivery.tournament_id == tournament_id)
             return [public_delivery(row) for row in db.scalars(query)]
+
+    def schedule_retry(self, key, actor=""):
+        """Only queue the existing frozen request; never send on an interactive path."""
+        with self.store.connect() as db:
+            row = db.get(ExternalDelivery, key)
+            if not row:
+                raise Conflict("not_found", "not_found")
+            if row.status == "failed":
+                row.status, row.updated_at = "pending", now()
+                audit(db, row.tournament_id, actor or row.actor_id, "external_retry_queued",
+                      {"request_id": key, "attempt": row.attempts})
+            return public_delivery(row)
 
     def send(self, key, actor="", retry=False):
         with _send_lock:

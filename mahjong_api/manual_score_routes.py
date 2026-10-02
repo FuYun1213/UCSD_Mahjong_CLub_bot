@@ -20,8 +20,8 @@ def lookup_players(request: Request, data: dict, user: Current):
 
 
 @router.get("/api/manual-score/context")
-def context(request: Request, user: Current, table: str | None = None):
-    return request.app.state.manual_scores.context(table, user)
+def context(request: Request, user: Current, table: str | None = None, match_id: str | None = None):
+    return request.app.state.manual_scores.context(table, user, match_id)
 
 
 @router.get("/api/manual-score/drafts/{draft_id}")

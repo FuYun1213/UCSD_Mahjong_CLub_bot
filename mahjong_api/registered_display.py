@@ -41,3 +41,17 @@ def with_registered_names(value, profiles):
     aliases(result)
     rewrite(result)
     return result
+
+
+def referenced_account_ids(value):
+    """Only load profiles actually used by this response, including audit labels."""
+    ids = set()
+    def visit(node):
+        if isinstance(node, list):
+            for child in node: visit(child)
+        elif isinstance(node, dict):
+            for key in ("account_id","user_id","id","actor_id","uploader_id","added_by_user_id","created_by"):
+                if node.get(key) is not None: ids.add(str(node[key]))
+            for child in node.values(): visit(child)
+    visit(value)
+    return sorted(ids)

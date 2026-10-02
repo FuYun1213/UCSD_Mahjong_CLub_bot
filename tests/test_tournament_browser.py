@@ -19,7 +19,7 @@ def test_browser_tournament_workflow(website,monkeypatch):
     app.state.external.transport=lambda endpoint,adapter,body,method:(201,{"match":{"id":"browser-match"}})
     env=os.environ.copy()
     env["NFC_TEST_URL"]=url
-    env["NODE_PATH"]=str(Path(".venv-api/browser-tests/node_modules").resolve())
+    env["NODE_PATH"]=str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve())
     result=subprocess.run(["node","tests/browser_tournament.cjs"],env=env,capture_output=True,text=True,
         encoding="utf-8",timeout=150)
     assert result.returncode==0,result.stdout+result.stderr
@@ -42,7 +42,7 @@ def test_browser_narts_key_setup(website, monkeypatch, tmp_path):
     app.state.external.transport = transport
     env = os.environ.copy()
     env["NFC_TEST_URL"] = url
-    env["NODE_PATH"] = str(Path(".venv-api/browser-tests/node_modules").resolve())
+    env["NODE_PATH"] = str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve())
     result = subprocess.run(["node", "tests/browser_narts_setup.cjs"], env=env, capture_output=True,
                             text=True, encoding="utf-8", timeout=100)
     assert result.returncode == 0, result.stdout + result.stderr
@@ -60,7 +60,7 @@ def test_browser_table_v3_workflow(website, monkeypatch):
     monkeypatch.setattr(web_server,"build_dashboard",lambda *a,**kw:{"stats":{"member_count":8},"rankings":[],"recent_yakuman":[]})
     env=os.environ.copy()
     env["NFC_TEST_URL"]=url
-    env["NODE_PATH"]=str(Path(".venv-api/browser-tests/node_modules").resolve())
+    env["NODE_PATH"]=str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve())
     result=subprocess.run(["node","tests/browser_table_v3.cjs"],env=env,capture_output=True,text=True,encoding="utf-8",timeout=150)
     assert result.returncode==0,result.stdout+result.stderr
     print(result.stdout)
@@ -75,7 +75,7 @@ def test_browser_table_reservation_regressions(website, monkeypatch):
     monkeypatch.setattr(web_server,"build_dashboard",lambda *a,**kw:{"stats":{"member_count":8},"rankings":[],"recent_yakuman":[]})
     env=os.environ.copy()
     env["NFC_TEST_URL"]=url
-    env["NODE_PATH"]=str(Path(".venv-api/browser-tests/node_modules").resolve())
+    env["NODE_PATH"]=str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve())
     result=subprocess.run(["node","tests/browser_table_v4.cjs"],env=env,capture_output=True,text=True,encoding="utf-8",timeout=150)
     assert result.returncode==0,result.stdout+result.stderr
     print(result.stdout)

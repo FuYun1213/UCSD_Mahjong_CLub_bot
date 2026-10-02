@@ -31,7 +31,7 @@ def test_registration_guest_scoring_browser(website,tmp_path,monkeypatch):
     state=app.state.tournaments.create({"name":"Browser Test Cup","settings":RULES,"request_id":str(uuid4())},admin.id)
     table=app.state.tables.create({"number":30,"tournament_id":state["id"],"request_id":str(uuid4())},admin)
     token=app.state.tables.issue_token(table["id"],{"channel":"qr","purpose":"table_landing","request_id":str(uuid4())},admin)
-    env={**os.environ,"NFC_TEST_URL":url,"NODE_PATH":str(Path('.venv-api/browser-tests/node_modules').resolve()),
+    env={**os.environ,"NFC_TEST_URL":url,"NODE_PATH":str(Path(os.environ.get('NODE_PATH') or '.venv-api/browser-tests/node_modules').resolve()),
          "V10_SEED":json.dumps({"tid":state["id"],"guest_path":token["path"],"legacy_id":legacy["id"]})}
     result=subprocess.run(["node","tests/browser_registration_v10.cjs"],env=env,capture_output=True,text=True,encoding="utf-8",timeout=200)
     assert result.returncode==0,result.stdout+result.stderr

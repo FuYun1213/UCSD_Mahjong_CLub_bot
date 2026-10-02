@@ -35,9 +35,13 @@ class TournamentService:
 
     def list(self, include_deleted=False):
         with self.store.connect() as db:
-            return [{"id": r.id, "name": json.loads(r.state_json)["name"],
-                     "status": json.loads(r.state_json)["status"], "version": r.version}
-                    for r in db.scalars(select(Tournament).where(Tournament.deleted_at.is_(None)) if not include_deleted else select(Tournament))]
+            rows=[]
+            for row in db.scalars(select(Tournament).where(Tournament.deleted_at.is_(None)) if not include_deleted else select(Tournament)):
+                state=json.loads(row.state_json)
+                rows.append({"id":row.id,"name":state["name"],"status":state["status"],
+                    "version":row.version,"archived_at":state.get("archived_at"),
+                    "created_at":state.get("created_at","")})
+            return sorted(rows,key=lambda item:(item["created_at"],item["id"]),reverse=True)
 
     def get(self, tid, include_deleted=False):
         with self.store.connect() as db:
@@ -90,6 +94,7 @@ class TournamentService:
             if row.deleted_at:
                 return {"id": tid, "deleted_at": row.deleted_at}
             state = self._decode(row)
+            require(not state.get("archived_at"), "archived")
             require(data.get("confirm_name", "").strip() == state["name"], "delete_name_mismatch")
             reason = normalized_name(data.get("reason", ""))
             require(1 <= len(reason) <= 500, "reason_required")
@@ -131,7 +136,8 @@ class TournamentService:
                 require(type(data.get("version")) is int and data["version"] == row.version, "stale_version")
                 state = self._decode(row)
                 attach_penalties(db, state)
-                require(state["status"] != "locked" or action == "unlock", "locked")
+                require(state["status"] != "locked" or action in {"unlock", "archive"}, "locked")
+                require(not state.get("archived_at"), "archived")
                 from .guest_models import TournamentParticipant
                 guest_binding = db.get(TournamentParticipant, data.get("player_id")) if action == "bind_account" else None
                 if guest_binding is not None and guest_binding.tournament_id == tid and guest_binding.merged_into_user_id is None:

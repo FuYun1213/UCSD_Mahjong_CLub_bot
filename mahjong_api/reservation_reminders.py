@@ -76,13 +76,38 @@ def _table(service, db, table_id):
 
 def reservation_default(service, table_id, user):
     check(user is not None, "not_authenticated")
-    with service.store.connect() as db:
-        _table(service, db, table_id)
-    return get_next_whole_hour(service.clock(), service.timezone)
+    from .reservation_queue import batch_members, next_batch
+    from .reservation_sessions import lock_scope
+    from .table_membership import lock_table
+    current = _utc(service.clock())
+    with membership_lock, service.store.connect() as db:
+        table = _table(service, db, table_id)
+        lock_scope(db, table.scope); lock_table(db, table.id)
+        batch = next_batch(db, table.id, current)
+        count = len(batch_members(db, batch.id)) if batch else 0
+        suggestion = (_utc(batch.suggested_start_at) if batch and count < 4
+                      and batch.suggested_start_at else
+                      _utc(batch.estimated_start_at) if batch and batch.estimated_start_at
+                      else current + timedelta(hours=1) if count < 4 else None)
+        missing = max(0, 4-count)
+        source = batch.prediction_source if batch else "insufficient_players"
+    result = {"scheduled_at": _stamp(suggestion) if suggestion else None,
+              "start_at": _stamp(suggestion) if suggestion else None,
+              "end_at": _stamp(suggestion + timedelta(hours=1)) if suggestion else None,
+              "server_now": _stamp(current), "timezone": service.timezone,
+              "missing_players": missing,
+              "estimated": bool(batch and count == 4 and batch.estimated_start_at),
+              "suggestion": missing > 0,
+              "prediction_source": source}
+    if suggestion:
+        result.update(_local_fields(suggestion, _zone(service.timezone)))
+        result.update({"end_"+key:value for key,value in
+                       _local_fields(suggestion+timedelta(hours=1),_zone(service.timezone)).items()})
+    return result
 
 
 def reservation_reminders(service, table_id, user):
-    """One row per logical session, inclusive from earliest start -1h to max end."""
+    """Show active session participants beginning one hour before their start."""
     from .reservation_session_models import ReservationSession
     check(user is not None, "not_authenticated")
     current = _utc(service.clock())
@@ -92,9 +117,20 @@ def reservation_reminders(service, table_id, user):
         table = _table(service, db, table_id)
         check(not table.tournament_id, "fixed_tournament_seating")
         table_id, score_table_id, table_number = table.id, table.score_table_id, table.number
-        sessions = list(db.scalars(select(ReservationSession).where(
-            ReservationSession.table_id == table.id, ReservationSession.status == "active")
-            .order_by(ReservationSession.start_at, ReservationSession.id)))
+        sessions = list(db.scalars(select(ReservationSession).join(
+            TableReservation, TableReservation.session_id == ReservationSession.id).where(
+            ReservationSession.table_id == table.id,
+            ReservationSession.status == "active",
+            TableReservation.status == "active",
+            TableReservation.plan_kind.in_(["finite","any"]),
+            ReservationSession.start_at <= _stamp(current + window))
+            .distinct().order_by(ReservationSession.start_at, ReservationSession.id)))
+        next_start = db.scalar(select(ReservationSession.start_at).where(
+            ReservationSession.table_id == table.id, ReservationSession.status == "active",
+            ReservationSession.start_at > _stamp(current + window))
+            .order_by(ReservationSession.start_at).limit(1))
+        if next_start:
+            changes.append(_utc(next_start)-window)
         members = {member.user_id: member for member in db.scalars(select(ActiveTableMember).where(
             ActiveTableMember.table_id == table.id, ActiveTableMember.status == "active",
             ActiveTableMember.left_at.is_(None)))}
@@ -102,17 +138,16 @@ def reservation_reminders(service, table_id, user):
             start, end = _utc(session.start_at), _utc(session.end_at)
             if start-window > current:
                 changes.append(start-window)
-            if start-window <= current <= end:
+            if start-window <= current:
                 row = service._reservation_session(db, session)
                 # Persisted sessions may outlive cancelled individual records;
                 # no empty session is presented even during administrative repair.
                 if not row["participants"]:
                     continue
-                changes.append(end+timedelta(milliseconds=1))
                 for person in row["participants"]:
                     member = members.get(person["user_id"])
                     person.update(seated=member is not None, seat=member.seat if member else None)
-                row.update(expires_at=session.end_at,
+                row.update(expires_at=None,
                     all_seated=all(person["seated"] for person in row["participants"]))
                 reminders.append(row)
     # Current registration/avatar projection happens outside the score DB read

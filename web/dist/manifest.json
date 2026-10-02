@@ -1,0 +1,117 @@
+{
+  "assets": {
+    "common": "/dist/common.76dd58489d404f3f.js",
+    "admin": "/dist/admin.e1acf33b020e2632.js",
+    "ranking": "/dist/ranking.0ddbaf96cfaa4309.js",
+    "tables": "/dist/tables.76a6d23f6b37f47c.js",
+    "tournaments": "/dist/tournaments.5a52a9b5c30987ef.js",
+    "challenge": "/dist/challenge.a8c90257dbc511a4.js",
+    "registered-user-combobox": "/dist/registered-user-combobox.2465918d2a74887b.js",
+    "navigation": "/dist/navigation.371af5716ee409cd.js",
+    "registration-v10": "/dist/registration-v10.cc620771e32c6bf8.js",
+    "tournament-v2": "/dist/tournament-v2.0d064870cb828a55.js",
+    "tournament-v10": "/dist/tournament-v10.1c852b78bd589bac.js",
+    "manual-score": "/dist/manual-score.75163300f2c0d302.js",
+    "brand": "/dist/brand.79c429558b0bce16.js",
+    "i18n": "/dist/i18n.5858317a444ecb23.js",
+    "competition-i18n": "/dist/competition-i18n.42662ed53eef4c58.js",
+    "table-v5-i18n": "/dist/table-v5-i18n.1af915fdb33fa798.js",
+    "seat-card-i18n": "/dist/seat-card-i18n.5f880bce93dbc28f.js",
+    "seat-swap-i18n": "/dist/seat-swap-i18n.716c4141a9f7457c.js",
+    "reservation-time": "/dist/reservation-time.b8a8df1ee9d3589c.js",
+    "reservation-v9-i18n": "/dist/reservation-v9-i18n.adbf86cddce45b15.js",
+    "account-avatar": "/dist/account-avatar.071703ace8b8600a.js",
+    "registered-v6-i18n": "/dist/registered-v6-i18n.d7a1e0be3d74f97d.js",
+    "manual-v6-i18n": "/dist/manual-v6-i18n.f9992c022ef236b3.js",
+    "react": "/dist/react.d949f1c3687aedad.js",
+    "react-dom": "/dist/react-dom.35f4f974f4b2bcd4.js",
+    "loader": "/dist/loader.3e07bca754312f82.js",
+    "boot": "/dist/boot.24032cbcbd8a65a3.js",
+    "style": "/dist/style.a8993f2a1623262d.css",
+    "initial": "/dist/initial.034615c749be2e5f.js"
+  },
+  "sizes": {
+    "common": 102576,
+    "admin": 47457,
+    "ranking": 4393,
+    "tables": 63591,
+    "tournaments": 40162,
+    "challenge": 23483,
+    "registered-user-combobox": 14459,
+    "navigation": 10282,
+    "registration-v10": 11088,
+    "tournament-v2": 9884,
+    "tournament-v10": 24283,
+    "manual-score": 20807,
+    "brand": 729,
+    "i18n": 54675,
+    "competition-i18n": 7399,
+    "table-v5-i18n": 5687,
+    "seat-card-i18n": 3235,
+    "seat-swap-i18n": 2995,
+    "reservation-time": 3670,
+    "reservation-v9-i18n": 4280,
+    "account-avatar": 2911,
+    "registered-v6-i18n": 5913,
+    "manual-v6-i18n": 4507,
+    "react": 10751,
+    "react-dom": 131835,
+    "loader": 2376,
+    "boot": 91,
+    "style": 57971,
+    "initial": 368422
+  },
+  "initialBytes": 368371,
+  "routes": {
+    "dashboard": [
+      "tables",
+      "challenge"
+    ],
+    "challenge": [
+      "challenge"
+    ],
+    "ranking": [
+      "ranking"
+    ],
+    "record": [
+      "tables"
+    ],
+    "reservations": [
+      "tables"
+    ],
+    "join-table": [
+      "tables"
+    ],
+    "tournament": [
+      "tables",
+      "tournaments",
+      "tournament-v2",
+      "tournament-v10",
+      "challenge"
+    ],
+    "manual-score": [
+      "tables",
+      "tournaments",
+      "tournament-v2",
+      "tournament-v10",
+      "manual-score"
+    ],
+    "account": [
+      "registration-v10"
+    ],
+    "register": [
+      "registration-v10"
+    ],
+    "registration-complete": [
+      "registration-v10"
+    ],
+    "admin": [
+      "tables",
+      "tournaments",
+      "tournament-v2",
+      "tournament-v10",
+      "registration-v10",
+      "admin"
+    ]
+  }
+}

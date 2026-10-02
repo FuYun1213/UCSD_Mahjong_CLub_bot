@@ -1,11 +1,12 @@
 """SQLAlchemy persistence. Network I/O happens only after database commits."""
 import json
+import time
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
 
-from sqlalchemy import create_engine, delete, event, func, select, text, update
+from sqlalchemy import case, create_engine, delete, event, func, select, text, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.orm import sessionmaker
 
@@ -54,7 +55,15 @@ class Store:
 
     @contextmanager
     def connect(self):
-        with self.sessions() as db, db.begin():
+        import request_performance
+        with request_performance.measure("transactionMs"), self.sessions() as db, db.begin():
+            metrics=request_performance.current.get()
+            if metrics is not None:
+                started=time.perf_counter()
+                try:
+                    db.connection()
+                finally:
+                    metrics["databasePoolAcquireMs"]+=(time.perf_counter()-started)*1000
             yield db
 
     def close(self):
@@ -107,7 +116,7 @@ class Store:
             "sequence": row.sequence, "match_id": row.match_id, "table_id": row.table_id,
             "round_no": row.round_no, "scores": json.loads(row.scores_json),
             "result": json.loads(row.result_json), "history_synced": row.history_synced,
-            "clear_synced": row.clear_synced,
+            "clear_synced": row.clear_synced, "local_finalized": row.local_finalized,
         }
 
     def match(self, match_id):
@@ -125,6 +134,23 @@ class Store:
             if existing is None and expected_match_id:
                 existing = db.scalar(select(MatchHistory).where(MatchHistory.match_id == expected_match_id))
             table = self._table(db, table_id)
+            from .game_round_models import GameRound
+            game = db.get(GameRound, expected_match_id) if expected_match_id else None
+            if game is not None and existing is None:
+                if game.score_table_id != table_id or game.status == "void":
+                    raise Conflict("stale_match", "stale_match")
+                if table is None:
+                    raise Conflict("table_not_found", "table_not_found")
+                if table["current_match_id"] != game.game_id:
+                    if game.status != "awaiting_score":
+                        raise Conflict("stale_match", "stale_match")
+                    table = {**table, "current_match_id": game.game_id, "round_no": game.round_no,
+                             "started_at": game.started_at, "pending_match_id": None,
+                             "seats": json.loads(game.roster_json)}
+                else:
+                    # A started game's identities are the frozen wind snapshot.
+                    table = {**table, "seats": json.loads(game.roster_json),
+                             "started_at": game.started_at}
             if existing is None and table and table["pending_match_id"]:
                 existing = db.scalar(select(MatchHistory).where(MatchHistory.match_id == table["pending_match_id"]))
             if existing is not None:
@@ -139,6 +165,29 @@ class Store:
                 return match["match_id"], True
             if expected_match_id and (table is None or table["current_match_id"] != expected_match_id):
                 raise Conflict("stale_match", "对局编号已失效，请重新读取当前桌状态")
+            if (game is None and table is not None and table["started_at"]
+                    and not table["pending_match_id"]):
+                # An upgraded, already-playing table may reach scoring before
+                # anyone opens Game Record. Capture only its current live
+                # four-seat roster; never reconstruct an older game's seats.
+                from .table_models import ClubTable
+                from .table_membership import lock_table
+                from .game_flow import ensure_game_round
+                registry = db.scalar(select(ClubTable).where(
+                    ClubTable.score_table_id == str(table_id)))
+                if registry is not None and not registry.tournament_id:
+                    lock_table(db, registry.id)
+                    score_state = db.scalar(select(TableState).where(
+                        TableState.table_id == table_id))
+                    if (score_state is None or score_state.current_match_id != table["current_match_id"]
+                            or score_state.started_at is None or score_state.pending_match_id):
+                        raise Conflict("stale_match", "对局编号已失效，请重新读取当前桌状态")
+                    if db.get(MatchHistory, score_state.current_match_id) is not None:
+                        raise Conflict("stale_match", "对局编号已失效，请重新读取当前桌状态")
+                    game = ensure_game_round(db, registry, score_state)
+                    table = self._table(db, table_id)
+                    table = {**table, "seats": json.loads(game.roster_json),
+                             "started_at": game.started_at}
             if roster is not None:
                 if table is None or set(roster) != set(SEATS) or len({str(p["id"]) for p in roster.values()}) != 4:
                     raise Conflict("incomplete_table", "incomplete_table")
@@ -156,8 +205,9 @@ class Store:
             missing = [seat for seat in SEATS if table is None or table["seats"][seat] is None]
             if missing:
                 raise Conflict("incomplete_table", "座位未满，请等待四位玩家入座", missing_seats=missing)
-            end = ended_at or now()
-            duration = elapsed(table["started_at"], end)
+            end = (game.actual_ended_at if game and game.actual_ended_at else ended_at or now())
+            # Upload and confirmation timestamps do not establish when play ended.
+            duration = elapsed(table["started_at"], game.actual_ended_at) if game and game.actual_ended_at else None
             match_id = table["current_match_id"]
             from .tournament_rules import DEFAULT_NAMES
             labels = db.get(Metadata, "table_names_v1")
@@ -190,7 +240,27 @@ class Store:
             from .external_sync import queue_free_match
             queue_free_match(db, result)
             state = db.scalar(select(TableState).where(TableState.table_id == table_id))
-            state.pending_match_id = match_id
+            # A late score for an earlier game must never mark the new live
+            # game as pending settlement or block its eventual score.
+            if state.current_match_id == match_id:
+                state.pending_match_id = match_id
+            dispatcher = getattr(self, "history_dispatcher", None)
+            if dispatcher is not None:
+                dispatcher.enqueue_history(db, self._match(match), source_kind="nfc", source_id=match_id)
+            self._finalize_local(db, match)
+            if game is not None:
+                game.status, game.updated_at = "completed", now()
+                from .reservation_queue import on_game_confirmed
+                on_game_confirmed(db, game.game_id)
+                if game.successor_batch_id:
+                    from .reservation_queue_models import ReservationQueueBatch
+                    from .queue_notifications import enqueue_queue_notice
+                    from .table_models import ClubTable
+                    registered = db.get(ClubTable, game.table_id)
+                    successor = db.get(ReservationQueueBatch, game.successor_batch_id)
+                    if registered and successor and successor.status in {"provisional", "notified"}:
+                        enqueue_queue_notice(db, registered, game, successor,
+                                             "queue_ready", now())
             if request_key:
                 db.add(IdempotencyRecord(request_key=request_key, match_id=match_id))
             if draft_id:
@@ -201,21 +271,53 @@ class Store:
         with self.connect() as db:
             return [self._match(row) for row in db.scalars(select(MatchHistory).where(MatchHistory.history_synced == 0).order_by(MatchHistory.sequence))]
 
-    def finish_history(self, match_id):
-        with self.connect() as db:
-            state = db.scalar(select(TableState).where(TableState.pending_match_id == match_id))
-            if state:
+    @staticmethod
+    def _finalize_local(db, match):
+        """Complete only this match, in the score/outbox transaction, without I/O."""
+        import request_performance
+        with request_performance.measure("localFinalizeMs"):
+            if match.local_finalized:
+                return False
+            state = db.scalar(select(TableState).where(TableState.current_match_id == match.match_id))
+            if state is not None:
+                if state.pending_match_id not in (None, match.match_id):
+                    raise Conflict("stale_match", "A newer settlement is pending")
                 from .table_models import ClubTable
                 from .table_membership import release_table
                 registered = db.scalar(select(ClubTable).where(ClubTable.score_table_id == state.table_id))
                 if registered:
-                    release_table(db, registered.id, "settlement", "completed", match_id)
+                    release_table(db, registered.id, "settlement", "completed", match.match_id)
                 db.execute(delete(SeatRecord).where(SeatRecord.table_id == state.table_id))
                 state.pending_match_id = None
                 state.current_match_id = str(uuid4())
                 state.round_no += 1
                 state.started_at = None
-                state.dirty, state.updated_at = 1, now()
+                state.dirty, state.updated_at = 0, now()
+            match.local_finalized = 1
+            return state is not None
+
+    def recover_local_settlements(self):
+        """Idempotent local-only upgrade: old history callbacks cannot clear new seats."""
+        from .table_membership import membership_lock
+        with membership_lock, self.connect() as db:
+            for match in db.scalars(select(MatchHistory).where(MatchHistory.local_finalized == 0)
+                                   .order_by(MatchHistory.sequence)):
+                self._finalize_local(db, match)
+            # An old callback may have left only the pending pointer behind.
+            # Clear it only when its immutable score is locally complete; never
+            # alter the current match, round, or newly seated players.
+            db.flush()
+            finalized = select(MatchHistory.match_id).where(MatchHistory.local_finalized == 1)
+            db.execute(update(TableState).where(TableState.pending_match_id.in_(finalized),
+                TableState.current_match_id != TableState.pending_match_id).values(pending_match_id=None))
+            # Current-seat Sheets projection is retired, not falsely marked delivered.
+            db.execute(update(TableState).where(TableState.dirty != 0).values(dirty=0))
+            if db.get(Metadata, "seat_projection_retired_v1") is None:
+                db.add(Metadata(key="seat_projection_retired_v1", value=now()))
+
+    def finish_history(self, match_id):
+        """Compatibility acknowledgement only; never mutate current table membership."""
+        with self.connect() as db:
             db.execute(update(MatchHistory).where(MatchHistory.match_id == match_id).values(history_synced=1))
 
     def dirty_tables(self):
@@ -230,24 +332,28 @@ class Store:
     def pending_counts(self):
         with self.connect() as db:
             return {
-                "tables": db.scalar(select(func.count()).select_from(TableState).where(TableState.dirty == 1)),
-                "matches": db.scalar(select(func.count()).select_from(MatchHistory).where((MatchHistory.history_synced == 0) | (MatchHistory.clear_synced == 0))),
+                "tables": 0,
+                "matches": db.scalar(select(func.count()).select_from(MatchHistory)
+                                     .where(MatchHistory.history_synced == 0)),
             }
 
     def configure_sync_target(self, target):
+        """Legacy metadata compatibility; never reset or replay all historical scores."""
         with self.connect() as db:
             old = db.get(Metadata, "sync_target")
-            if old is not None and old.value != target:
-                db.execute(update(TableState).values(dirty=1))
-                db.execute(update(MatchHistory).values(history_synced=0, clear_synced=0))
             if old is None:
                 db.add(Metadata(key="sync_target", value=target))
-            else:
-                old.value = target
+            elif old.value != target:
+                raise Conflict("history_target_change_requires_review",
+                               "Historical delivery target changes need an explicit migration")
 
     def stats(self, table_id=None, user_id=None):
         with self.connect() as db:
-            query = select(func.count(MatchHistory.duration_seconds), func.avg(MatchHistory.duration_seconds)).where(MatchHistory.duration_seconds.is_not(None))
+            eligible_duration = case(
+                (MatchHistory.duration_seconds >= 10 * 60, MatchHistory.duration_seconds),
+                else_=None,
+            )
+            query = select(func.count(MatchHistory.duration_seconds), func.avg(eligible_duration)).where(MatchHistory.duration_seconds.is_not(None))
             if table_id:
                 query = query.where(MatchHistory.table_id == table_id)
             if user_id:
@@ -273,8 +379,9 @@ class Store:
         with self.connect() as db:
             if request_key:
                 row = db.scalar(select(ScoreDraft).where(ScoreDraft.request_key == request_key))
-                if row:
-                    return self._draft(row)
+                # A new key starts a new OCR task. Only the exact task may
+                # replay its result; falling back to the match hides retries.
+                return self._draft(row)
             if match_id:
                 row = db.scalar(select(ScoreDraft).where(ScoreDraft.table_id == table_id,
                     ScoreDraft.uploader_id == str(user_id), ScoreDraft.match_id == match_id).order_by(ScoreDraft.created_at.desc()))

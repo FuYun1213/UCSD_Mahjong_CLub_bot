@@ -1,6 +1,6 @@
 """Club-local event time, stored as UTC; never infer it from upload timestamps."""
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 
@@ -10,6 +10,15 @@ def site_timezone():
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def local_day_utc_bounds(day, zone=None):
+    """Return UTC ISO boundaries for one club-local calendar day."""
+    local_zone = ZoneInfo(zone or site_timezone())
+    start = datetime.strptime(str(day), "%Y-%m-%d").replace(tzinfo=local_zone)
+    end = start + timedelta(days=1)
+    return (start.astimezone(timezone.utc).isoformat(timespec="seconds"),
+            end.astimezone(timezone.utc).isoformat(timespec="seconds"))
 
 
 def event_time(value, zone=None):

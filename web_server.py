@@ -1,5 +1,8 @@
+import request_performance
+request_performance.install()
 from mahjong_api.http_security import trusted_proxy, request_scheme, same_origin
 import json
+import contextvars
 import logging
 import argparse
 import base64
@@ -16,7 +19,7 @@ import urllib.error
 import urllib.request
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlparse, urlencode, unquote
 from datetime import datetime
 
 from bot_action_log import get_action, get_recent_actions, mark_reverted, record_action
@@ -42,7 +45,7 @@ except ImportError:
     gspread = None
 
 
-WEB_DIR = ROOT / "web"
+WEB_DIR = Path(os.getenv("WEB_ASSET_DIR", str(ROOT / "web")))
 SHEET_ID = "1Ce5k2Blbf5MYXbM4rSTeWHOf2uTHPrvZX6vm6Cdyc5Q"
 GUILD_ID = "1278056421224747162"
 CREDENTIALS_FILE = ROOT / "credentials.json"
@@ -95,6 +98,7 @@ WRITE_RATE_LIMIT = 30
 WRITE_RATE_WINDOW_SECONDS = 60
 SHEET_CACHE_TTL_SECONDS = 120
 PLAYER_CACHE_TTL_SECONDS = 300
+SESSION_MAX_AGE_SECONDS = 180 * 24 * 60 * 60
 
 
 def read_json(path, fallback):
@@ -167,7 +171,8 @@ def public_response_body(body, status=200):
             else:
                 result[key] = sanitize(item)
         return result
-    result = sanitize(body)
+    from account_images import public_avatars
+    result = public_avatars(sanitize(body))
     if status >= 500 and isinstance(result, dict):
         _logger.error("Website request failed: %s", body.get("message", "server error"), exc_info=True)
         result["message"] = PUBLIC_REQUEST_ERROR
@@ -213,6 +218,10 @@ def same_origin_allowed(handler):
 def secure_cookie_suffix(handler):
     secure = "; Secure" if request_scheme(handler) == "https" or os.getenv("PUBLIC_SITE_URL", "").startswith("https://") else ""
     return f"; HttpOnly; SameSite=Lax{secure}; Path=/"
+
+
+def persistent_session_cookie_suffix(handler):
+    return f"; Max-Age={SESSION_MAX_AGE_SECONDS}" + secure_cookie_suffix(handler)
 
 
 def is_blocked_static_path(path):
@@ -419,6 +428,10 @@ def sorted_player_names(names):
 
 
 RANKING_TYPES = {
+    "quarter_games": {"label": "Quarter Games", "worksheet": "Ranking Quarter",
+        "fallback_name_index": 6, "fallback_value_index": 7, "value_headers": ["games played", "games"]},
+    "total_games": {"label": "Total Games", "worksheet": "Ranking",
+        "fallback_name_index": 6, "fallback_value_index": 7, "value_headers": ["total games", "games"]},
     "quarter_pt": {
         "label": "Quarter PT",
         "worksheet": "Ranking Quarter",
@@ -475,7 +488,7 @@ def sheet_rankings(kind="quarter_pt", limit=25):
     config = RANKING_TYPES.get(kind, RANKING_TYPES["quarter_pt"])
     rows = sheet.worksheet(config["worksheet"]).get_all_values()
     headers = rows[0] if rows else []
-    name_index = find_header_index(headers, ["name", "player"])
+    name_index = config["fallback_name_index"] if kind in {"quarter_games", "total_games"} else find_header_index(headers, ["name", "player"])
     value_index = find_header_index(headers, config["value_headers"])
     if name_index is None:
         name_index = config["fallback_name_index"]
@@ -781,18 +794,28 @@ def resolve_logged_row(worksheet, row_number, expected, sheet_name):
     raise ValueError(f"{sheet_name} row no longer matches the logged action.")
 
 
+class NFCScoreRevertBlocked(ValueError):
+    code = "nfc_score_revert_blocked"
+
+
 def revert_web_record(data, username):
     game_id = safe_int(data.get("game_id")) if data.get("game_id") not in (None, "") else 0
     if game_id:
         if not is_admin(username):
             raise PermissionError("Only admins can revert game rows.")
         with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
+            # An NFC-linked game also lives in the score ledger, reservation
+            # accounting, and external history. This legacy SQL-only revert
+            # cannot reverse those projections together.
+            connection.execute("BEGIN IMMEDIATE")
             game = connection.execute(
-                "SELECT id, sheet_row, played_at FROM games WHERE id = ?",
+                "SELECT id, sheet_row, played_at, nfc_match_id FROM games WHERE id = ?",
                 (game_id,),
             ).fetchone()
             if not game:
                 raise ValueError("Could not find that SQL game record.")
+            if game["nfc_match_id"]:
+                raise NFCScoreRevertBlocked("NFC scores cannot be reverted here. Contact an administrator for coordinated score correction.")
             player_rows = connection.execute(
                 """
                 SELECT p.name, gp.final_score
@@ -872,6 +895,11 @@ def revert_web_record(data, username):
     sql_game_id = payload.get("sql_game_id")
     if sql_game_id:
         with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            linked = connection.execute("SELECT nfc_match_id FROM games WHERE id=?",
+                                        (int(sql_game_id),)).fetchone()
+            if linked and linked["nfc_match_id"]:
+                raise NFCScoreRevertBlocked("NFC scores cannot be reverted here. Contact an administrator for coordinated score correction.")
             mahjong_store.revert_game(connection, int(sql_game_id))
 
     sheet_error = ""
@@ -946,6 +974,24 @@ def update_user_role(data, username):
     return {"ok": True, "message": f"{canonical_name} is now {role}.", "target": canonical_name, "role": role}
 
 
+def discord_score_state(username):
+    if not is_admin(username):
+        raise PermissionError("Only administrators can manage Discord scoring.")
+    with closing(mahjong_store.connect(MAHJONG_DB_FILE)) as connection:
+        return {"ok": True, "paused": mahjong_store.discord_score_paused(connection)}
+
+
+def update_discord_score_state(data, username):
+    if not is_admin(username):
+        raise PermissionError("Only administrators can manage Discord scoring.")
+    paused = data.get("paused")
+    if type(paused) is not bool:
+        raise ValueError("paused must be a boolean")
+    with closing(mahjong_store.connect(MAHJONG_DB_FILE)) as connection:
+        mahjong_store.set_discord_score_paused(connection, paused)
+    return {"ok": True, "paused": paused}
+
+
 def resolve_registered_account(data_file, target_name):
     target_key = normalize_name(target_name)
     if not target_key:
@@ -969,7 +1015,10 @@ class PasswordResetError(ValueError):
 
 
 def recovery_account_enabled(account):
-    return not (account.get("disabled") or account.get("is_active") is False
+    # History sync creates placeholder accounts without ownership proof. Only
+    # an approved existing-ID claim clears this marker; a reset code must not.
+    return not (account.get("auto_registered") is True or account.get("disabled")
+                or account.get("is_active") is False
                 or account.get("status") in {"disabled", "banned", "deleted", "pending_claim"})
 
 
@@ -980,6 +1029,8 @@ def revoke_account_sessions(account, display_name):
                 or normalize_name(session_name) == normalize_name(display_name)):
             _sessions.pop(token, None)
             _session_account_ids.pop(token, None)
+    if account_id:
+        registered_names.revoke_sessions(USERS_FILE, account_id)
 
 
 @account_mutation
@@ -1016,6 +1067,83 @@ def reset_user_password(data, username):
     return {"ok": True, "message": "Reset code generated. The user must choose their own new password.",
             "target": display_name, "reset_code": "-".join(raw[i:i+4] for i in range(0, 12, 4)),
             "expires_at": issued_at + 30 * 60, "expires_in": 1800, "reset_url": "/login#reset-password"}
+
+
+def _admin_account(account):
+    role = account.get("role") or default_role_for_name(account.get("name", ""))
+    return ROLE_ORDER.get(role, 0) >= ROLE_ORDER["admin"]
+
+
+def prepare_admin_password_setup():
+    """Remove legacy admin passwords once a bound self-service route is available."""
+    changed = 0
+    with registered_names.account_lock(USERS_FILE):
+        directory = users_data()
+        for account in directory.get("users", {}).values():
+            display_name = str(account.get("name", ""))
+            if (not _admin_account(account) or normalize_name(display_name) == "fuyun"
+                    or account.get("admin_password_setup_required_v1")):
+                continue
+            discord_id = str(account.get("discord_id") or "")
+            if not re.fullmatch(r"\d{15,22}", discord_id):
+                continue
+            account.pop("password_hash", None)
+            account.pop("salt", None)
+            account.pop("password_reset", None)
+            account["admin_password_setup_required_v1"] = True
+            changed += 1
+        if changed:
+            write_json(USERS_FILE, directory)
+    return changed
+
+
+def start_admin_password_setup(data):
+    username = data.get("username")
+    if not isinstance(username, str) or not username.strip() or len(username) > 128:
+        raise ValueError("Enter your administrator username first.")
+    directory = users_data()
+    try:
+        key, _ = resolve_registered_account(directory, username)
+    except ValueError:
+        raise ValueError("This administrator account cannot start password setup. Check the name or use password recovery.") from None
+    account = directory["users"][key]
+    if (not _admin_account(account) or account.get("password_hash")
+            or account.get("disabled") or account.get("is_active") is False
+            or account.get("status") in {"pending_claim", "disabled", "deleted", "banned"}):
+        raise ValueError("This administrator account cannot start password setup. Check the name or use password recovery.")
+    return {"ok": True, "url": account_discord.start_admin_password_setup(
+        account.get("account_id"), account.get("discord_id"))}
+
+
+def set_admin_password_from_verified_setup(data, grant_token):
+    new_password = data.get("new_password")
+    if not isinstance(new_password, str) or not 6 <= len(new_password) <= 1024:
+        raise PasswordResetError("Password must contain 6–1024 characters.", "invalid_reset_password")
+    if new_password != data.get("confirm_password"):
+        raise PasswordResetError("Please enter the new password twice.", "reset_password_mismatch")
+    grant = account_discord.take_admin_password_setup_grant(grant_token)
+    if not grant:
+        raise PermissionError("Administrator verification expired. Start password setup again.")
+    with registered_names.account_lock(USERS_FILE):
+        directory = users_data()
+        account = next((item for item in directory["users"].values()
+                        if str(item.get("account_id")) == grant["account_id"]), None)
+        if (not account or not _admin_account(account) or account.get("password_hash")
+                or str(account.get("discord_id") or "") != grant["discord_id"]
+                or account.get("disabled") or account.get("is_active") is False
+                or account.get("status") in {"pending_claim", "disabled", "deleted", "banned"}):
+            raise PermissionError("This administrator account changed. Start password setup again.")
+        salt, hashed = password_hash(new_password)
+        account.update(salt=salt, password_hash=hashed, password_changed_at=int(time.time()))
+        account.pop("password_reset", None)
+        write_json(USERS_FILE, directory)
+        revoke_account_sessions(account, account["name"])
+        token, display_name = create_account_session(account)
+    record_action(user_id=grant["account_id"], user_name=display_name,
+                  action_type="admin_password_setup",
+                  summary=f"Administrator set a password after Discord verification: {display_name}",
+                  payload={"target": display_name})
+    return token, display_name
 
 
 @account_mutation
@@ -1071,11 +1199,10 @@ def delete_user_account(data, username):
     if normalize_name(display_name) == normalize_name(username):
         raise ValueError("You cannot delete your own account from here.")
 
+    deleted_account = dict(data_file["users"][target_key])
+    revoke_account_sessions(deleted_account, display_name)
     data_file["users"].pop(target_key, None)
     write_json(USERS_FILE, data_file)
-    for token, session_name in list(_sessions.items()):
-        if normalize_name(session_name) == normalize_name(display_name):
-            _sessions.pop(token, None)
     record_action(
         user_id=0,
         user_name=username,
@@ -1168,46 +1295,730 @@ def admin_rename_player(data, username):
     return {"ok": True, "message": f"Renamed {result['old_name']} to {result['new_name']}.", **result}
 
 
+def active_merge_references(account_id):
+    """Find mutable scoring state that would be orphaned by deleting an account."""
+    account_id = str(account_id or "")
+    if not account_id:
+        return []
+    found = []
+    live_path = Path(LIVE_DB_FILE)
+    if live_path.exists():
+        try:
+            with closing(sqlite3.connect(live_path)) as db:
+                tables = {row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                if "live_games" in tables:
+                    columns = {row[1] for row in db.execute("PRAGMA table_info(live_games)")}
+                    player_columns = [f"player{i}_user_id" for i in range(1, 5)
+                                      if f"player{i}_user_id" in columns]
+                    if player_columns and db.execute(
+                        "SELECT 1 FROM live_games WHERE status='active' AND ("
+                        + " OR ".join(column + "=?" for column in player_columns)
+                        + ") LIMIT 1", (account_id,) * len(player_columns)
+                    ).fetchone():
+                        found.append("an active live game")
+        except sqlite3.Error:
+            _logger.exception("Could not verify live-game references before player merge")
+            found.append("unverified live-game data")
+
+    score_path = Path(os.getenv("NFC_DATABASE_PATH", "data/nfc_matches.sqlite3"))
+    if score_path.exists():
+        try:
+            with closing(sqlite3.connect(score_path)) as db:
+                tables = {row[0] for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                checks = []
+                if "active_table_members" in tables:
+                    checks.append(("an active table seat",
+                                   "SELECT 1 FROM active_table_members WHERE user_id=? LIMIT 1"))
+                if "table_reservations" in tables:
+                    checks.append(("an active table reservation",
+                                   "SELECT 1 FROM table_reservations WHERE status='active' AND user_id=? LIMIT 1"))
+                if {"table_reservations", "table_reservation_participants"} <= tables:
+                    checks.append(("an active reservation roster",
+                                   """SELECT 1 FROM table_reservation_participants p
+                                      JOIN table_reservations r ON r.id=p.reservation_id
+                                      WHERE r.status='active' AND p.user_id=? LIMIT 1"""))
+                if "seat_swap_claims" in tables:
+                    checks.append(("a pending seat swap",
+                                   "SELECT 1 FROM seat_swap_claims WHERE user_id=? LIMIT 1"))
+                if {"manual_score_players", "manual_score_drafts"} <= tables:
+                    checks.append(("a score awaiting confirmation",
+                                   """SELECT 1 FROM manual_score_players p
+                                      JOIN manual_score_drafts d ON d.id=p.draft_id
+                                      WHERE d.status='review' AND p.user_id=? LIMIT 1"""))
+                if {"tournament_check_ins", "tournament_table_sessions"} <= tables:
+                    checks.append(("an active tournament check-in",
+                                   """SELECT 1 FROM tournament_check_ins c
+                                      JOIN tournament_table_sessions s ON s.id=c.match_id
+                                      WHERE s.status NOT IN ('COMPLETED','LOCKED')
+                                        AND c.account_id=? LIMIT 1"""))
+                for label, query in checks:
+                    if db.execute(query, (account_id,)).fetchone():
+                        found.append(label)
+        except sqlite3.Error:
+            _logger.exception("Could not verify score-service references before player merge")
+            found.append("unverified active score data")
+    return list(dict.fromkeys(found))
+
+
 @account_mutation
 def admin_merge_players(data, username):
     if not is_admin(username):
         raise PermissionError("Only admins can merge players.")
-    source_name = (data.get("source_name") or "").strip()
-    target_name = (data.get("target_name") or "").strip()
-    registered_names.ensure_directory(USERS_FILE)
-    if any(normalize_name(account.get("name", key)) == normalize_name(source_name)
-           for key, account in users_data()["users"].items()):
-        raise ValueError("Registered accounts must keep their stable identity. Change the registered name instead.")
+    actor_id = stable_account_id(username)
+    source_value = data.get("source_player_id")
+    target_value = data.get("target_player_id")
     with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
-        result = mahjong_store.merge_players(connection, source_name, target_name)
-    data_file = users_data()
-    source_key = normalize_name(result["source"])
-    target_key = normalize_name(result["target"])
-    users = data_file.get("users", {})
-    if source_key in users:
-        if target_key not in users:
-            moved = users.pop(source_key)
-            moved["name"] = result["target"]
-            users[target_key] = moved
+        if source_value is None or target_value is None:
+            # Compatibility for older administrative clients. Resolve names
+            # once, then run the same stable-ID path.
+            source_name = (data.get("source_name") or "").strip()
+            target_name = (data.get("target_name") or "").strip()
+            source_row = connection.execute("SELECT * FROM players WHERE name_key=?", (mahjong_store.normalize_name(source_name),)).fetchone()
+            target_row = connection.execute("SELECT * FROM players WHERE name_key=?", (mahjong_store.normalize_name(target_name),)).fetchone()
+            if not source_row or not target_row:
+                raise ValueError("Select both players by ID.")
         else:
-            users.pop(source_key, None)
-    icons = data_file.get("player_icons", {})
-    if source_key in icons and target_key not in icons:
-        icons[target_key] = icons.pop(source_key)
-    else:
-        icons.pop(source_key, None)
-    write_json(USERS_FILE, data_file)
+            source_id = account_registration.player_id(source_value)
+            target_id = account_registration.player_id(target_value)
+            source_row = connection.execute("SELECT * FROM players WHERE id=?", (source_id,)).fetchone()
+            target_row = connection.execute("SELECT * FROM players WHERE id=?", (target_id,)).fetchone()
+            if not source_row or not target_row:
+                raise ValueError("One of the selected player IDs no longer exists. Search again.")
+        source, target = dict(source_row), dict(target_row)
+    account_plan = account_registration.inspect_player_account_merge(
+        sys.modules[__name__], source, target)
+    source_account = account_plan.get("source_account")
+    target_account = account_plan.get("target_account")
+    sensitive_accounts = [account for account in (source_account, target_account) if account]
+    if any(ROLE_ORDER.get(account.get("role") or default_role_for_name(account.get("name", "")), 0)
+           >= ROLE_ORDER["admin"] for account in sensitive_accounts) and not is_super_admin(username):
+        raise PermissionError("Only super admins can merge a player linked to an administrator account.")
+    if account_plan.get("deletes_source") and source_account:
+        source_account_id = str(source_account.get("account_id") or "")
+        if source_account_id and source_account_id == actor_id:
+            raise ValueError("You cannot remove your own login account through a player merge.")
+        source_role = source_account.get("role") or default_role_for_name(source_account.get("name", ""))
+        if source_role == "super_admin":
+            directory = users_data()
+            remaining = [account for account in directory.get("users", {}).values()
+                         if str(account.get("account_id") or "") != source_account_id
+                         and recovery_account_enabled(account)
+                         and (account.get("role") or default_role_for_name(account.get("name", ""))) == "super_admin"]
+            if not remaining:
+                raise ValueError("The last super admin account cannot be removed through a player merge.")
+        active_references = active_merge_references(source_account_id)
+        if active_references:
+            raise ValueError(
+                "Finish or leave this player's active scoring activity before merging: "
+                + ", ".join(active_references) + ".")
+    operation_id = registered_names.stage_player_merge(
+        USERS_FILE, source, target,
+        source_account_id=(source_account or {}).get("account_id"),
+        target_account_id=(target_account or {}).get("account_id"),
+        delete_source_account=account_plan.get("deletes_source", False))
+    try:
+        with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
+            result = mahjong_store.merge_player_ids(connection, source["id"], target["id"])
+    except Exception as error:
+        registered_names.update_player_merge(USERS_FILE, operation_id, "failed", error)
+        raise
+    try:
+        registered_names.update_player_merge(USERS_FILE, operation_id, "club_merged")
+        account_result = account_registration.merge_player_accounts(sys.modules[__name__], source, target)
+    except Exception as error:
+        registered_names.update_player_merge(USERS_FILE, operation_id, "account_error", error)
+        raise
+    registered_names.update_player_merge(USERS_FILE, operation_id, "completed")
+    result.update(account_result)
+    result["operation_id"] = operation_id
     for token, session_name in list(_sessions.items()):
-        if normalize_name(session_name) == source_key:
+        session_id = _session_account_ids.get(token)
+        if (account_result.get("source_sessions_revoked")
+                and (session_id == account_result.get("source_account_id")
+                     or (not session_id and normalize_name(session_name) == normalize_name(result["source"])))):
+            _sessions.pop(token, None)
+            _session_account_ids.pop(token, None)
+        elif session_id == account_result.get("target_account_id") or normalize_name(session_name) == normalize_name(result["source"]):
             _sessions[token] = result["target"]
     record_action(
-        user_id=0,
+        user_id=actor_id,
         user_name=username,
         action_type="merge_players",
-        summary=f"Merged {result['source']} into {result['target']} and recomputed all SQL games",
+        summary=f"Merged player ID {result['source_player_id']} ({result['source']}) into ID {result['target_player_id']} ({result['target']})",
         payload=result,
     )
-    return {"ok": True, "message": f"Merged {result['source']} into {result['target']} and recomputed all games.", **result}
+    clear_sheet_cache()
+    if result.get("source_sessions_revoked"):
+        account_message = "the old player and login were removed"
+    elif result.get("source_account_id"):
+        account_message = "the old player was removed and its login was moved to the target ID"
+    else:
+        account_message = "the old player was removed"
+    return {"ok": True, "message": f"Merged ID {result['source_player_id']} ({result['source']}) into ID {result['target_player_id']} ({result['target']}); {account_message}.", **result}
+
+
+@account_mutation
+def recover_confirmed_player_merge_accounts():
+    """Finish confirmed legacy player merges and their account publication.
+
+    Old action/static evidence may describe a merge whose source player is still
+    physically present. Revalidate destructive preconditions, persist a journal,
+    then reuse the normal club/account merge operations. Pending journals remain
+    the stronger evidence and make every post-stage crash replayable.
+    """
+    def positive_id(value):
+        try:
+            result = int(value)
+            return result if result > 0 else None
+        except (TypeError, ValueError):
+            return None
+
+    def receipt_key(origin, *, action_id="", source_id=None, target_id=None,
+                    source="", target=""):
+        # The durable key deliberately contains no player names or action data.
+        # An action UUID is its strongest stable identity; older name-only
+        # actions and static confirmations use a canonical, hashed payload.
+        if origin == "action" and action_id:
+            identity = {"action_id": str(action_id)}
+        else:
+            identity = {
+                "source_player_id": positive_id(source_id) or "",
+                "target_player_id": positive_id(target_id) or "",
+                "source_name": normalize_name(source),
+                "target_name": normalize_name(target),
+            }
+        canonical = json.dumps(
+            {"version": 1, "origin": origin, "identity": identity},
+            ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        return "player-merge-evidence-v1:" + hashlib.sha256(canonical).hexdigest()
+
+    pending_intents = registered_names.pending_player_merges(USERS_FILE)
+    receipts = registered_names.player_merge_evidence_receipts(USERS_FILE)
+    active_receipt_keys = {
+        str(intent.get("evidence_key") or "") for intent in pending_intents
+        if intent.get("evidence_key")
+    }
+
+    evidence = [
+        {
+            "source_id": intent["source_player_id"],
+            "target_id": intent["target_player_id"],
+            "source": intent["source_name"],
+            "target": intent["target_name"],
+            "operation_id": intent["operation_id"],
+            "source_account_id": intent.get("source_account_id", ""),
+            "target_account_id": intent.get("target_account_id", ""),
+            "delete_source_account": bool(intent.get("delete_source_account")),
+            "evidence_key": intent.get("evidence_key", ""),
+            "evidence_origin": intent.get("evidence_origin", ""),
+            "operation_kind": intent.get("operation_kind", "merge"),
+            "origin": "journal",
+        }
+        for intent in pending_intents
+    ]
+
+    def legacy_evidence_available(key):
+        receipt = receipts.get(key) or {}
+        if receipt.get("status") in {"completed", "blocked"}:
+            return False
+        # A linked pending intent is already first in the evidence list. A
+        # receipt without an operation belongs to interrupted account-only
+        # cleanup and must be replayed from its legacy source.
+        return not (receipt.get("status") == "pending" and key in active_receipt_keys)
+
+    for action in get_recent_actions(100000):
+        if action.get("action_type") != "merge_players" or action.get("reverted_at"):
+            continue
+        payload = action.get("payload") if isinstance(action.get("payload"), dict) else {}
+        key = receipt_key(
+            "action", action_id=action.get("id"),
+            source_id=payload.get("source_player_id"),
+            target_id=payload.get("target_player_id"),
+            source=payload.get("source"), target=payload.get("target"),
+        )
+        evidence.append({
+            "source_id": payload.get("source_player_id"), "target_id": payload.get("target_player_id"),
+            "source": payload.get("source"), "target": payload.get("target"),
+            "origin": "action", "evidence_origin": "action", "evidence_key": key,
+            "suppressed": not legacy_evidence_available(key),
+        })
+    try:
+        from apply_confirmed_name_merges import MERGES
+        for source, target in MERGES:
+            key = receipt_key("static", source=source, target=target)
+            evidence.append({
+                "source": source, "target": target, "origin": "static",
+                "evidence_origin": "static", "evidence_key": key,
+                "suppressed": not legacy_evidence_available(key),
+            })
+    except (ImportError, OSError):
+        pass
+
+    # Conflicting historical evidence must never be resolved by list order.
+    id_choices = {}
+    name_choices = {}
+    for item in evidence:
+        source_id = positive_id(item.get("source_id"))
+        target_id = positive_id(item.get("target_id"))
+        if source_id and target_id and source_id != target_id:
+            id_choices.setdefault(source_id, set()).add(target_id)
+        source_name = normalize_name(item.get("source"))
+        target_name = normalize_name(item.get("target"))
+        if source_name and target_name and source_name != target_name:
+            name_choices.setdefault(source_name, set()).add(target_name)
+    id_redirects = {source: next(iter(targets)) for source, targets in id_choices.items()
+                    if len(targets) == 1}
+    name_redirects = {source: next(iter(targets)) for source, targets in name_choices.items()
+                      if len(targets) == 1}
+    ambiguous_ids = {source for source, targets in id_choices.items() if len(targets) != 1}
+    ambiguous_names = {source for source, targets in name_choices.items() if len(targets) != 1}
+
+    def terminal(value, redirects):
+        visited = set()
+        while value in redirects:
+            if value in visited:
+                return None
+            visited.add(value)
+            value = redirects[value]
+        return value
+
+    def current_players():
+        with closing(mahjong_store.connect(MAHJONG_DB_FILE)) as db:
+            return [dict(row) for row in db.execute("SELECT id,name FROM players")]
+
+    def unique_name_player(players, value):
+        key = normalize_name(value)
+        matches = [player for player in players if normalize_name(player["name"]) == key]
+        return matches[0] if key and len(matches) == 1 else None
+
+    def resolve_target(item, players):
+        direct_id = positive_id(item.get("target_id"))
+        direct_name = normalize_name(item.get("target"))
+        # A journal's exact target wins while it exists. Legacy evidence follows
+        # every confirmed redirect to its surviving chain endpoint.
+        if item.get("operation_id"):
+            if direct_id:
+                exact = next((p for p in players if int(p["id"]) == direct_id), None)
+                if exact:
+                    return exact
+            if direct_name:
+                exact = unique_name_player(players, direct_name)
+                if exact:
+                    return exact
+        if direct_id:
+            resolved_id = terminal(direct_id, id_redirects)
+            if resolved_id:
+                match = next((p for p in players if int(p["id"]) == resolved_id), None)
+                if match:
+                    return match
+        if direct_name:
+            resolved_name = terminal(direct_name, name_redirects)
+            if resolved_name:
+                return unique_name_player(players, resolved_name)
+        return None
+
+    def same_game_conflicts(source_id, target_id):
+        with closing(mahjong_store.connect(MAHJONG_DB_FILE)) as db:
+            return [int(row["game_id"]) for row in db.execute(
+                """SELECT game_id FROM game_players
+                   WHERE player_id IN (?,?) GROUP BY game_id
+                   HAVING COUNT(DISTINCT player_id)>1 ORDER BY game_id LIMIT 10""",
+                (source_id, target_id))]
+
+    def account_preflight(item, source, target):
+        plan = account_registration.inspect_player_account_merge(
+            sys.modules[__name__], source, target)
+        source_account = plan.get("source_account") or {}
+        if not item.get("operation_id") and plan.get("deletes_source"):
+            source_role = source_account.get("role") or default_role_for_name(
+                source_account.get("name", source["name"]))
+            if ROLE_ORDER.get(source_role, 0) >= ROLE_ORDER["admin"]:
+                _logger.warning("Skipping automatic legacy merge for privileged source account %s",
+                                source_account.get("account_id"))
+                return None
+        if plan.get("deletes_source") and source_account.get("account_id"):
+            references = active_merge_references(source_account["account_id"])
+            if references:
+                if item.get("operation_id"):
+                    registered_names.update_player_merge(
+                        USERS_FILE, item["operation_id"], "account_error",
+                        "Active scoring activity still references the source account.")
+                _logger.warning("Skipping confirmed merge while active scoring references %s: %s",
+                                source_account.get("account_id"), ", ".join(references))
+                return None
+        return plan
+
+    def finish_sessions(item, source, target, account_result):
+        captured_source_id = str(item.get("source_account_id") or "")
+        source_account_id = str(account_result.get("source_account_id") or captured_source_id)
+        target_account_id = str(account_result.get("target_account_id")
+                                or item.get("target_account_id") or "")
+        revoke_source = bool(account_result.get("source_sessions_revoked")
+                             or (item.get("delete_source_account") and captured_source_id))
+        if revoke_source and source_account_id:
+            registered_names.revoke_sessions(USERS_FILE, source_account_id)
+        for token, session_name in list(_sessions.items()):
+            session_id = str(_session_account_ids.get(token) or "")
+            if revoke_source and (session_id == source_account_id
+                                  or (not session_id and normalize_name(session_name)
+                                      == normalize_name(source["name"]))):
+                _sessions.pop(token, None)
+                _session_account_ids.pop(token, None)
+            elif (target_account_id and session_id == target_account_id) or (
+                    not session_id and normalize_name(session_name) == normalize_name(source["name"])):
+                _sessions[token] = target["name"]
+
+    def settle_legacy_evidence(item, status, operation_id=""):
+        key = str(item.get("evidence_key") or "")
+        if key and not item.get("operation_id"):
+            registered_names.update_player_merge_evidence_receipt(
+                USERS_FILE, key, item.get("evidence_origin") or item.get("origin") or "legacy",
+                status, operation_id=operation_id)
+
+    def recover_static_rename(item, player, players):
+        """Replay the original static rename-as-target rule by stable player ID."""
+        operation_id = item.get("operation_id")
+        try:
+            if player is None:
+                raise ValueError("The rename source no longer exists.")
+            target_name = registered_names.display_name(item.get("target"))
+            legacy_source = {
+                "id": int(player["id"]),
+                "name": item.get("source") or player["name"],
+            }
+            renamed_target = {"id": int(player["id"]), "name": target_name}
+            allowed_player_names = {
+                normalize_name(legacy_source["name"]), normalize_name(target_name)
+            }
+            if normalize_name(player["name"]) not in allowed_player_names:
+                raise ValueError("The rename source ID now belongs to another player name.")
+            if any(int(other["id"]) != int(player["id"])
+                   and normalize_name(other["name"]) == normalize_name(target_name)
+                   for other in players):
+                raise ValueError("The rename target is already used by another player.")
+
+            plan = account_registration.inspect_player_account_merge(
+                sys.modules[__name__], legacy_source, renamed_target)
+            if plan.get("deletes_source"):
+                raise ValueError("The source and target names belong to different website accounts.")
+            allowed_accounts = {
+                str(account.get("account_id") or "")
+                for account in (plan.get("source_account"), plan.get("target_account"))
+                if account
+            }
+            directory = users_data()
+            if any(normalize_name(account.get("name", key)) == normalize_name(target_name)
+                   and str(account.get("account_id") or "") not in allowed_accounts
+                   for key, account in directory.get("users", {}).items()):
+                raise ValueError("The rename target is already used by another website account.")
+        except ValueError as error:
+            if operation_id:
+                registered_names.update_player_merge(
+                    USERS_FILE, operation_id, "account_error", error)
+            else:
+                settle_legacy_evidence(item, "blocked")
+            _logger.warning("Skipping unsafe confirmed rename-as-target: %s", error)
+            return 0
+        except Exception as error:
+            if operation_id:
+                registered_names.update_player_merge(
+                    USERS_FILE, operation_id, "account_error", error)
+            else:
+                settle_legacy_evidence(item, "failed")
+            _logger.exception("Could not validate confirmed rename-as-target")
+            return 0
+
+        if not operation_id:
+            try:
+                operation_id = registered_names.stage_player_rename(
+                    USERS_FILE, legacy_source, target_name,
+                    source_account_id=(plan.get("source_account") or {}).get("account_id"),
+                    target_account_id=(plan.get("target_account") or {}).get("account_id"),
+                    evidence_key=item.get("evidence_key", ""),
+                    evidence_origin=item.get("evidence_origin", "static"))
+            except Exception:
+                _logger.exception("Could not journal confirmed rename-as-target")
+                return 0
+            item = {
+                **item, "operation_id": operation_id, "operation_kind": "rename",
+                "source_id": int(player["id"]), "target_id": int(player["id"]),
+                "source_account_id": (plan.get("source_account") or {}).get("account_id", ""),
+                "target_account_id": (plan.get("target_account") or {}).get("account_id", ""),
+            }
+
+        try:
+            with closing(mahjong_store.connect(MAHJONG_DB_FILE)) as db:
+                current = db.execute(
+                    "SELECT id,name FROM players WHERE id=?", (int(player["id"]),)
+                ).fetchone()
+                if not current:
+                    raise ValueError("The rename source no longer exists.")
+                if normalize_name(current["name"]) not in allowed_player_names:
+                    raise ValueError("The rename source ID changed unexpectedly.")
+                if current["name"] != target_name:
+                    mahjong_store.rename_player(db, current["name"], target_name)
+        except Exception as error:
+            try:
+                registered_names.update_player_merge(USERS_FILE, operation_id, "failed", error)
+            except Exception:
+                _logger.exception("Could not mark failed rename-as-target")
+            _logger.exception("Could not finish confirmed rename-as-target in the club database")
+            return 0
+
+        # The club rename commits inside rename_player. If only the cross-store
+        # marker write fails, leave the intent pending rather than marking the
+        # already-committed rename failed; the stable ID makes replay idempotent.
+        try:
+            registered_names.update_player_merge(USERS_FILE, operation_id, "club_merged")
+        except Exception:
+            _logger.exception("Could not mark committed rename-as-target for account recovery")
+            return 0
+
+        try:
+            account_result = account_registration.merge_player_accounts(
+                sys.modules[__name__], legacy_source, renamed_target)
+            finish_sessions(item, legacy_source, renamed_target, account_result)
+            registered_names.update_player_merge(USERS_FILE, operation_id, "completed")
+            clear_sheet_cache()
+            return 1
+        except Exception as error:
+            try:
+                registered_names.update_player_merge(
+                    USERS_FILE, operation_id, "account_error", error)
+            except Exception:
+                _logger.exception("Could not mark rename-as-target account recovery error")
+            _logger.exception("Could not publish confirmed rename-as-target account name")
+            return 0
+
+    completed = 0
+    for item in evidence:
+        if item.get("suppressed"):
+            continue
+        players = current_players()
+        source_id = positive_id(item.get("source_id"))
+        source_name = normalize_name(item.get("source"))
+        if (not item.get("operation_id")
+                and ((source_id and source_id in ambiguous_ids)
+                     or (source_name and source_name in ambiguous_names))):
+            _logger.warning("Skipping ambiguous legacy player-merge evidence for %s",
+                            item.get("source") or source_id)
+            settle_legacy_evidence(item, "blocked")
+            continue
+        source = None
+        if source_id:
+            source = next((p for p in players if int(p["id"]) == source_id), None)
+        elif item.get("source"):
+            source_candidates = [
+                player for player in players
+                if normalize_name(player["name"]) == normalize_name(item["source"])
+            ]
+            if len(source_candidates) > 1:
+                settle_legacy_evidence(item, "blocked")
+                continue
+            source = source_candidates[0] if source_candidates else None
+        target = resolve_target(item, players)
+        direct_target_name = normalize_name(item.get("target"))
+        terminal_static_target_missing = (
+            direct_target_name
+            and direct_target_name not in name_redirects
+            and direct_target_name not in ambiguous_names
+        )
+        if item.get("operation_kind") == "rename" or (
+                not item.get("operation_id") and item.get("origin") == "static"
+                and source is not None and target is None
+                and terminal_static_target_missing):
+            completed += recover_static_rename(item, source, players)
+            continue
+        if target is None:
+            if item.get("operation_id"):
+                registered_names.update_player_merge(
+                    USERS_FILE, item["operation_id"], "failed",
+                    "The merge target no longer exists.")
+            else:
+                settle_legacy_evidence(item, "blocked")
+            continue
+        if source is not None:
+            if int(source["id"]) == int(target["id"]):
+                if item.get("operation_id"):
+                    registered_names.update_player_merge(
+                        USERS_FILE, item["operation_id"], "failed",
+                        "Source and target resolve to the same player.")
+                else:
+                    settle_legacy_evidence(item, "completed")
+                continue
+            try:
+                plan = account_preflight(item, source, target)
+            except ValueError as error:
+                if item.get("operation_id"):
+                    registered_names.update_player_merge(
+                        USERS_FILE, item["operation_id"], "failed", error)
+                else:
+                    settle_legacy_evidence(item, "blocked")
+                _logger.exception("Could not safely validate confirmed player merge")
+                continue
+            except Exception as error:
+                if item.get("operation_id"):
+                    registered_names.update_player_merge(
+                        USERS_FILE, item["operation_id"], "failed", error)
+                else:
+                    settle_legacy_evidence(item, "failed")
+                _logger.exception("Could not validate confirmed player merge")
+                continue
+            if plan is None:
+                settle_legacy_evidence(item, "blocked")
+                continue
+            conflicts = same_game_conflicts(source["id"], target["id"])
+            if conflicts:
+                if item.get("operation_id"):
+                    registered_names.update_player_merge(
+                        USERS_FILE, item["operation_id"], "failed",
+                        "Both players occur in the same game(s): "
+                        + ", ".join(str(game_id) for game_id in conflicts))
+                _logger.warning("Skipping confirmed player merge %s -> %s; shared games %s",
+                                source["id"], target["id"], conflicts)
+                settle_legacy_evidence(item, "blocked")
+                continue
+            operation_id = item.get("operation_id")
+            if not operation_id:
+                try:
+                    operation_id = registered_names.stage_player_merge(
+                        USERS_FILE, source, target,
+                        source_account_id=(plan.get("source_account") or {}).get("account_id"),
+                        target_account_id=(plan.get("target_account") or {}).get("account_id"),
+                        delete_source_account=plan.get("deletes_source", False),
+                        evidence_key=item.get("evidence_key", ""),
+                        evidence_origin=item.get("evidence_origin", ""))
+                except Exception:
+                    _logger.exception("Could not journal confirmed legacy player merge")
+                    continue
+                item = {
+                    **item,
+                    "operation_id": operation_id,
+                    "source_id": int(source["id"]),
+                    "target_id": int(target["id"]),
+                    "source": source["name"],
+                    "target": target["name"],
+                    "source_account_id": (plan.get("source_account") or {}).get("account_id", ""),
+                    "target_account_id": (plan.get("target_account") or {}).get("account_id", ""),
+                    "delete_source_account": bool(plan.get("deletes_source")),
+                }
+            try:
+                with closing(mahjong_store.connect(MAHJONG_DB_FILE)) as db:
+                    mahjong_store.merge_player_ids(db, source["id"], target["id"])
+            except Exception as error:
+                try:
+                    registered_names.update_player_merge(
+                        USERS_FILE, operation_id, "failed", error)
+                except Exception:
+                    _logger.exception("Could not mark failed confirmed player merge")
+                _logger.exception("Could not physically finish confirmed player merge")
+                continue
+            try:
+                registered_names.update_player_merge(USERS_FILE, operation_id, "club_merged")
+                account_result = account_registration.merge_player_accounts(
+                    sys.modules[__name__], source, target)
+                finish_sessions(item, source, target, account_result)
+                registered_names.update_player_merge(USERS_FILE, operation_id, "completed")
+                clear_sheet_cache()
+                completed += 1
+            except Exception as error:
+                try:
+                    registered_names.update_player_merge(
+                        USERS_FILE, operation_id, "account_error", error)
+                except Exception:
+                    _logger.exception("Could not mark account recovery error")
+                _logger.exception("Could not publish confirmed player-merge account cleanup")
+            continue
+
+        directory = users_data()
+        accounts = list(directory.get("users", {}).items())
+        exact_source_matches = [
+            (key, account) for key, account in accounts
+            if source_id is not None and str(account.get("club_player_id")) == str(source_id)
+        ]
+        name_source_matches = [
+            (key, account) for key, account in accounts
+            if item.get("source")
+            and normalize_name(account.get("name", key)) == normalize_name(item["source"])
+        ]
+        source_matches = exact_source_matches or name_source_matches
+        # A staged merge is sufficient recovery evidence even when no source
+        # login ever existed or account publication already completed. The
+        # directory merge is idempotent and also finishes pending-claim cleanup.
+        if not item.get("operation_id"):
+            if not source_matches:
+                # Confirming the old source is already absent consumes this
+                # name-only evidence, so a future player may safely reuse it.
+                settle_legacy_evidence(item, "completed")
+                continue
+            if len(source_matches) != 1:
+                settle_legacy_evidence(item, "blocked")
+                continue
+
+        recovery_source_id = source_id
+        if not recovery_source_id and source_matches:
+            linked_id = positive_id(source_matches[0][1].get("club_player_id"))
+            if linked_id:
+                if any(int(player["id"]) == linked_id for player in players):
+                    # This same-name account belongs to a current, different
+                    # identity and is never legacy cleanup evidence.
+                    settle_legacy_evidence(item, "blocked")
+                    continue
+                recovery_source_id = linked_id
+        source = {"id": recovery_source_id or -1,
+                  "name": item.get("source") or (source_matches[0][1].get("name", source_matches[0][0])
+                                                    if source_matches else "club-" + str(source_id or "unknown"))}
+        try:
+            recovery_plan = account_preflight(item, source, target)
+            if recovery_plan is None:
+                settle_legacy_evidence(item, "blocked")
+                continue
+            if not item.get("operation_id") and not recovery_plan.get("source_account"):
+                # A same-name account linked to another identity must not be
+                # rewritten merely because an old player row is gone.
+                settle_legacy_evidence(item, "blocked")
+                continue
+            if not item.get("operation_id"):
+                settle_legacy_evidence(item, "pending")
+            source_account = recovery_plan.get("source_account") or {}
+            if recovery_plan.get("deletes_source") and source_account.get("account_id"):
+                # Revoke before the directory write. If publication then fails,
+                # the intact source account can be retried without leaving a
+                # durable cookie for an account that no longer exists.
+                registered_names.revoke_sessions(USERS_FILE, source_account["account_id"])
+            account_result = account_registration.merge_player_accounts(
+                sys.modules[__name__], source, target)
+            finish_sessions(item, source, target, account_result)
+            if item.get("operation_id"):
+                registered_names.update_player_merge(
+                    USERS_FILE, item["operation_id"], "completed")
+            else:
+                settle_legacy_evidence(item, "completed")
+            completed += 1
+        except ValueError as error:
+            if item.get("operation_id"):
+                try:
+                    registered_names.update_player_merge(
+                        USERS_FILE, item["operation_id"], "account_error", error)
+                except Exception:
+                    _logger.exception("Could not mark account recovery error")
+            else:
+                settle_legacy_evidence(item, "blocked")
+            _logger.exception("Could not safely recover confirmed player-merge account cleanup")
+        except Exception as error:
+            if item.get("operation_id"):
+                try:
+                    registered_names.update_player_merge(
+                        USERS_FILE, item["operation_id"], "account_error", error)
+                except Exception:
+                    _logger.exception("Could not mark account recovery error")
+            else:
+                settle_legacy_evidence(item, "failed")
+            _logger.exception("Could not recover confirmed player-merge account cleanup")
+    return completed
 
 
 @account_mutation
@@ -2147,8 +2958,18 @@ def normalize_name(value):
     return registered_names.normalize_name(value)
 
 
+_request_accounts = contextvars.ContextVar("request_accounts", default=None)
+
+
 def users_data():
+    cache = _request_accounts.get()
+    version = (str(USERS_FILE), registered_names._file_version(USERS_FILE),
+               registered_names._file_version(registered_names.database_path(USERS_FILE)))
+    if cache is not None and cache.get("version") == version and not Path(str(USERS_FILE)+".pending").exists():
+        return cache["data"]
     data = registered_names.read_accounts(USERS_FILE)
+    if cache is not None:
+        cache.update(version=version, data=data)
     if not isinstance(data, dict):
         data = {}
     users = data.get("users")
@@ -2239,18 +3060,23 @@ def current_user_profile(handler):
     username = current_user(handler)
     if not username:
         return None
-    return current_user_profile_from_name(username)
+    profile = current_user_profile_from_name(username)
+    profile["session_mode"] = "member" if session_cookie(handler).startswith("member.") else "verified"
+    return profile
 
 
 def stable_account_id(username):
     """Keep existing opaque IDs while adding the unique registered-name directory."""
     with registered_names.account_lock(USERS_FILE):
-        registered_names.ensure_directory(USERS_FILE)
         data = users_data()
         try:
             key, _ = resolve_registered_account(data, username)
         except ValueError:
             raise PermissionError("Account no longer exists.") from None
+        if not data["users"][key].get("account_id") or not registered_names.database_path(USERS_FILE).exists():
+            registered_names.ensure_directory(USERS_FILE)
+            data = users_data()
+            key, _ = resolve_registered_account(data, username)
         return data["users"][key]["account_id"]
 
 
@@ -2267,6 +3093,7 @@ def current_user_profile_from_name(username):
         "icon": icon_for_name(current_name),
         "discord_id": account.get("discord_id", ""),
         "discord_name": account.get("discord_name", ""),
+        "has_password": bool(account.get("password_hash")),
         "role": role,
         "is_admin": ROLE_ORDER.get(role, 0) >= ROLE_ORDER["admin"],
         "is_super_admin": ROLE_ORDER.get(role, 0) >= ROLE_ORDER["super_admin"],
@@ -2317,6 +3144,27 @@ def session_cookie(handler):
     return cookie["mahjong_session"].value if "mahjong_session" in cookie else ""
 
 
+def unverified_historical_account(account):
+    return (account.get("auto_registered") is True
+            and not account.get("password_hash") and not account.get("discord_id"))
+
+
+def create_account_session(account, *, member_only=False):
+    account_id = str(account.get("account_id") or "")
+    if not account_id:
+        raise ValueError("Account identity is unavailable.")
+    token = ("member." if member_only else "") + secrets.token_urlsafe(32)
+    _sessions[token], _session_account_ids[token] = account["name"], account_id
+    try:
+        registered_names.remember_session(
+            USERS_FILE, token, account_id, int(time.time()) + SESSION_MAX_AGE_SECONDS)
+    except Exception:
+        _sessions.pop(token, None)
+        _session_account_ids.pop(token, None)
+        raise
+    return token, account["name"]
+
+
 def issue_session(handler, account_id):
     directory = users_data()
     account = next((a for a in directory["users"].values() if a.get("account_id") == account_id), None)
@@ -2324,44 +3172,73 @@ def issue_session(handler, account_id):
         raise PermissionError("This account is unavailable.")
     old = session_cookie(handler)
     _sessions.pop(old, None); _session_account_ids.pop(old, None)
-    token = secrets.token_urlsafe(32)
-    _sessions[token], _session_account_ids[token] = account["name"], account_id
-    return token, account["name"]
+    registered_names.forget_session(USERS_FILE, old)
+    return create_account_session(account)
 
 
 def authenticated_response(handler, token, body):
-    payload = json.dumps(body, ensure_ascii=False).encode()
+    from account_images import public_avatars
+    payload = json.dumps(public_avatars(body), ensure_ascii=False).encode()
     handler.send_response(200)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Set-Cookie", f"mahjong_session={token}{secure_cookie_suffix(handler)}")
+    handler.send_header("Set-Cookie", f"mahjong_session={token}{persistent_session_cookie_suffix(handler)}")
     handler.send_header("Content-Length", str(len(payload)))
     handler.end_headers(); handler.wfile.write(payload)
 
 
 def current_user(handler):
-    cookie = handler.headers.get("Cookie", "")
-    for part in cookie.split(";"):
-        key, _, value = part.strip().partition("=")
-        if key == "mahjong_session" and value in _sessions:
-            username = _sessions[value]
-            directory = users_data()
-            try:
-                session_id = _session_account_ids.get(value)
-                if session_id:
-                    matches = [(account_key, account) for account_key, account in directory["users"].items()
-                               if str(account.get("account_id")) == session_id]
-                    if len(matches) != 1:
-                        return None
-                    account_key, account = matches[0]
-                    name = account.get("name", account_key)
-                else:
-                    account_key, name = resolve_registered_account(directory, username)
-                    account = directory["users"][account_key]
-                if account.get("disabled") or account.get("is_active") is False or account.get("status") in {"disabled", "banned", "deleted", "pending_claim"}:
+    token = session_cookie(handler)
+    if not token:
+        return None
+    cached_id = _session_account_ids.get(token)
+    durable_id = registered_names.session_account_id(USERS_FILE, token)
+    if cached_id:
+        # The durable row is authoritative for expiry and cross-worker
+        # revocation; an in-process cache must never resurrect it.
+        if durable_id != cached_id:
+            _sessions.pop(token, None)
+            _session_account_ids.pop(token, None)
+            return None
+    elif durable_id:
+        directory = users_data()
+        matches = [(account_key, account) for account_key, account in directory["users"].items()
+                   if str(account.get("account_id")) == durable_id]
+        if len(matches) == 1:
+            account_key, account = matches[0]
+            _sessions[token] = account.get("name", account_key)
+            _session_account_ids[token] = durable_id
+    if token in _sessions:
+        username = _sessions[token]
+        directory = users_data()
+        try:
+            session_id = _session_account_ids.get(token)
+            if session_id:
+                matches = [(account_key, account) for account_key, account in directory["users"].items()
+                           if str(account.get("account_id")) == session_id]
+                if len(matches) != 1:
+                    registered_names.forget_session(USERS_FILE, token)
+                    _sessions.pop(token, None)
+                    _session_account_ids.pop(token, None)
                     return None
-                return name
-            except ValueError:
+                account_key, account = matches[0]
+                name = account.get("name", account_key)
+            else:
+                account_key, name = resolve_registered_account(directory, username)
+                account = directory["users"][account_key]
+            if (account.get("disabled") or account.get("is_active") is False
+                    or account.get("status") in {"disabled", "banned", "deleted", "pending_claim"}
+                    or (token.startswith("member.") and is_admin(name))):
+                registered_names.forget_session(USERS_FILE, token)
+                _sessions.pop(token, None)
+                _session_account_ids.pop(token, None)
                 return None
+            _sessions[token] = name
+            return name
+        except ValueError:
+            registered_names.forget_session(USERS_FILE, token)
+            _sessions.pop(token, None)
+            _session_account_ids.pop(token, None)
+            return None
     return None
 
 
@@ -2370,6 +3247,13 @@ def require_user(handler):
     if not user:
         raise PermissionError("Please log in before recording games.")
     return user
+
+
+def require_verified_user(handler):
+    username = require_user(handler)
+    if session_cookie(handler).startswith("member."):
+        raise PermissionError("Sign in with your account password to change account settings.")
+    return username
 
 
 @account_mutation
@@ -2382,10 +3266,34 @@ class WebsiteRegistrationRequired(ValueError):
     code = "website_registration_required"
 
 
+class PasswordRequired(ValueError):
+    code = "password_required"
+
+
+class AdminPasswordSetupRequired(ValueError):
+    code = "admin_password_setup_required"
+
+
+def login_player(data):
+    player = account_registration.legacy_player(sys.modules[__name__], data.get("player_id"))
+    account = account_registration.ensure_player_account(sys.modules[__name__], player)
+    if account.get("disabled") or account.get("is_active") is False or account.get("status") in {"disabled", "banned", "deleted", "pending_claim"}:
+        raise PermissionError("This account is unavailable.")
+    if is_admin(account.get("name", player["name"])):
+        if not account.get("password_hash"):
+            raise AdminPasswordSetupRequired("You are an administrator. Please register a password.")
+        raise PermissionError("Administrators must use the separate administrator sign-in.")
+    return create_account_session(account, member_only=True)
+
+
 @account_mutation
 def login_user(data):
-    if not isinstance(data, dict) or not isinstance(data.get("username"), str) or not isinstance(data.get("password"), str):
-        raise ValueError("Please enter your username and password.")
+    if isinstance(data, dict) and "player_id" in data:
+        return login_player(data)
+    if not isinstance(data, dict) or not isinstance(data.get("username"), str):
+        raise ValueError("Please enter your username.")
+    if data.get("password") is not None and not isinstance(data.get("password"), str):
+        raise ValueError("Invalid password.")
     account_registration.recover_creations(sys.modules[__name__])
     raw_username = data.get("username") or ""
     username = normalize_name(raw_username)
@@ -2404,49 +3312,48 @@ def login_user(data):
             known_player = False
         if known_player:
             raise WebsiteRegistrationRequired(
-                "This player has no website account. Use Claim Existing ID on the registration page "
-                "for administrator approval. Your existing records will be kept.")
+                "This player has no website account. Select the player's name to continue; existing results stay linked.")
         raise ValueError("Incorrect username or password.")
     if user.get("disabled") or user.get("is_active") is False or user.get("status") in {"disabled", "banned", "deleted", "pending_claim"}:
         raise PermissionError("This account is unavailable.")
+    if is_admin(user.get("name", raw_username)) and not user.get("password_hash"):
+        raise AdminPasswordSetupRequired("You are an administrator. Please register a password.")
+    if not password:
+        raise PasswordRequired("Select your player name to sign in, or enter your password.")
     if not verify_password(password, user):
         raise ValueError("Incorrect username or password.")
-    token = secrets.token_urlsafe(32)
-    _sessions[token] = user["name"]
-    # Names remain the login credential; session identity stays stable across
-    # administrator renames, including a login racing with a rename publication.
-    if user.get("account_id"):
-        _session_account_ids[token] = str(user["account_id"])
-    return token, user["name"]
+    return create_account_session(user)
 
 
 @account_mutation
 def change_password(username, data):
-    old_password = data.get("old_password") or ""
-    new_password = data.get("new_password") or ""
-    confirm_password = data.get("confirm_password") or ""
-    if len(new_password) < 6:
-        raise ValueError("New password must be at least 6 characters.")
-    if new_password != confirm_password:
+    if not isinstance(data, dict):
+        raise ValueError("Invalid password form.")
+    old_password = data.get("old_password")
+    new_password = data.get("new_password")
+    if new_password != data.get("confirm_password"):
         raise ValueError("Please enter the new password twice.")
+    salt, new_hash = password_hash(new_password)
 
     data_file = users_data()
     user_key, _ = resolve_registered_account(data_file, username)
     user = data_file.get("users", {}).get(user_key)
     if not user:
         raise ValueError("User account not found.")
-    if not verify_password(old_password, user):
+    if unverified_historical_account(user):
+        raise PermissionError("Complete a verified account claim before setting a password.")
+    if user.get("password_hash") and not verify_password(old_password, user):
         raise ValueError("Current password is incorrect.")
-    salt, new_hash = password_hash(new_password)
     user["salt"] = salt
     user["password_hash"] = new_hash
+    user["password_changed_at"] = int(time.time())
     user.pop("password_reset", None)
     write_json(USERS_FILE, data_file)
     return True
 
 
 def request_password_reset(data):
-    """Notify only the recovery channel; reserve a cooldown before network I/O."""
+    """Notify the established Discord recovery channel; admins deliver codes privately."""
     username = data.get("username")
     if not isinstance(username, str) or not username.strip() or len(username) > 128:
         raise PasswordResetError("Please enter your player name.", "reset_name_required")
@@ -2469,12 +3376,12 @@ def request_password_reset(data):
         account["password_reset_request"] = {"request_id": marker, "requested_at": time.time()}
         write_json(USERS_FILE, directory)
     from urllib.parse import urlencode
-    origin = os.getenv("PUBLIC_SITE_URL", "https://ucsdmj.org").rstrip("/") or "https://ucsdmj.org"
+    origin = os.getenv("PUBLIC_SITE_URL", "https://doramj.org").rstrip("/") or "https://doramj.org"
     link = origin + "/?" + urlencode({"page": "admin", "recovery_user": account_id}) + "#account-recovery"
-    # Never reuse the score channel, include a password/code, or mention everyone.
+    # Keep the established channel notice code-free; the user sets their own password.
     payload = {"content": "Password reset request / 密码重置申请", "allowed_mentions": {"parse": []},
                "embeds": [{"title": "Generate reset code / 生成重置码", "url": link,
-                           "description": "核实玩家身份后，打开链接生成一次性重置码并交给本人。玩家自行设置新密码。",
+                           "description": "核实玩家身份后，打开链接生成一次性重置码并私下交给本人。玩家自行设置新密码。",
                            "fields": [{"name": "Player / 玩家", "value": display_name[:128]}]}]}
     try:
         discord_request("POST", "/channels/1488771447915544586/messages", payload)
@@ -2558,29 +3465,14 @@ def append_game_record(data):
 
     try:
         sheet = get_sheet()
-        ws_pt = sheet.worksheet("Games/pt")
-        pt_row = len(ws_pt.get_all_values()) + 1
-        ws_pt.append_row(pt_values)
-
-        ws_riichi = sheet.worksheet("Games Riichi")
-        riichi_row = len(ws_riichi.get_all_values()) + 1
-        ws_riichi.append_row(riichi_values)
-        if sql_game_id and riichi_row:
-            with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
-                connection.execute("UPDATE games SET sheet_row = ?, sync_status = ? WHERE id = ?", (riichi_row, "synced", sql_game_id))
-                connection.commit()
-
-        if len(mmr_deltas) == 4 and len(mmr_afters) == 4:
-            ws_riichi.update(
-                values=[[*mmr_deltas, *mmr_afters, "✅ Calculated", current_quarter]],
-                range_name=f"I{riichi_row}:R{riichi_row}",
-            )
-
-        if yakuman_winner or yakuman_deal_in or yakuman_text:
-            ws_riichi.update(
-                values=[[yakuman_winner, yakuman_deal_in, yakuman_text]],
-                range_name=f"S{riichi_row}:U{riichi_row}",
-            )
+        from legacy_sheet_sync import append_game
+        riichi_row = append_game(sheet, final_time, players, scores, mmr_deltas,
+            mmr_afters, current_quarter, yakuman_winner, yakuman_deal_in, yakuman_text, record_id=sql_game_id)
+        pt_row = riichi_row
+        with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
+            connection.execute("UPDATE games SET sheet_row=?, sync_status='synced' WHERE id=?",
+                               (riichi_row, sql_game_id))
+            connection.commit()
     except Exception as error:
         sheet_error = str(error)
         print(f"Web dashboard: Google Sheet game write failed: {sheet_error}")
@@ -2628,6 +3520,7 @@ def append_game_record(data):
             "yakuman_names": yakuman_names,
             "mmr_deltas": mmr_deltas,
             "pre_status": pre_status,
+            "post_status": post_status,
             "recorder": recorder,
         }
     )
@@ -2656,85 +3549,18 @@ def append_game_record(data):
 
 
 def build_discord_game_embed(context, mmr_deltas, post_status):
-    players = context["players"]
-    scores = context["scores"]
-    pre_status = context["pre_status"]
-    fields = []
-
-    if context["yakuman_text"]:
-        yakuman_line = f"Winner: `{context['yakuman_winner']}`"
-        if context["yakuman_deal_in"]:
-            yakuman_line += f"\nDeal-in: `{context['yakuman_deal_in']}`"
-        yakuman_line += f"\nYakuman: `{context['yakuman_text']}`"
-        fields.append({"name": "Yakuman", "value": yakuman_line, "inline": False})
-
-    rank_labels = ["\U0001f436 1st", "\U0001f948 2nd", "\U0001f949 3rd", "\U0001faa6 4th"]
-    for index, name in enumerate(players):
-        pre = pre_status.get(name, {})
-        post = post_status.get(name, {})
-
-        post_mmr = safe_float(post.get("mmr", 0)) or 0
-        pre_mmr = safe_float(pre.get("mmr", 0)) or 0
-        mmr_diff = post_mmr - pre_mmr
-        if index < len(mmr_deltas):
-            sheet_delta = safe_float(mmr_deltas[index])
-            if sheet_delta is not None:
-                mmr_diff = sheet_delta
-        mmr_sign = "+" if mmr_diff >= 0 else ""
-        mmr_str = f"{post_mmr:.1f} ({mmr_sign}{mmr_diff:.1f})"
-
-        pre_mmr_rank = safe_int(pre.get("mmr_rank", 999))
-        post_mmr_rank = safe_int(post.get("mmr_rank", 999))
-        mmr_rank_diff = pre_mmr_rank - post_mmr_rank
-        if mmr_rank_diff > 0:
-            mmr_rank_icon = f"📈 +{mmr_rank_diff}"
-        elif mmr_rank_diff < 0:
-            mmr_rank_icon = f"📉 {mmr_rank_diff}"
-        else:
-            mmr_rank_icon = "➖"
-        mmr_rank = post_mmr_rank if post_mmr_rank != 999 else "??"
-
-        post_pt = safe_float(post.get("pt", 0)) or 0
-        pre_pt = safe_float(pre.get("pt", 0)) or 0
-        pt_diff = post_pt - pre_pt
-        pt_sign = "+" if pt_diff >= 0 else ""
-        pt_str = f"{post_pt:.1f} ({pt_sign}{pt_diff:.1f})"
-
-        pre_pt_rank = safe_int(pre.get("pt_rank", 999))
-        post_pt_rank = safe_int(post.get("pt_rank", 999))
-        pt_rank_diff = pre_pt_rank - post_pt_rank
-        if pt_rank_diff > 0:
-            pt_rank_icon = f"📈 +{pt_rank_diff}"
-        elif pt_rank_diff < 0:
-            pt_rank_icon = f"📉 {pt_rank_diff}"
-        else:
-            pt_rank_icon = "➖"
-        pt_rank = post_pt_rank if post_pt_rank != 999 else "??"
-
-        fields.append(
-            {
-                "name": f"{rank_labels[index]} {name} ({scores[index]})",
-                "value": (
-                    f"**MMR**: `{mmr_str}` | Rank #{mmr_rank} ({mmr_rank_icon})\n"
-                    f"**PT**: `{pt_str}` | Rank #{pt_rank} ({pt_rank_icon})"
-                ),
-                "inline": False,
-            }
-        )
-
-    return {
-        "title": "✅ 结算完成 (Game Summary)",
-        "description": f"**Time Recorded:** {context['final_time']}\n**Recorded by:** {context['recorder']} (web)",
-        "color": 65280,
-        "fields": fields,
-    }
+    from game_summary import build_game_summary
+    return build_game_summary(context["players"], context["scores"], context["final_time"],
+        context["pre_status"], post_status, context.get("yakuman_winner", ""),
+        context.get("yakuman_deal_in", ""), context.get("yakuman_text", ""))
 
 
 def send_discord_game_summary(context):
+    if os.getenv("DISCORD_SCORE_NOTIFICATIONS_ENABLED", "true").strip().lower() in {"0", "false", "no", "off"}:
+        return
     try:
-        time.sleep(60)
         mmr_deltas = context.get("mmr_deltas") or []
-        post_status = get_players_status(context["players"])
+        post_status = context["post_status"]
         channel_id = find_game_record_channel_id()
         discord_request(
             "POST",
@@ -2818,7 +3644,8 @@ def build_dashboard(ranking_type="quarter_pt", user=None, match_player="", view_
     actions = read_json(ROOT / "bot_action_log.json", [])
     subscriptions = read_json(ROOT / "replay_subscriptions.json", {})
     requested_match_player = (match_player or "").strip()
-    resolved_match_player = requested_match_player or (user or "")
+    # The match-history page defaults to the full recent list when no player is selected.
+    resolved_match_player = requested_match_player
     players = sql_player_names()
     try:
         quarter_context = sql_quarter_context()
@@ -2833,7 +3660,7 @@ def build_dashboard(ranking_type="quarter_pt", user=None, match_player="", view_
         if table_players:
             record_games = sql_recent_games_for_players(table_players, 500, quarter=selected_quarter)
             resolved_match_player = " / ".join(table_players)
-        elif requested_match_player or user:
+        elif requested_match_player:
             record_games, resolved_match_player = sql_recent_games_for_player(resolved_match_player, 500, quarter=selected_quarter)
         else:
             with mahjong_store.connect(MAHJONG_DB_FILE) as connection:
@@ -2935,6 +3762,44 @@ def safe_sql_player_stats():
         return []
 
 
+def public_player_history(raw_player_id):
+    """Public historical results for one canonical club ID, with no account data."""
+    player = account_registration.legacy_player(sys.modules[__name__], raw_player_id)
+    with closing(mahjong_store.connect(MAHJONG_DB_FILE)) as db:
+        row = db.execute(
+            "SELECT id, name, current_mmr, total_pt, games_played, wins FROM players WHERE id = ?",
+            (player["id"],),
+        ).fetchone()
+        if row is None:
+            raise ValueError("Player ID not found.")
+        games, _ = mahjong_store.recent_games(db, limit=30, player_name=row["name"])
+    return {
+        "ok": True,
+        "player": {"id": f"club-{row['id']}", "name": row["name"]},
+        "summary": {
+            "games_played": row["games_played"],
+            "wins": row["wins"],
+            "current_mmr": round(float(row["current_mmr"]), 2),
+            "total_pt": round(float(row["total_pt"]), 2),
+        },
+        "recent_games": [
+            {
+                "date": game["date"],
+                "players": [
+                    {
+                        "name": seat["name"],
+                        "score": seat["score"],
+                        "mmr_delta": seat["delta"],
+                        "pt_delta": seat["pt_delta"],
+                    }
+                    for seat in game["players"]
+                ],
+            }
+            for game in games
+        ],
+    }
+
+
 class WebHTTPServer(ThreadingHTTPServer):
     # Python 3.14 defaults to five queued sockets. Concurrent browser assets
     # overflow that queue on Windows before handler threads can accept them.
@@ -2942,23 +3807,108 @@ class WebHTTPServer(ThreadingHTTPServer):
 
 
 class Handler(SimpleHTTPRequestHandler):
+    def handle_one_request(self):
+        token = _request_accounts.set({})
+        self._perf = None
+        try:
+            return super().handle_one_request()
+        finally:
+            if getattr(self,"_perf",None):
+                request_performance.finish(*self._perf)
+            _request_accounts.reset(token)
+
+    def parse_request(self):
+        parsed = super().parse_request()
+        if parsed:
+            self._perf = request_performance.start(self.command, self.path)
+        return parsed
+
+    def send_response(self, code, message=None):
+        if getattr(self,"_perf",None):
+            self._perf[0]["status"] = code
+        return super().send_response(code, message)
+
+    def send_header(self, keyword, value):
+        if getattr(self,"_perf",None) and keyword.lower() == "content-length":
+            self._perf[0]["responseSize"] = int(value)
+        return super().send_header(keyword, value)
+
     def log_message(self, format, *args):
         from mahjong_api.logging_filters import redact_table_token as redact
         args = tuple(re.sub(r"(/api/discord/callback)\?[^ ]+", r"\1?[redacted]", v) if isinstance(v, str) else v for v in args)
         super().log_message(redact(format), *(redact(v) if isinstance(v, str) else v for v in args))
 
+    def send_error(self, code, message=None, explain=None):
+        # Reuse the generated legal copy for HTML errors outside the application
+        # shell. The standard renderer still escapes messages, calculates the
+        # final byte length, and omits the body for HEAD and bodyless statuses.
+        if urlparse(getattr(self, "path", "")).path.startswith("/api/"):
+            return super().send_error(code, message, explain)
+        try:
+            footer = (WEB_DIR / "footer.html").read_text(encoding="utf-8")
+        except OSError:
+            return super().send_error(code, message, explain)
+        original = self.error_message_format
+        self.error_message_format = original.replace("</body>", footer.replace("%", "%%") + "\n</body>")
+        try:
+            return super().send_error(code, message, explain)
+        finally:
+            self.error_message_format = original
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(WEB_DIR), **kwargs)
 
     def end_headers(self):
+        for name, value in request_performance.headers().items():
+            self.send_header(name, value)
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN" if urlparse(self.path).path == "/score" else "DENY")
         self.send_header("Referrer-Policy", "same-origin")
         self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
-        self.send_header("Cache-Control", "no-store" if self.path.startswith(("/api/", "/score", "/sit")) else "public, max-age=300")
+        self.send_header("Cache-Control", "no-store" if getattr(self,"_application_document",False) or self.path.startswith(("/api/", "/score", "/sit")) else ("public, max-age=31536000, immutable" if self.path.startswith(("/avatars/","/dist/")) else "public, max-age=300"))
         super().end_headers()
 
+    def guard_application_page(self):
+        self._application_document = False
+        parsed = urlparse(self.path)
+        path = unquote(parsed.path).rstrip("/") or "/"
+        if path.lower() == "/index.html":
+            path = "/index.html"
+        query = parse_qs(parsed.query)
+        if path == "/player-history":
+            self._application_document = True
+            self.send_response(302)
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return True
+        public = path in {"/login", "/register", "/auth/callback", "/discord/callback"}
+        application = (path in {"/", "/index.html", "/registration-complete", "/reservations",
+            "/manual-score", "/score", "/sit", "/account", "/admin", "/record", "/ranking", "/tournament"}
+            or path.startswith(("/join/", "/join-table/", "/challenges/", "/tables/", "/tournaments/")))
+        if not (public or application):
+            return False
+        self._application_document = True
+        user = current_user(self)
+        destination = None
+        if path in {"/login", "/register"} and user:
+            destination = "/"
+        elif application and not user:
+            destination = "/login?" + urlencode({"returnTo": account_registration.safe_return(self.path)})
+        elif application and (path == "/admin" or (query.get("page") or [""])[0] == "admin") and not is_admin(user):
+            self.send_error(403, "Administrator access required")
+            return True
+        if destination is None:
+            return False
+        self.send_response(302)
+        self.send_header("Location", destination)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+        return True
+
     def do_GET(self):
+        if self.guard_application_page():
+            return
         import competition_http
         if competition_http.get(sys.modules[__name__], self):
             return
@@ -2967,9 +3917,24 @@ class Handler(SimpleHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        if path.startswith("/avatars/"):
+            from account_images import thumbnail
+            match=re.fullmatch(r"/avatars/([a-f0-9]{64})\.webp",path)
+            image=thumbnail(match[1],USERS_FILE,YAKUMAN_UPLOAD_DIR,MAHJONG_DB_FILE) if match else None
+            if not image:
+                self.send_error(404);return
+            content=image.read_bytes();self.send_response(200)
+            self.send_header("Content-Type","image/webp");self.send_header("Content-Length",str(len(content)))
+            self.end_headers();self.wfile.write(content);return
         if self.account_get(path, query):
             return
+        if path == "/api/public-player-history":
+            response_json(self, {"ok": False, "code": "feature_removed"}, 410)
+            return
         if path == "/api/dashboard":
+            if not current_user(self):
+                response_json(self, {"ok": False, "code": "not_authenticated"}, 401)
+                return
             try:
                 ranking_type = (query.get("ranking") or ["mmr"])[0]
                 match_player = (query.get("match_player") or [""])[0]
@@ -3004,6 +3969,19 @@ class Handler(SimpleHTTPRequestHandler):
             except Exception as error:
                 response_json(self, {"ok": False, "message": str(error), "summary": None}, 500)
             return
+        if path == "/api/admin/discord-score":
+            username = current_user(self)
+            if not username:
+                response_json(self, {"ok": False, "code": "not_authenticated"}, 401)
+            elif not is_admin(username):
+                response_json(self, {"ok": False, "code": "admin_required"}, 403)
+            else:
+                try:
+                    response_json(self, discord_score_state(username))
+                except Exception:
+                    _logger.exception("Discord score setting read failed")
+                    response_json(self, {"ok": False, "code": "server_error"}, 500)
+            return
         if path == "/api/admin/matches":
             try:
                 username = current_user(self)
@@ -3030,6 +4008,21 @@ class Handler(SimpleHTTPRequestHandler):
                 response_json(self, {"ok": False, "message": str(error), "actions": []}, 401)
             except Exception as error:
                 response_json(self, {"ok": False, "message": str(error), "actions": []}, 500)
+            return
+        if path == "/api/login-players":
+            try:
+                body = account_registration.search_players(
+                    sys.modules[__name__], query=(query.get("q") or [""])[0],
+                    cursor=(query.get("cursor") or [""])[0],
+                    limit=(query.get("limit") or [10])[0], played_only=False)
+                # Administrators use a separate password sign-in and are never
+                # issued an ordinary member-selection session.
+                body["users"] = [entry for entry in body.get("users", []) if not is_admin(entry["name"])]
+                response_json(self, body)
+            except ValueError as error:
+                response_json(self, {"message": str(error), "users": [], "next_cursor": None}, 400)
+            except Exception:
+                response_json(self, {"message": "Player ID search is unavailable. Please retry.", "users": [], "next_cursor": None}, 503)
             return
         if path == "/api/registered-users":
             if not current_user(self):
@@ -3060,6 +4053,17 @@ class Handler(SimpleHTTPRequestHandler):
                     "account_count": report["account_count"]})
             except Exception:
                 response_json(self, {"message": "The name report is unavailable. Please retry."}, 503)
+            return
+        if path == "/api/history-players":
+            try:
+                body = account_registration.search_players(
+                    sys.modules[__name__], query=(query.get("q") or [""])[0],
+                    cursor=(query.get("cursor") or [""])[0], limit=(query.get("limit") or [10])[0])
+                for player in body["users"]:
+                    player["id"] = "historical:" + player["display_id"]
+                response_json(self, body)
+            except ValueError as error:
+                response_json(self, {"message": str(error), "users": [], "next_cursor": None}, 400)
             return
         if path == "/api/players":
             try:
@@ -3094,6 +4098,11 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if path.startswith("/uploads/yakuman/"):
             filename = Path(path.removeprefix("/uploads/yakuman/")).name
+            if re.fullmatch(r"competition-[a-f0-9-]+-original\.(png|jpg|webp)",filename):
+                self._application_document=True
+                user=current_user(self)
+                if not user or not is_admin(user):
+                    self.send_error(403);return
             target = (YAKUMAN_UPLOAD_DIR / filename).resolve()
             if target.parent != YAKUMAN_UPLOAD_DIR.resolve() or not target.exists():
                 self.send_error(404)
@@ -3106,7 +4115,7 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(content)
             return
 
-        if path.startswith("/challenges/") or path in {"/", "/login", "/register", "/registration-complete", "/reservations", "/manual-score"} or re.fullmatch(r"/(?:join-table|join)/[A-Za-z0-9_.-]+", path):
+        if path.startswith(("/challenges/", "/tables/", "/tournaments/")) or path in {"/", "/login", "/register", "/registration-complete", "/reservations", "/manual-score", "/account", "/admin", "/record", "/ranking", "/tournament"} or re.fullmatch(r"/(?:join-table|join)/[A-Za-z0-9_.-]+", path):
             self.path = "/index.html"
         elif is_blocked_static_path(path):
             self.send_error(403)
@@ -3118,8 +4127,7 @@ class Handler(SimpleHTTPRequestHandler):
             return False
         try:
             if path == "/api/register/players":
-                response_json(self, account_registration.claimable_players(sys.modules[__name__],
-                    (query.get("q") or [""])[0], (query.get("limit") or ["20"])[0]))
+                response_json(self, {"ok": False, "code": "feature_removed"}, 410)
             elif path == "/api/discord/config":
                 response_json(self, {"available": account_discord.configured()})
             elif path == "/api/admin/account-claims":
@@ -3128,6 +4136,17 @@ class Handler(SimpleHTTPRequestHandler):
                     raise PermissionError("Only administrators can view claims.")
                 response_json(self, {"claims": account_registration.claims(sys.modules[__name__])})
             else:
+                state = (query.get("state") or [""])[0]
+                if account_discord.is_admin_password_setup_state(state):
+                    grant = account_discord.complete_admin_password_setup(
+                        USERS_FILE, {k:v[0] for k,v in query.items()}, _admin_account)
+                    secure = "; Secure" if request_scheme(self) == "https" or os.getenv("PUBLIC_SITE_URL", "").startswith("https://") else ""
+                    self.send_response(302)
+                    self.send_header("Location", "/login#admin-password-setup")
+                    self.send_header("Set-Cookie", f"mahjong_admin_setup={grant}; Max-Age=600; HttpOnly; SameSite=Lax{secure}; Path=/api/admin/password-setup")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return True
                 user = require_user(self)
                 destination, linked = account_discord.complete(USERS_FILE, {k:v[0] for k,v in query.items()}, stable_account_id(user), session_cookie(self))
                 from urllib.parse import urlencode
@@ -3156,10 +4175,13 @@ class Handler(SimpleHTTPRequestHandler):
             clear_sheet_cache()
             return
         path = urlparse(self.path).path
+        if path in {"/api/register/claim", "/api/register/resume"}:
+            response_json(self, {"ok": False, "code": "feature_removed"}, 410)
+            return
         if path == "/api/record-game" and os.getenv("NFC_REPLACE_RECORDING", "true").lower() == "true":
             response_json(self, {"ok": False, "message": "请刷新网页，使用拍照登分或人工确认。", "score_url": "/score"}, 410)
             return
-        if path not in {"/api/admin/account-claims/review", "/api/register/claim", "/api/register/resume", "/api/discord/start", "/api/record-game", "/api/register", "/api/login", "/api/logout", "/api/live-games", "/api/live-hands", "/api/profile/avatar", "/api/profile/discord-unbind", "/api/change-password", "/api/forgot-password", "/api/reset-password", "/api/quarter", "/api/admin/role", "/api/admin/password-reset", "/api/admin/account-delete", "/api/admin/player-create", "/api/admin/player-rename", "/api/admin/registered-name", "/api/admin/player-merge", "/api/admin/player-icon", "/api/admin/yakuman", "/api/admin/yakuman-update", "/api/admin/yakuman-delete", "/api/admin/yakuman-hard-delete", "/api/admin/yakuman-photo", "/api/admin/action-revert", "/api/revert"}:
+        if path not in {"/api/admin/account-claims/review", "/api/register/claim", "/api/register/resume", "/api/discord/start", "/api/admin/password-setup/start", "/api/admin/password-setup", "/api/record-game", "/api/register", "/api/login", "/api/logout", "/api/live-games", "/api/live-hands", "/api/profile/avatar", "/api/profile/discord-unbind", "/api/change-password", "/api/forgot-password", "/api/reset-password", "/api/quarter", "/api/admin/role", "/api/admin/discord-score", "/api/admin/password-reset", "/api/admin/account-delete", "/api/admin/player-create", "/api/admin/player-rename", "/api/admin/registered-name", "/api/admin/player-merge", "/api/admin/player-icon", "/api/admin/yakuman", "/api/admin/yakuman-update", "/api/admin/yakuman-delete", "/api/admin/yakuman-hard-delete", "/api/admin/yakuman-photo", "/api/admin/action-revert", "/api/revert"}:
             self.send_error(404)
             return
 
@@ -3179,38 +4201,39 @@ class Handler(SimpleHTTPRequestHandler):
                 token, name = issue_session(self, stable_account_id(name))
                 authenticated_response(self, token, {"ok": True, "user": name, "redirect_url": account_registration.safe_return(data.get("redirect_url"))})
                 return
-            elif path == "/api/register/claim":
-                token = account_registration.submit_claim(sys.modules[__name__], data)
-                payload = json.dumps({"ok": True, "status": "pending"}).encode()
-                self.send_response(202)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Set-Cookie", f"mahjong_claim={token}; Max-Age=2592000{secure_cookie_suffix(self)}")
-                self.send_header("Content-Length", str(len(payload)))
-                self.end_headers(); self.wfile.write(payload)
-                return
-            elif path == "/api/register/resume":
-                from http.cookies import SimpleCookie
-                cookies = SimpleCookie(self.headers.get("Cookie", ""))
-                token = cookies["mahjong_claim"].value if "mahjong_claim" in cookies else ""
-                body, uid = account_registration.resume(sys.modules[__name__], token)
-                if uid:
-                    session, name = issue_session(self, uid)
-                    authenticated_response(self, session, {"ok": True, "user": name, **body})
-                    return
             elif path == "/api/admin/account-claims/review":
                 body = account_registration.review(sys.modules[__name__], data, require_user(self))
             elif path == "/api/discord/start":
-                user = require_user(self)
+                user = require_verified_user(self)
                 body = {"url": account_discord.start(stable_account_id(user), session_cookie(self), data.get("redirect_url"))}
+            elif path == "/api/admin/password-setup/start":
+                body = start_admin_password_setup(data)
+            elif path == "/api/admin/password-setup":
+                from http.cookies import SimpleCookie
+                cookies = SimpleCookie(self.headers.get("Cookie", ""))
+                grant = cookies["mahjong_admin_setup"].value if "mahjong_admin_setup" in cookies else ""
+                token, name = set_admin_password_from_verified_setup(data, grant)
+                response_body = json.dumps({"ok": True, "user": name, "redirect_url": "/"}, ensure_ascii=False).encode("utf-8")
+                secure = "; Secure" if request_scheme(self) == "https" or os.getenv("PUBLIC_SITE_URL", "").startswith("https://") else ""
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Set-Cookie", f"mahjong_session={token}{persistent_session_cookie_suffix(self)}")
+                self.send_header("Set-Cookie", f"mahjong_admin_setup=; Max-Age=0; HttpOnly; SameSite=Lax{secure}; Path=/api/admin/password-setup")
+                self.send_header("Content-Length", str(len(response_body)))
+                self.end_headers()
+                self.wfile.write(response_body)
+                return
             elif path == "/api/login":
                 token, name = login_user(data)
                 old = session_cookie(self)
                 _sessions.pop(old, None); _session_account_ids.pop(old, None)
-                body = {"ok": True, "user": name}
+                if old and old != token:
+                    registered_names.forget_session(USERS_FILE, old)
+                body = {"ok": True, "user": name, "redirect_url": account_registration.safe_return(data.get("returnTo", data.get("redirect_url")))}
                 payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Set-Cookie", f"mahjong_session={token}{secure_cookie_suffix(self)}")
+                self.send_header("Set-Cookie", f"mahjong_session={token}{persistent_session_cookie_suffix(self)}")
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -3223,6 +4246,7 @@ class Handler(SimpleHTTPRequestHandler):
                     if key == "mahjong_session":
                         _sessions.pop(value, None)
                         _session_account_ids.pop(value, None)
+                        registered_names.forget_session(USERS_FILE, value)
                 body = {"ok": True, "user": user}
                 payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
                 self.send_response(200)
@@ -3239,14 +4263,25 @@ class Handler(SimpleHTTPRequestHandler):
                 username = require_user(self)
                 body = {"ok": True, "game": record_live_hand(data, username)}
             elif path == "/api/profile/avatar":
-                username = require_user(self)
+                username = require_verified_user(self)
                 body = {"ok": True, "profile": update_user_avatar(username, data.get("avatar", ""))}
             elif path == "/api/profile/discord-unbind":
-                username = require_user(self)
+                username = require_verified_user(self)
                 body = {"ok": True, "profile": unbind_discord_account(username), "message": "Discord account unbound."}
             elif path == "/api/change-password":
-                username = require_user(self)
+                username = require_verified_user(self)
+                current_token = session_cookie(self)
+                account_id = stable_account_id(username)
                 change_password(username, data)
+                for token, session_id in list(_session_account_ids.items()):
+                    if session_id == account_id and token != current_token:
+                        _sessions.pop(token, None)
+                        _session_account_ids.pop(token, None)
+                registered_names.revoke_sessions(USERS_FILE, account_id)
+                if current_token:
+                    registered_names.remember_session(
+                        USERS_FILE, current_token, account_id,
+                        int(time.time()) + SESSION_MAX_AGE_SECONDS)
                 body = {"ok": True, "message": "Password updated."}
             elif path == "/api/forgot-password":
                 body = request_password_reset(data)
@@ -3258,6 +4293,9 @@ class Handler(SimpleHTTPRequestHandler):
             elif path == "/api/admin/role":
                 username = require_user(self)
                 body = update_user_role(data, username)
+            elif path == "/api/admin/discord-score":
+                username = require_user(self)
+                body = update_discord_score_state(data, username)
             elif path == "/api/admin/password-reset":
                 username = require_user(self)
                 body = reset_user_password(data, username)
@@ -3331,6 +4369,11 @@ def main():
     # Complete interrupted name publications before accepting requests.
     registered_names.ensure_directory(USERS_FILE)
     account_registration.initialize(sys.modules[__name__])
+    recover_confirmed_player_merge_accounts()
+    account_registration.sync_historical_accounts(sys.modules[__name__])
+    cleared_admin_passwords = prepare_admin_password_setup()
+    if cleared_admin_passwords:
+        print(f"Enabled self-service password setup for {cleared_admin_passwords} linked administrator account(s).")
     import competition_http
     competition_http.service(sys.modules[__name__]).start_worker()
     server = WebHTTPServer((args.host, args.port), Handler)

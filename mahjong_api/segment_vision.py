@@ -1,9 +1,10 @@
 """Read four scores on blue LCD / red LED mahjong control panels.
 
 This is a deterministic seven-segment decoder, not a trained neural network.
-It uses colour, repeated digit baselines, and segment occupancy. No score sum,
-filename, fixture values, or expected player score participates in recognition.
+It uses colour, repeated digit baselines, and segment occupancy. Score sums,
+filenames and fixture values are never used to invent or repair a digit.
 Two independent colour thresholds must agree before automatic settlement.
+Only displays read in hundreds use the first-position sign/0/1 grammar.
 """
 import itertools
 import math
@@ -13,7 +14,7 @@ import numpy as np
 
 cv2.setNumThreads(1)  # Bound CPU/thread overhead on the small production server.
 
-from .score_mapping import POSITIONS
+from .score_mapping import POSITIONS, display_units
 
 
 # Segment order: top, upper right, lower right, bottom, lower left,
@@ -67,7 +68,7 @@ def _deskew(mask):
     return cv2.warpAffine(mask, matrix, (new_width, new_height)), angle
 
 
-def _decode_digit(crop):
+def _decode_digit(crop, leading=False):
     height, width = crop.shape
     if width / height < .5:
         # A one has only the two right vertical segments; its tight bounding
@@ -86,7 +87,16 @@ def _decode_digit(crop):
         bitmap = cv2.resize(straight, (40, 64)) > 100
         occupancy = np.array([bitmap[y1:y2, x1:x2].mean() for x1, y1, x2, y2 in ZONES])
         pattern = "".join("1" if value > .3 else "0" for value in occupancy)
-        if pattern in PATTERNS:
+        if leading:
+            # The four-position hundreds display starts with 0, 1 or a sign.
+            # A reflected middle bar can turn a leading 0 into 8, while a poor
+            # shear can turn it into 2. Require all six outer bars and a much
+            # weaker middle before accepting 0; never force a clear 2 into 0.
+            outer = float(min(occupancy[:6]))
+            zero_margin = min(outer - .3, .65 * outer - occupancy[6])
+            if zero_margin >= .04:
+                choices.append((float(zero_margin), "0"))
+        if pattern in PATTERNS and (not leading or PATTERNS[pattern] in {"0", "1"}):
             margin = float(min(abs(occupancy - .3)))
             choices.append((margin, PATTERNS[pattern]))
     if not choices:
@@ -121,7 +131,7 @@ def _digit_boxes(mask):
     return sorted(boxes)
 
 
-def _read_groups(mask):
+def _read_groups(mask, leading_constraint=False):
     groups = []
     for box in _digit_boxes(mask):
         x, y, width, height = box
@@ -141,11 +151,6 @@ def _read_groups(mask):
         # Single-digit ranks are separate labels above a score, not scores.
         if not 3 <= len(group) <= 7:
             continue
-        digits, margins = [], []
-        for x, y, width, height in group:
-            digit, margin = _decode_digit(mask[y:y + height, x:x + width])
-            digits.append(digit)
-            margins.append(margin)
         x1 = min(box[0] for box in group)
         y1 = min(box[1] for box in group)
         x2 = max(box[0] + box[2] for box in group)
@@ -158,8 +163,21 @@ def _read_groups(mask):
                     and abs(y + h / 2 - (y1 + y2) / 2) < .2 * height):
                 sign = "-"
                 break
+        digits, margins = [], []
+        constrained = leading_constraint and not sign and len(group) in (3, 4)
+        for index, (x, y, width, digit_height) in enumerate(group):
+            digit, margin = _decode_digit(mask[y:y + digit_height, x:x + width],
+                                          leading=constrained and len(group) == 4 and index == 0)
+            digits.append(digit)
+            margins.append(margin)
+        # A lost first glyph must remain visible as an uncertainty. Inserting
+        # a guessed zero would hide the missing evidence from the reviewer.
+        if constrained and len(group) == 3:
+            digits.insert(0, "?")
+            margins.append(0.0)
         result.append({"raw": sign + "".join(digits), "box": [x1, y1, x2, y2],
-                       "segment_margin": round(min(margins), 4)})
+                       "segment_margin": round(min(margins), 4),
+                       **({"leading_digit_uncertain": True} if constrained and digits[0] == "?" else {})})
     return result
 
 
@@ -175,9 +193,25 @@ def _assign(groups):
             and center(bottom)[1] > max(center(left)[1], center(right)[1])):
         return {}, [{"code": "ambiguous_display_position", "candidates": groups}]
     observations = dict(zip(POSITIONS, (bottom, right, top, left)))
-    issues = [{"code": "unreadable_segments", "position": position}
+    issues = [{"code": "invalid_leading_digit" if group.get("leading_digit_uncertain") else "unreadable_segments", "position": position}
               for position, group in observations.items() if "?" in group["raw"]]
     return observations, issues
+
+
+def _hundreds_display(layout, observations):
+    """Use the whole frame's units before enabling the short-display grammar.
+
+    A full-points frame may contain short scores such as 6100 or 8900. Never
+    constrain those just because their individual digit count is four. The
+    other full scores, including any unreadable five-digit glyphs, rule out
+    the hundreds-only correction for the entire frame.
+    """
+    if layout != "red_led" or len(observations) != 4:
+        return False
+    raw = {position: group["raw"] for position, group in observations.items()}
+    if any(len(value.lstrip("-")) > 4 for value in raw.values()):
+        return False
+    return display_units(raw)["multiplier"] == 100
 
 
 def recognize_panel(photo):
@@ -189,21 +223,40 @@ def recognize_panel(photo):
     blue_mask = cv2.inRange(hsv, (90, 100, 70), (140, 255, 255))
     blue_contours = _contours(blue_mask)
     panel = np.zeros(blue_mask.shape, np.uint8)
+    small_blue_panel = False
     if blue_contours and cv2.contourArea(blue_contours[0]) > panel.size * .06:
-        cv2.fillConvexPoly(panel, cv2.convexHull(blue_contours[0]), 255)
+        panel_hull = cv2.convexHull(blue_contours[0])
+        panel_x, panel_y, panel_width, panel_height = cv2.boundingRect(panel_hull)
+        small_blue_panel = max(panel_width, panel_height) < 360
+        cv2.fillConvexPoly(panel, panel_hull, 255)
         layout = "blue_lcd"
     else:
         layout = "red_led"
     passes = []
     for delta in (0, 10):
         if layout == "blue_lcd":
-            # White/cyan score glyphs; exclude yellow totals and coloured deltas.
-            mask = (red > 150 + delta) & (green > 170) & (blue > 170) & (blue > green * .85) & (panel > 0)
+            if small_blue_panel:
+                # Small screenshots have only a few pixels per glyph. Use a
+                # softer cyan threshold and skip unreliable contour-based
+                # deskew; the latter tilted this nearly level panel by ~5°.
+                mask = ((red > 130) & (green > 150 + delta) & (blue > 160 + delta // 2)
+                        & (blue > green * (.75 + delta * .003)) & (panel > 0))
+            else:
+                # White/cyan score glyphs; exclude yellow totals and coloured deltas.
+                mask = (red > 150 + delta) & (green > 170) & (blue > 170) & (blue > green * .85) & (panel > 0)
         else:
             # Reject the orange AMOS housing and dim reflections of unlit bars.
-            mask = (red > 160) & (red - np.maximum(green, blue) > 100 + delta) & (blue > green * 1.3)
-        mask, angle = _deskew(mask.astype(np.uint8) * 255)
+            # Red LED segments are red-dominant; requiring blue > green dropped
+            # the actual lit pixels on ordinary red displays, yielding 0 groups.
+            mask = (red > 160) & (red - np.maximum(green, blue) > 100 + delta)
+        mask = mask.astype(np.uint8) * 255
+        if small_blue_panel:
+            angle = 0.0
+        else:
+            mask, angle = _deskew(mask)
         observations, issues = _assign(_read_groups(mask))
+        if _hundreds_display(layout, observations):
+            observations, issues = _assign(_read_groups(mask, leading_constraint=True))
         passes.append((observations, issues, angle))
     observations, issues, angle = passes[0]
     alternate, alternate_issues, _ = passes[1]
@@ -211,5 +264,5 @@ def recognize_panel(photo):
     if alternate_issues or scores != {position: alternate.get(position, {}).get("raw", "") for position in POSITIONS}:
         issues.append({"code": "unstable_segments", "message": "不同曝光阈值的识别结果不一致，请手动核对"})
     return {"scores": scores, "issues": issues, "observations": observations,
-            "model": "mahjong-seven-segment-v1", "engine": "opencv_segments", "layout": layout,
+            "model": "mahjong-seven-segment-v3", "engine": "opencv_segments", "layout": layout,
             "deskew_degrees": round(angle, 2), "box_coordinates": "deskewed_image_pixels"}

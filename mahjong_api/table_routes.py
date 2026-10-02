@@ -14,6 +14,21 @@ router = APIRouter()
 write = [Depends(check_cookie_origin)]
 
 
+@router.get("/api/scoring-table")
+def scoring_table(request: Request, user: Current, table: str | None = None,
+                  entry_token: str | None = None, current_table: str | None = None,
+                  auto_select_full: bool = False):
+    return request.app.state.tables.resolve_scoring_table(user, table, entry_token, current_table, auto_select_full)
+
+
+@router.get("/api/scoring/current-table-context")
+def scoring_context(request: Request, user: Current, table: str):
+    from .reservation_reminders import reservation_reminders
+    state=request.app.state.seat_swaps.list(table,user)
+    state["reservation_context"]=reservation_reminders(request.app.state.tables,table,user)
+    return state
+
+
 @router.get("/api/club-tables")
 def tables(request: Request, user: Current):
     return request.app.state.tables.list(user)
@@ -140,3 +155,13 @@ def reserve(request: Request, table_id: str, data: dict, user: Current):
 @router.post("/api/table-reservations/{reservation_id}", dependencies=write)
 def update_reservation(request: Request, reservation_id: str, data: dict, user: Current):
     return request.app.state.tables.update_reservation(reservation_id, data, user)
+
+
+@router.get("/api/club-tables/{table_id}/queue")
+def reservation_queue(request: Request, table_id: str, user: Current):
+    return request.app.state.tables.reservation_queue(table_id, user)
+
+
+@router.post("/api/club-tables/{table_id}/queue/reorder", dependencies=write)
+def reorder_reservation_queue(request: Request, table_id: str, data: dict, user: Current):
+    return request.app.state.tables.reorder_reservation_queue(table_id, data, user)

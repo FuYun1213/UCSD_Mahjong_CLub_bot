@@ -28,11 +28,12 @@ class SeatSwapService:
     def _stamp(self):
         return instant(self.clock()).isoformat(timespec="milliseconds")
 
-    def _table(self, db, reference):
+    def _table(self, db, reference, *, for_update=True):
         row = db.get(ClubTable, reference) or db.scalar(select(ClubTable).where(ClubTable.score_table_id == reference))
         check(row is not None, "table_not_found")
-        lock_table(db, row.id)
-        db.refresh(row)
+        if for_update:
+            lock_table(db, row.id)
+            db.refresh(row)
         return row
 
     @staticmethod
@@ -81,19 +82,29 @@ class SeatSwapService:
             self._reconcile(db, request, table, stamp)
         db.flush()
 
-    def _view(self, db, request, user, table):
+    def _view(self, db, request, user, table, *, stamp=None):
         def person(role):
             uid = getattr(request, role + "_user_id")
             account = db.get(Account, uid)
             return {"id":uid, "name":account.name if account else "", "seat":getattr(request, role + "_seat")}
+        # Polling projects stale requests without mutating rows or claims. The
+        # accepting transaction remains authoritative and repeats these checks.
+        status, reason = request.status, request.invalidated_reason
+        if stamp is not None and status == "pending":
+            if instant(stamp) >= instant(request.expires_at):
+                status = "expired"
+            else:
+                reason = self._invalid_reason(db, request, table)
+                if reason:
+                    status = "invalidated"
         current = str(user.id)
         return {"id":request.id, "table_id":request.table_id, "score_table_id":table.score_table_id,
-            "match_id":request.match_id, "status":request.status, "requester":person("requester"), "target":person("target"),
+            "match_id":request.match_id, "status":status, "requester":person("requester"), "target":person("target"),
             "requested_at":request.requested_at, "expires_at":request.expires_at,
-            "responded_at":request.responded_at, "invalidated_reason":request.invalidated_reason,
-            "can_accept":request.status == "pending" and current == request.target_user_id,
-            "can_decline":request.status == "pending" and current == request.target_user_id,
-            "can_cancel":request.status == "pending" and current == request.requester_user_id}
+            "responded_at":request.responded_at, "invalidated_reason":reason,
+            "can_accept":status == "pending" and current == request.target_user_id,
+            "can_decline":status == "pending" and current == request.target_user_id,
+            "can_cancel":status == "pending" and current == request.requester_user_id}
 
     def _response(self, table_id, **payload):
         return self.tables.display_names({**payload, "server_now":self._stamp(),
@@ -101,19 +112,44 @@ class SeatSwapService:
 
     def list(self, table_id, user):
         check(user is not None, "not_authenticated")
-        with membership_lock, self.store.connect() as db:
-            table = self._table(db, table_id)
+        with self.store.connect() as db:
+            table = self._table(db, table_id, for_update=False)
             check(not table.tournament_id, "fixed_tournament_seating")
             stamp = self._stamp()
-            self._sweep(db, table, stamp)
             recent = (instant(stamp) - timedelta(minutes=5)).isoformat(timespec="milliseconds")
             rows = db.scalars(select(SeatSwapRequest).where(SeatSwapRequest.table_id == table.id,
                 or_(SeatSwapRequest.requester_user_id == str(user.id), SeatSwapRequest.target_user_id == str(user.id)),
                 or_(SeatSwapRequest.status == "pending", SeatSwapRequest.responded_at >= recent))
                 .order_by(SeatSwapRequest.requested_at.desc(), SeatSwapRequest.id).limit(20))
-            requests = [self._view(db, row, user, table) for row in rows]
+            requests = [self._view(db, row, user, table, stamp=stamp) for row in rows]
             score_id = table.score_table_id
         return self._response(score_id, requests=requests)
+
+    def sweep_due(self, limit=50):
+        """Expire a bounded batch outside GET requests, one short transaction each.
+
+        Re-read under the same table-writer lock as accept/create so concurrent
+        acceptance can never be overwritten and claims are released atomically.
+        """
+        limit = max(0, min(200, int(limit)))
+        if not limit:
+            return 0
+        stamp = self._stamp()
+        with self.store.connect() as db:
+            due = list(db.scalars(select(SeatSwapRequest.id).where(
+                SeatSwapRequest.status == "pending", SeatSwapRequest.expires_at <= stamp)
+                .order_by(SeatSwapRequest.expires_at, SeatSwapRequest.id).limit(limit)))
+        expired = 0
+        for request_id in due:
+            with membership_lock, self.store.connect() as db:
+                row = db.get(SeatSwapRequest, request_id)
+                if row is None or row.status != "pending":
+                    continue
+                self._table(db, row.table_id)
+                db.refresh(row)
+                if row.status == "pending" and instant(stamp) >= instant(row.expires_at):
+                    expired += bool(finish_swap(db, row, "expired", timestamp=stamp))
+        return expired
 
     def create(self, table_id, data, user):
         check(user is not None, "not_authenticated")
@@ -199,7 +235,7 @@ class SeatSwapService:
         for member in (requester,target):
             event(db,table.id,row.match_id,member.user_id,user.id,"seat_swapped","seat_swap",stamp,detail,seat=member.seat)
         score = self._score(db, table)
-        score.updated_at, score.dirty = stamp, 1
+        score.updated_at, score.dirty = stamp, 0
         db.flush()
 
     def respond(self, request_id, action, user):
@@ -229,6 +265,4 @@ class SeatSwapService:
         # Expiry/invalidations must commit even when the requested accept fails.
         if failure:
             raise Conflict(failure, failure, request=request)
-        if action == "accept":
-            self.tables.matches.flush()
         return self._response(score_id, request=request)

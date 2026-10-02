@@ -31,9 +31,16 @@ class NoVision:
         raise AssertionError("Manual entry must not call photo recognition")
 
 
+@pytest.fixture(autouse=True)
+def isolated_external_defaults(monkeypatch):
+    for name in ("NARTS_EXTERNAL_API_KEY", "NARTS_EXTERNAL_API_KEY_FILE", "NARTS_EXTERNAL_API_ENDPOINT"):
+        monkeypatch.delenv(name, raising=False)
+
+
 @pytest.fixture
 def manual(tmp_path, monkeypatch):
     monkeypatch.delenv("TABLE_TOKEN_SECRET_FILE", raising=False)
+    monkeypatch.setenv("TABLE_ACCOUNT_FILE", str(tmp_path / "isolated-accounts.json"))
     club = tmp_path / "club.sqlite3"
     app = create_app(Settings(database_path=tmp_path / "api.sqlite3", club_database_path=str(club),
                               mock_auth_enabled=True, sync_interval_seconds=3600), DisabledSheets(), NoVision())
@@ -66,7 +73,8 @@ def test_generic_preview_confirm_existing_history_no_photo_no_round(manual):
         assert db.scalar(select(func.count()).select_from(ManualScorePlayer)) == 0
         assert db.scalar(select(func.count()).select_from(TableState)) == 0
     response = confirm(client, draft)
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
+    assert response.json()["local_saved"] and response.json()["local_completed"]
     result = response.json()["result"]
     assert result["table"] is None and result["round"] is None
     assert result["uploader_id"] == "u1"
@@ -78,6 +86,9 @@ def test_generic_preview_confirm_existing_history_no_photo_no_round(manual):
         assert {p.seat: p.user_id for p in db.scalars(select(ManualScorePlayer))} == PLAYERS
         audit = db.scalar(select(TournamentAudit).where(TournamentAudit.action == "manual_score_submitted"))
         assert audit.actor_id == "u1"
+    with closing(mahjong_store.connect(club)) as db:
+        assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
+    app.state.manual_scores.flush()
     with closing(mahjong_store.connect(club)) as db:
         assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
         assert db.execute("SELECT source,created_by FROM games").fetchone()[:] == ("manual", "Player 1")
@@ -139,8 +150,9 @@ def test_confirmation_revalidates_users_and_keeps_draft(manual):
 def test_table_prefill_empty_positions_association_and_permissions(manual):
     client, app, _, _ = manual
     table = app.state.tables.create({"request_id": "table", "number": 3}, ADMIN)
-    denied = preview(client, table_id=table["id"])
-    assert denied.status_code == 403
+    outsider = preview(client, table_id=table["id"])
+    assert outsider.status_code == 200
+    assert app.state.tables.get(table["id"], CURRENT)["player_count"] == 0
     app.state.tables.join(table["id"], CURRENT, "east")
     context = client.get("/api/manual-score/context", params={"table": table["id"]}, headers=AUTH).json()
     assert context["players"]["east"]["id"] == "u1" and context["players"]["north"] is None
@@ -148,7 +160,8 @@ def test_table_prefill_empty_positions_association_and_permissions(manual):
     assert preview(client, table_id=table["id"], players=mismatched).status_code == 422
     draft = preview(client, table_id=table["id"]).json()
     response = confirm(client, draft)
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
+    assert response.json()["local_saved"] and response.json()["local_completed"]
     assert response.json()["result"]["table"] == table["score_table_id"]
     assert response.json()["result"]["match_id"] == context["match_id"]
     with app.state.service.store.connect() as db:
@@ -178,6 +191,9 @@ def test_parallel_confirmation_idempotency_and_request_collision(manual):
     with app.state.service.store.connect() as db:
         assert db.scalar(select(func.count()).select_from(ManualScorePlayer)) == 4
         assert db.scalar(select(func.count()).select_from(TournamentAudit).where(TournamentAudit.action == "manual_score_submitted")) == 1
+    with closing(mahjong_store.connect(club)) as db:
+        assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
+    app.state.manual_scores.flush()
     with closing(mahjong_store.connect(club)) as db:
         assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
     another = preview(client).json()
@@ -231,7 +247,10 @@ def test_separate_processes_confirm_one_generic_game(manual):
     with ProcessPoolExecutor(2) as pool:
         replies = list(pool.map(_confirm_in_process, [args, args]))
     assert sum(not body["replayed"] for body, _ in replies) == 1
-    assert all(status == 200 for _, status in replies)
+    assert all(status == 202 and body["local_saved"] and body["local_completed"] for body, status in replies)
+    with closing(mahjong_store.connect(club)) as db:
+        assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
+    app.state.manual_scores.flush()
     with closing(mahjong_store.connect(club)) as db:
         assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
         assert [row[0] for row in db.execute("SELECT games_played FROM players")] == [1] * 4
@@ -241,19 +260,31 @@ def test_generic_history_lost_ack_retries_without_duplicate_game(manual, monkeyp
     client, app, club, _ = manual
     draft = preview(client).json()
     sink = app.state.service.sheets
-    original = sink.write_manual_history
-    failed = False
+    original = sink.deliver_history
+    calls = []
 
-    def lost_ack(match):
-        nonlocal failed
-        original(match)
-        if not failed:
-            failed = True
-            raise TimeoutError("Saved but acknowledgment lost")
+    def lost_ack(target, match, *, reconcile=False):
+        result = original(target, match, reconcile=reconcile)
+        if target["adapter"] == "club":
+            calls.append(reconcile)
+            if len(calls) == 1:
+                raise TimeoutError("Saved but acknowledgment lost")
+        return result
 
-    monkeypatch.setattr(sink, "write_manual_history", lost_ack)
+    monkeypatch.setattr(sink, "deliver_history", lost_ack)
     response = confirm(client, draft, "retry")
-    assert response.status_code == 202 and response.json()["local_saved"]
+    assert response.status_code == 202 and response.json()["local_saved"] and response.json()["local_completed"]
+    assert calls == []
+    app.state.manual_scores.flush()
+    assert calls == [False]
+    assert app.state.service.history.status(response.json()["result"]["match_id"])["status"] == "delivery_unknown"
+    replay = confirm(client, draft, "retry")
+    assert replay.status_code == 202 and replay.json()["replayed"]
+    assert calls == [False]
+    queued = client.post("/api/manual-score/drafts/" + draft["draft_id"] + "/retry", headers=AUTH, json={})
+    assert queued.status_code == 202 and calls == [False]
+    app.state.manual_scores.flush()
+    assert calls == [False, True]
     response = confirm(client, draft, "retry")
     assert response.status_code == 200 and response.json()["replayed"]
     with closing(mahjong_store.connect(club)) as db:
@@ -302,12 +333,15 @@ def test_upload_one_action_validates_and_saves_without_photo(manual):
     with app.state.service.store.connect() as db:
         assert db.scalar(select(func.count()).select_from(ManualScoreDraft)) == 0
     response = upload(client)
-    assert response.status_code == 200 and response.json()["local_saved"]
+    assert response.status_code == 202 and response.json()["local_saved"] and response.json()["local_completed"]
     assert upload(client).json()["replayed"]
     with app.state.service.store.connect() as db:
         assert db.scalar(select(func.count()).select_from(ManualScoreDraft)) == 1
         assert db.scalar(select(func.count()).select_from(ManualScoreRequest)) == 1
         assert db.scalar(select(func.count()).select_from(ScoreDraft)) == 0
+    with closing(mahjong_store.connect(club)) as db:
+        assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
+    app.state.manual_scores.flush()
     with closing(mahjong_store.connect(club)) as db:
         assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
 
@@ -336,6 +370,9 @@ def test_parallel_uploads_reuse_one_draft_and_game(manual):
     assert len({body["draft_id"] for body, _ in replies}) == 1
     with app.state.service.store.connect() as db:
         assert db.scalar(select(func.count()).select_from(ManualScoreDraft)) == 1
+    with closing(mahjong_store.connect(club)) as db:
+        assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
+    app.state.manual_scores.flush()
     with closing(mahjong_store.connect(club)) as db:
         assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
 
@@ -367,6 +404,9 @@ def test_processes_upload_same_key_once(manual):
     assert sum(not body["replayed"] for body, _ in replies) == 1
     assert len({body["draft_id"] for body, _ in replies}) == 1
     with closing(mahjong_store.connect(club)) as db:
+        assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
+    app.state.manual_scores.flush()
+    with closing(mahjong_store.connect(club)) as db:
         assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
         assert [row[0] for row in db.execute("SELECT games_played FROM players")] == [1] * 4
 
@@ -381,7 +421,8 @@ def test_upload_resume_after_draft_saved_before_confirmation(manual, monkeypatch
         app.state.manual_scores.upload({"request_id": "interrupted", "players": PLAYERS, "scores": POINTS}, CURRENT)
     monkeypatch.setattr(app.state.manual_scores, "confirm", original)
     response = upload(client, key="interrupted")
-    assert response.status_code == 200
+    assert response.status_code == 202
+    assert response.json()["local_saved"] and response.json()["local_completed"]
     with app.state.service.store.connect() as db:
         assert db.scalar(select(func.count()).select_from(ManualScoreDraft)) == 1
         assert db.scalar(select(func.count()).select_from(ManualScorePlayer)) == 4
@@ -396,7 +437,7 @@ def test_nondefault_total_rule_comes_from_existing_configuration(tmp_path, monke
         assert client.get("/api/manual-score/context", headers=AUTH).json()["score_rules"]["expected_total"] == 120000
         assert upload(client).status_code == 422
         response = upload(client, scores={s: 30000 for s in SEATS})
-        assert response.status_code == 200 and response.json()["local_saved"]
+        assert response.status_code == 202 and response.json()["local_saved"] and response.json()["local_completed"]
 
 
 def test_external_failure_preserves_local_score_and_retry_same_delivery(manual):
@@ -411,14 +452,27 @@ def test_external_failure_preserves_local_score_and_retry_same_delivery(manual):
             raise requests.Timeout("Provider saved it but the acknowledgement was lost")
         return 200, {"ok": True}
     external.transport = transport
-    response = upload(client).json()
-    assert response["local_saved"] and response["external_sync"]["status"] == "failed"
+    saved = upload(client)
+    assert saved.status_code == 202
+    response = saved.json()
+    assert response["local_saved"] and response["local_completed"] and response["external_sync"]["status"] == "pending"
+    assert calls == []
+    app.state.manual_scores.flush()
+    assert calls == []
+    external.flush()
+    assert len(calls) == 1
+    assert external.get(response["external_sync"]["request_id"])["status"] == "failed"
     draft_id = response["draft_id"]
     with closing(mahjong_store.connect(club)) as db:
         assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 1
     assert client.post("/api/manual-score/drafts/" + draft_id + "/retry", headers={"Authorization": "Bearer demo-2"}, json={}).status_code == 403
-    retry = client.post("/api/manual-score/drafts/" + draft_id + "/retry", headers=AUTH, json={}).json()
-    assert retry["local_saved"] and retry["external_sync"]["status"] == "success"
+    queued = client.post("/api/manual-score/drafts/" + draft_id + "/retry", headers=AUTH, json={})
+    assert queued.status_code == 200
+    retry = queued.json()
+    assert retry["local_saved"] and retry["local_completed"] and retry["external_sync"]["status"] == "pending"
+    assert len(calls) == 1  # Retry only requeues the frozen request.
+    external.flush()
+    assert external.get(response["external_sync"]["request_id"])["status"] == "success"
     assert calls[0] == calls[1] and calls[0]["requestId"] == response["external_sync"]["request_id"]
     assert upload(client).json()["replayed"] and len(calls) == 2
     with closing(mahjong_store.connect(club)) as db:
@@ -437,8 +491,13 @@ def test_background_retries_transient_manual_failure_after_backoff(manual):
         return (503, {}) if len(calls) == 1 else (200, {"ok": True})
     external.transport = transport
     first = upload(client).json()
+    assert first["local_saved"] and first["local_completed"] and calls == []
     app.state.manual_scores.flush()
+    assert calls == []
+    external.flush()
     assert len(calls) == 1
+    app.state.manual_scores.flush()
+    assert len(calls) == 1  # Backoff prevents an immediate worker retry.
     with app.state.service.store.connect() as db:
         delivery = db.get(ExternalDelivery, first["external_sync"]["request_id"])
         delivery.updated_at = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
@@ -468,17 +527,31 @@ def test_pending_history_uses_current_registered_name_without_changing_delivery(
     sink = app.state.service.sheets
     sink.account_lookup = lambda: registered_names.account_rows(account_file)
     sink.account_path = account_file
-    original_writer = sink.write_manual_history
-    def fail_before_history(match):
-        raise TimeoutError("history database unavailable")
-    monkeypatch.setattr(sink, "write_manual_history", fail_before_history)
+    original_writer = sink.deliver_history
+    calls = []
+    def fail_before_history(target, match, *, reconcile=False):
+        if target["adapter"] == "club":
+            calls.append(match["match_id"])
+            raise TimeoutError("history database unavailable")
+        return original_writer(target, match, reconcile=reconcile)
+    monkeypatch.setattr(sink, "deliver_history", fail_before_history)
     first = upload(client, key="rename-before-history-retry").json()
-    assert first["local_saved"] and first["status"] == "pending"
+    assert first["local_saved"] and first["local_completed"] and first["status"] == "pending"
+    assert calls == []
+    app.state.manual_scores.flush()
+    assert calls == [first["result"]["match_id"]]
+    assert app.state.service.history.status(first["result"]["match_id"])["status"] == "delivery_unknown"
     with app.state.service.store.connect() as db:
         delivery_before = db.get(ExternalDelivery, first["external_sync"]["request_id"]).payload_json
+        assert json.loads(delivery_before)["players"][0]["username"] == "Player 1"
+        assert json.loads(delivery_before)["players"][0]["sourcePlayerId"] == "u1"
     web_server.admin_registered_name({"user_id": "u1", "expected_name": "Player 1", "new_name": "Renamed Player",
                                       "confirm": True}, "Admin")
-    monkeypatch.setattr(sink, "write_manual_history", original_writer)
+    monkeypatch.setattr(sink, "deliver_history", original_writer)
+    retry = client.post("/api/manual-score/drafts/" + first["draft_id"] + "/retry", headers=AUTH, json={})
+    assert retry.status_code == 202
+    with closing(mahjong_store.connect(club)) as db:
+        assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
     app.state.manual_scores.flush()
     with closing(mahjong_store.connect(club)) as db:
         assert db.execute("SELECT id FROM players WHERE name='Renamed Player'").fetchone()[0] == original_player
@@ -498,7 +571,8 @@ def test_case_distinct_opaque_ids_remain_distinct_for_manual_upload(manual):
     lookup = client.post("/api/player-lookup", json={"user_ids": ["u1", "U1"]}, headers=AUTH)
     assert [p["id"] for p in lookup.json()["players"]] == ["u1", "U1"]
     response = upload(client, key="case-distinct", players=players)
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
+    assert response.json()["local_saved"] and response.json()["local_completed"]
     assert response.json()["result"]["players"]["east"]["user"]["id"] == "u1"
     assert response.json()["result"]["players"]["south"]["user"]["id"] == "U1"
     swapped = {**players, "east": "U1", "south": "u1"}
@@ -532,23 +606,77 @@ def test_application_lifespan_wires_current_names_for_pending_history(tmp_path, 
         sink = app.state.service.sheets
         assert sink.account_path == account_file
         assert sink.account_lookup.__self__ is app.state.tables
-        original_writer = sink.write_manual_history
-        def fail_before_history(match):
-            raise TimeoutError("temporary history failure")
-        monkeypatch.setattr(sink, "write_manual_history", fail_before_history)
+        original_writer = sink.deliver_history
+        calls = []
+        def fail_before_history(target, match, *, reconcile=False):
+            if target["adapter"] == "club":
+                calls.append(match["match_id"])
+                raise TimeoutError("temporary history failure")
+            return original_writer(target, match, reconcile=reconcile)
+        monkeypatch.setattr(sink, "deliver_history", fail_before_history)
         first = upload(client, key="lifespan-pending-rename").json()
-        assert first["local_saved"] and first["status"] == "pending"
+        assert first["local_saved"] and first["local_completed"] and first["status"] == "pending"
+        assert calls == []
+        app.state.manual_scores.flush()
+        assert calls == [first["result"]["match_id"]]
+        assert app.state.service.history.status(first["result"]["match_id"])["status"] == "delivery_unknown"
         with app.state.service.store.connect() as db:
             payload_before = db.get(ExternalDelivery, first["external_sync"]["request_id"]).payload_json
+            assert json.loads(payload_before)["players"][0]["username"] == "Player 1"
+            assert json.loads(payload_before)["players"][0]["sourcePlayerId"] == "u1"
         web_server.admin_registered_name({"user_id": "u1", "expected_name": "Player 1", "new_name": "Current Registered Name",
                                           "confirm": True}, "Admin")
-        monkeypatch.setattr(sink, "write_manual_history", original_writer)
+        monkeypatch.setattr(sink, "deliver_history", original_writer)
         again = upload(client, key="lifespan-pending-rename")
-        assert again.status_code == 200 and again.json()["replayed"]
+        assert again.status_code == 202 and again.json()["replayed"]
         assert again.json()["result"]["players"]["east"]["user"]["name"] == "Current Registered Name"
+        with closing(mahjong_store.connect(club)) as db:
+            assert db.execute("SELECT COUNT(*) FROM games").fetchone()[0] == 0
+        retry = client.post("/api/manual-score/drafts/" + first["draft_id"] + "/retry", headers=AUTH, json={})
+        assert retry.status_code == 202
+        app.state.manual_scores.flush()
         with closing(mahjong_store.connect(club)) as db:
             assert db.execute("SELECT id FROM players WHERE name='Current Registered Name'").fetchone()[0] == original_player
             assert db.execute("SELECT COUNT(*) FROM players WHERE name='Player 1'").fetchone()[0] == 0
             assert db.execute("SELECT COUNT(*) FROM game_players WHERE player_id=?", (original_player,)).fetchone()[0] == 1
         with app.state.service.store.connect() as db:
             assert db.get(ExternalDelivery, first["external_sync"]["request_id"]).payload_json == payload_before
+
+
+def test_saved_draft_status_reads_are_local_only(manual, monkeypatch):
+    client, app, _, _ = manual
+    draft = preview(client).json()
+    saved = confirm(client, draft).json()
+    assert saved["local_saved"] and saved["status"] == "pending"
+    from sqlalchemy import event
+    verbs = []
+    def trace(connection, cursor, statement, parameters, context, many):
+        verbs.append(statement.lstrip().split(None, 1)[0].upper())
+    event.listen(app.state.service.store.engine, "before_cursor_execute", trace)
+    try:
+        polled = client.get("/api/manual-score/drafts/" + draft["draft_id"], headers=AUTH)
+    finally:
+        event.remove(app.state.service.store.engine, "before_cursor_execute", trace)
+    assert polled.status_code == 200
+    assert polled.json()["submission"]["history_sync"]["status"] == "pending"
+    assert verbs and not set(verbs) & {"INSERT", "UPDATE", "DELETE", "REPLACE"}
+    app.state.manual_scores.flush()
+    updated = client.get("/api/manual-score/drafts/" + draft["draft_id"], headers=AUTH).json()
+    assert updated["submission"]["status"] == "success"
+    assert updated["submission"]["result"] == saved["result"]
+
+
+def test_bound_manual_score_has_two_aliases_but_one_projection(manual):
+    from mahjong_api.history_delivery_models import ScoreSourceAlias, ScoreProjectionJob, ScoreRecord
+    client, app, _, _ = manual
+    table = app.state.tables.create({"request_id": "alias-table", "number": 3}, ADMIN)
+    app.state.tables.join(table["id"], CURRENT, "east")
+    draft = preview(client, table_id=table["id"]).json()
+    response = confirm(client, draft)
+    assert response.status_code == 202, response.text
+    mid = response.json()["result"]["match_id"]
+    with app.state.service.store.connect() as db:
+        assert db.get(ScoreSourceAlias, ("manual", draft["draft_id"])).game_id == mid
+        assert db.get(ScoreSourceAlias, ("nfc", mid)).game_id == mid
+        assert db.scalar(select(func.count()).select_from(ScoreRecord)) == 1
+        assert db.scalar(select(func.count()).select_from(ScoreProjectionJob)) == 1

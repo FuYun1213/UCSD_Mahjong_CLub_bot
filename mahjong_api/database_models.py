@@ -24,7 +24,7 @@ class TableState(Base):
     updated_at: Mapped[str] = mapped_column(String(40))
     # UTC ISO strings retain timezone semantics on both SQLite and PostgreSQL.
     started_at: Mapped[str | None] = mapped_column(String(40))
-    dirty: Mapped[int] = mapped_column(default=1)
+    dirty: Mapped[int] = mapped_column(default=0)
 
 
 class SeatRecord(Base):
@@ -54,6 +54,7 @@ class MatchHistory(Base):
     source_seat_order: Mapped[str] = mapped_column(String(16), default="ESWN")
     uploader_id: Mapped[str | None] = mapped_column(String(128))
     history_synced: Mapped[int] = mapped_column(default=0)
+    local_finalized: Mapped[int] = mapped_column(default=0)
     clear_synced: Mapped[int] = mapped_column(default=0)
 
 

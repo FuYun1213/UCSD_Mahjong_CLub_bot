@@ -1,3 +1,5 @@
+import request_performance
+request_performance.install()
 import asyncio
 import hashlib
 import json
@@ -29,6 +31,8 @@ from .discord_reminder_service import DiscordReminderService
 from .seat_swap_routes import router as seat_swap_router
 from .manual_score import ManualScoreService
 from .manual_score_routes import router as manual_score_router
+from .game_flow import GameFlowService
+from .game_flow_routes import router as game_flow_router
 from .logging_filters import install_token_redaction
 
 logger = logging.getLogger(__name__)
@@ -60,6 +64,7 @@ def create_app(settings: Settings | None = None, sheets: SheetsSink | None = Non
                     sink.account_lookup = app.state.tables._account_rows
                     sink.account_path = Path(os.getenv("TABLE_ACCOUNT_FILE", str(Path(__file__).resolve().parents[1] / "web_users.json")))
                 app.state.manual_scores = ManualScoreService(service, app.state.tables)
+                app.state.game_flow = GameFlowService(app.state.tables)
                 app.state.vision = vision
                 if settings.vision_enabled and vision is None:
                     from .vision import LCDRecognizer
@@ -68,21 +73,32 @@ def create_app(settings: Settings | None = None, sheets: SheetsSink | None = Non
                     logger.warning("Sheets disabled; data stored locally only")
                 if settings.mock_auth_enabled:
                     logger.warning("Demo authentication enabled")
-                await asyncio.to_thread(service.flush)
-                await asyncio.to_thread(app.state.manual_scores.flush)
+                # Startup only restores local state/outbox. External services must
+                # never hold application readiness hostage.
                 stop = asyncio.Event()
 
                 async def retry_sync():
                     while not stop.is_set():
                         try:
+                            await asyncio.to_thread(app.state.manual_scores.flush)
+                            await asyncio.to_thread(service.external.flush)
+                        except Exception:
+                            logger.warning("History sync worker failed; persisted tasks retained")
+                        try:
                             await asyncio.wait_for(stop.wait(), timeout=settings.sync_interval_seconds)
                         except asyncio.TimeoutError:
-                            try:
-                                await asyncio.to_thread(service.flush)
-                                await asyncio.to_thread(app.state.manual_scores.flush)
-                                await asyncio.to_thread(service.external.flush)
-                            except Exception:
-                                logger.exception("Sync worker failed; will retry")
+                            pass
+
+                async def sweep_seat_swaps():
+                    while not stop.is_set():
+                        try:
+                            await asyncio.to_thread(app.state.seat_swaps.sweep_due, limit=50)
+                        except Exception:
+                            logger.warning("Seat swap expiry worker failed; action-time validation remains active")
+                        try:
+                            await asyncio.wait_for(stop.wait(), timeout=15)
+                        except asyncio.TimeoutError:
+                            pass
 
                 async def reservation_reminders():
                     # Independent persisted scheduler: ordinary requests and the
@@ -101,15 +117,17 @@ def create_app(settings: Settings | None = None, sheets: SheetsSink | None = Non
 
                 worker = asyncio.create_task(retry_sync())
                 reminder_worker = asyncio.create_task(reservation_reminders())
+                swap_worker = asyncio.create_task(sweep_seat_swaps())
                 try:
                     yield
                 finally:
                     stop.set()
-                    await asyncio.gather(worker, reminder_worker)
+                    await asyncio.gather(worker, reminder_worker, swap_worker)
             finally:
                 database.close()
 
     app = FastAPI(title="麻将 NFC / 照片 OCR 自动登分 API", version="2.1.0", lifespan=lifespan)
+    app.add_middleware(request_performance.Middleware)
     app.state.settings = settings
     from .guest_routes import router as guest_router
     app.include_router(guest_router)
@@ -118,6 +136,7 @@ def create_app(settings: Settings | None = None, sheets: SheetsSink | None = Non
     app.include_router(reservation_reminder_router)
     app.include_router(seat_swap_router)
     app.include_router(manual_score_router)
+    app.include_router(game_flow_router)
     if settings.allowed_origins:
         app.add_middleware(CORSMiddleware, allow_origins=list(settings.allowed_origins),
             allow_credentials=True, allow_methods=["GET", "POST", "PUT"],
@@ -138,7 +157,7 @@ def create_app(settings: Settings | None = None, sheets: SheetsSink | None = Non
 
     @app.exception_handler(Conflict)
     async def conflict_handler(request, exc):
-        return JSONResponse(status_code=410 if exc.detail["code"] == "tournament_deleted" else 403 if exc.detail["code"] in {"admin_required", "not_assigned", "reservation_not_owner", "must_join_first", "swap_not_target", "swap_not_requester"} else 409, content={"detail": exc.detail})
+        return JSONResponse(status_code=410 if exc.detail["code"] == "tournament_deleted" else 403 if exc.detail["code"] in {"admin_required", "not_assigned", "reservation_not_owner", "must_join_first", "swap_not_target", "swap_not_requester", "queue_reorder_forbidden"} else 409, content={"detail": exc.detail})
 
     @app.api_route("/api/sit", methods=["GET", "POST"], dependencies=[Depends(check_cookie_origin)])
     def sit(request: Request, table: TableId, seat: Seat, user: CurrentUser):
@@ -187,6 +206,7 @@ def create_app(settings: Settings | None = None, sheets: SheetsSink | None = Non
         match_id: Annotated[str, Form(min_length=1, max_length=64)],
         regions: Annotated[str | None, Form()] = None,
         review_only: Annotated[bool, Form()] = False,
+        viewpoint_seat: Annotated[Seat | None, Form()] = None,
         idempotency_key: RequestKey = None,
     ):
         recognizer = request.app.state.vision
@@ -201,7 +221,9 @@ def create_app(settings: Settings | None = None, sheets: SheetsSink | None = Non
         try:
             regions_value = json.loads(regions) if regions else None
             photo_hash = hashlib.sha256(content + json.dumps(regions_value, sort_keys=True, allow_nan=False).encode()).hexdigest()
-            context, replay = await asyncio.to_thread(service.photo_context, table, match_id, user, idempotency_key, photo_hash)
+            if viewpoint_seat is not None:
+                photo_hash = hashlib.sha256((photo_hash + ':' + viewpoint_seat.value).encode()).hexdigest()
+            context, replay = await asyncio.to_thread(service.photo_context, table, match_id, user, idempotency_key, photo_hash, viewpoint_seat)
             if replay:
                 body, status = replay
                 return JSONResponse(status_code=status, content=body)
@@ -211,7 +233,7 @@ def create_app(settings: Settings | None = None, sheets: SheetsSink | None = Non
         except (ImportError, FileNotFoundError) as exc:
             logger.exception("OCR runtime is not installed")
             raise HTTPException(503, detail={"code": "vision_not_configured"}) from exc
-        payload = RelativeSubmission(table=table, match_id=match_id, scores=recognized["scores"])
+        payload = RelativeSubmission(table=table, match_id=match_id, scores=recognized["scores"], viewpoint_seat=context["photo_viewpoint_seat"])
         body, status = await asyncio.to_thread(service.submit_relative, payload, user, idempotency_key,
             recognized.get("issues", []) + ([{"code": "manual_confirmation_requested"}] if review_only else []), ended_at, context["seats"], photo_hash)
         body["recognition"] = recognized
@@ -255,3 +277,4 @@ def create_app(settings: Settings | None = None, sheets: SheetsSink | None = Non
 
 
 app = create_app()
+

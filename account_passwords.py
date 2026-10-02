@@ -16,7 +16,10 @@ def hash_password(password):
 def verify_password(password, account):
     if not isinstance(password, str) or len(password) > 1024:
         return False
-    digest = account.get("password_hash", "")
+    digest = account.get("password_hash")
+    if not isinstance(digest, str) or not digest:
+        # An unset hash is never a credential, including for ID login.
+        return False
     if digest.startswith("$argon2id$"):
         try:
             return hasher.verify(digest, password)

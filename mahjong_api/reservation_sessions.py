@@ -1,5 +1,5 @@
 """Session grouping: bounded start span, stable ranking and one scope transaction."""
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from uuid import uuid4
 from sqlalchemy import select, update
 from .reservation_session_models import ReservationScopeLock, ReservationSession
@@ -7,7 +7,11 @@ from .table_models import ClubTable, TableReservation, ReservationParticipant
 
 
 def instant(value):
-    return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(
+        value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("timezone_required")
+    return parsed.astimezone(timezone.utc)
 
 
 def lock_scope(db, scope):
@@ -51,9 +55,19 @@ def reservation_participants(db, rows):
 def session_participants(db, session_id, exclude_id=None):
     """Stable-ID union of participants on active individual reservations only."""
     rows = active_reservations(db, session_id, exclude_id)
+    from .reservation_queue import participant_progress
+    progress=participant_progress(db,rows)
+    groups=reservation_participants(db,rows)
     people = {}
-    for group in reservation_participants(db, rows).values():
-        for person in group:
+    for row in rows:
+        for person in groups[row.id]:
+            count=progress.get((row.id,person["user_id"]),{"completed":0,"occupied":0})
+            if row.plan_kind=="finite" and row.planned_games is not None and (
+                    count["completed"]+count["occupied"] >= row.planned_games):
+                continue
+            if row.plan_kind=="legacy_unknown":
+                # Legacy rows remain visible as history, not speculative queue slots.
+                continue
             people.setdefault(person["user_id"], person)
     return list(people.values())
 
@@ -81,8 +95,12 @@ def fits_session(db, session, start_at, participant_ids, capacity, exclude_id=No
 
 
 def candidates(db, scope, start_at, participant_ids, table_id=None, exclude_id=None):
+    requested=instant(start_at)
+    lower=(requested-timedelta(hours=1)).isoformat(timespec="milliseconds")
+    upper=(requested+timedelta(hours=1)).isoformat(timespec="milliseconds")
     query = select(ReservationSession).join(ClubTable).where(ReservationSession.scope == scope,
-        ReservationSession.status == "active", ClubTable.status == "open")
+        ReservationSession.status == "active", ReservationSession.start_at.between(lower,upper),
+        ClubTable.status == "open")
     if table_id:
         query = query.where(ReservationSession.table_id == table_id)
     result = []

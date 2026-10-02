@@ -1,5 +1,4 @@
 /* Global registration and optional Discord flow; no credentials are stored in the browser. */
-const v10 = (language, en, cn) => language === "CN" ? cn : en;
 const registrationMessages={
   "Existing player registration uses the selected player's current name.": "已有玩家须使用所选玩家当前的姓名开通账号，不能另设新名字。",
   "This ID is already registered. Please log in or contact an administrator.": "此 ID 已注册，请登录或联系管理员。",
@@ -7,7 +6,7 @@ const registrationMessages={
   "This ID is unavailable. Please contact an administrator.": "此 ID 暂不可用，请联系管理员。",
   "This registered name is already in use.": "此注册名已被使用。",
   "This registered name is already used by another existing player.": "此注册名已被其他已有玩家使用。",
-  "This is an existing ID. Use Claim Existing ID for administrator approval.": "此名称属于已有玩家，请选择“已有玩家开通账号”并提交管理员审批。",
+  "This is an existing ID. Select the player name at sign-in.": "此名称已在俱乐部名单中，请返回登录并选择该玩家姓名。",
   "Please select your existing player name from the results.": "请从搜索结果中选择自己的原玩家姓名。",
   "This name has a pending registration. Please contact an administrator.": "此名称有待审批的注册申请，请联系管理员。",
   "This ID has a pending registration. Please contact an administrator.": "此 ID 有待审批的认领申请，请联系管理员。",
@@ -46,90 +45,31 @@ function registrationDestination(result, bindDiscord) {
   const target=safeLoginReturn(result.redirect_url||"/");
   location.assign(bindDiscord?"/registration-complete?redirect_url="+encodeURIComponent(target):target);
 }
-function ExistingPlayerPicker({language,value,onChange,disabled=false}) {
-  const t=(en,cn)=>v10(language,en,cn),id=React.useId(),box=React.useRef(null);
-  const [query,setQuery]=React.useState(value?.name||""),[players,setPlayers]=React.useState([]),[open,setOpen]=React.useState(false),[active,setActive]=React.useState(-1);
-  const [loading,setLoading]=React.useState(false),[failed,setFailed]=React.useState(false),[more,setMore]=React.useState(false),[retry,setRetry]=React.useState(0);
-  React.useEffect(()=>{
-    if(value&&query===value.name){setLoading(false);setFailed(false);return;}
-    const controller=new AbortController();let current=true;setLoading(true);setFailed(false);setPlayers([]);setActive(-1);
-    const timer=setTimeout(async()=>{try{
-      const response=await fetch("/api/register/players?"+new URLSearchParams({q:query,limit:"20"}),{credentials:"same-origin",cache:"no-store",signal:controller.signal});
-      if(!response.ok)throw new Error("lookup");const result=await response.json();
-      if(!Array.isArray(result.players))throw new Error("lookup");
-      if(current){setPlayers(result.players);setMore(Boolean(result.has_more));}
-    }catch(error){if(current&&error.name!=="AbortError")setFailed(true);}finally{if(current)setLoading(false);}},180);
-    return()=>{current=false;clearTimeout(timer);controller.abort();};
-  },[query,value?.id,retry]);
-  function choose(player){onChange(player);setQuery(player.name);setOpen(false);setActive(-1);}
-  function keydown(event){
-    if(event.key==="ArrowDown"||event.key==="ArrowUp"){event.preventDefault();setOpen(true);if(players.length)setActive(old=>event.key==="ArrowDown"?(old+1)%players.length:old<0?players.length-1:(old-1+players.length)%players.length);}
-    else if(event.key==="Enter"&&open){event.preventDefault();if(active>=0&&players[active])choose(players[active]);}
-    else if(event.key==="Escape"){event.preventDefault();setOpen(false);setActive(-1);}
-    else if(event.key==="Tab")setOpen(false);
-  }
-  return <div data-registration-picker ref={box} onBlur={event=>{if(!box.current?.contains(event.relatedTarget))setOpen(false);}}>
-    <label htmlFor={id} className="mb-1 block text-sm font-semibold text-zinc-600">{t("Find your player name","搜索已有玩家姓名")}</label>
-    <input id={id} role="combobox" maxLength={128} autoComplete="off" className={inputStyle} value={query} disabled={disabled} aria-autocomplete="list" aria-expanded={open} aria-controls={id+"-list"} aria-activedescendant={open&&active>=0?id+"-option-"+active:undefined} aria-describedby={id+"-help"} onFocus={()=>setOpen(true)} onChange={event=>{setQuery(event.target.value);onChange(null);setOpen(true);setActive(-1);}} onKeyDown={keydown} placeholder={t("Type the name in the club player list","输入社团名单中的玩家姓名")}/>
-    <p id={id+"-help"} className="mt-2 text-sm text-zinc-500">{t("Choose your name from the results. No player number or separate username is needed.","从搜索结果中选择自己的姓名，无需玩家编号，也无需另设用户名。")}</p>
-    {open&&<div className="mt-2 rounded-xl border bg-white p-2">
-      {loading&&<p role="status" className="p-2 text-sm">{t("Searching player names…","正在查找玩家姓名…")}</p>}
-      {failed&&<div role="alert" className="p-2 text-sm text-red-700"><p>{t("Player names could not be loaded. Your input is saved; please retry.","暂时无法加载玩家名单，已保留输入，请重试。")}</p><button type="button" className={buttonStyle+" mt-2"} disabled={disabled} onClick={()=>{setRetry(old=>old+1);document.getElementById(id)?.focus();}}>{t("Retry search","重新搜索")}</button></div>}
-      {!loading&&!failed&&players.length===0&&<p role="status" className="p-2 text-sm">{t("No available player name found. If you already have an account, log in. Otherwise try another spelling or ask an administrator.","未找到可开通账号的玩家姓名。已有账号请登录；否则可换个写法搜索，或联系管理员。")}</p>}
-      <ul role="listbox" id={id+"-list"} aria-label={t("Existing player names","已有玩家姓名")} className="max-h-60 overflow-y-auto">{players.map((player,index)=><li key={player.id} role="presentation"><button id={id+"-option-"+index} role="option" aria-selected={active===index} type="button" tabIndex={-1} className={"block w-full break-words rounded-lg px-3 py-2 text-left "+(active===index?"bg-warm font-bold":"")} onMouseDown={event=>event.preventDefault()} onMouseEnter={()=>setActive(index)} onClick={()=>choose(player)}>{player.name}</button></li>)}</ul>
-      {!loading&&!failed&&more&&<p className="p-2 text-sm text-zinc-500">{t("More names match. Keep typing to narrow the results.","还有更多匹配姓名，请继续输入以缩小范围。")}</p>}
-    </div>}
-    {value&&<p data-selected-claim-player role="status" className="mt-3 break-words rounded-xl bg-warm p-3 text-sm"><strong>{t("Login and display name: ","登录和显示名：")}{value.name}</strong></p>}
-  </div>;
-}
 function RegistrationPage({language,session,authReady,onRefresh}) {
-  const t=(en,cn)=>v10(language,en,cn),[mode,setMode]=React.useState("claim"),[player,setPlayer]=React.useState(null),[message,setMessage]=React.useState(""),[busy,setBusy]=React.useState(false),[pending,setPending]=React.useState(false);
-  const [bind,setBind]=React.useState(false),[available,setAvailable]=React.useState(false),operation=React.useRef(false),resuming=React.useRef(false);
-  const target=safeLoginReturn(new URLSearchParams(location.search).get("redirect_url"));
-  React.useEffect(()=>{if(authReady&&session)location.replace(target);},[authReady,session]);
-  React.useEffect(()=>{fetch("/api/discord/config").then(r=>r.json()).then(r=>setAvailable(r.available)).catch(()=>{});},[]);
-  async function resume() {
-    if(resuming.current)return;resuming.current=true;
-    try {
-      const result=await accountRequest("/api/register/resume",{});
-      if(result.status==="approved"){onRefresh();registrationDestination(result,result.bind_discord);}
-      if(result.status==="pending"||result.status==="approving")setPending(true);
-      if(result.status==="rejected"){setPending(false);setMessage("Your claim was not approved. Please contact an administrator.");}
-    } catch(e){setMessage(e.message);}finally{resuming.current=false;}
-  }
-  React.useEffect(()=>{if(authReady&&!session)resume();},[authReady]);
-  React.useEffect(()=>{if(!pending)return;const timer=setInterval(resume,10000);return()=>clearInterval(timer);},[pending,language]);
+  const t=(en,cn)=>v10(language,en,cn),[message,setMessage]=React.useState(""),[busy,setBusy]=React.useState(false);
+  const [bind,setBind]=React.useState(false),operation=React.useRef(false);
+  const target=loginReturnTarget();
   async function submit(event){
     event.preventDefault();if(operation.current)return;
     const form=event.currentTarget,body=Object.fromEntries(new FormData(form));
-    if(mode==="claim"&&!player){setMessage("Please select your existing player name from the results.");return;}
-    if(body.password!==body.confirm_password){setMessage("Passwords must match.");return;}
     operation.current=true;setBusy(true);setMessage("");
     try{
-      const result=await accountRequest(mode==="claim"?"/api/register/claim":"/api/register",{...body,...(mode==="claim"?{player_id:player.id}:{}),bind_discord:bind,redirect_url:target});
-      form.reset();
-      if(result.status==="pending")setPending(true);
-      else{onRefresh();registrationDestination(result,bind);}
+      const result=await accountRequest("/api/register",{...body,bind_discord:bind,redirect_url:target});
+      form.reset();registrationDestination(result,bind);
     }catch(e){setMessage(e.message);}finally{setBusy(false);operation.current=false;}
   }
   if(authReady&&session)return null;
   return <div data-registration-page data-i18n-owned className="mx-auto max-w-xl"><Card>
     <p className="text-sm font-bold uppercase tracking-widest text-zinc-500">UCSD MAHJONG CLUB</p>
-    <h1 className="my-3 text-3xl font-black">{t("Register","注册")}</h1>
-    {pending?<div role="status" className="space-y-4 rounded-xl bg-warm p-5"><h2 className="text-xl font-bold">{t("Waiting for administrator approval","等待管理员审批")}</h2><p>{t("After an administrator verifies your identity, your existing player name becomes your login and display name. Your original results stay unchanged. Keep this page open, or return on this device to continue automatically.","管理员核实身份后，原玩家姓名就是你的登录名和显示名，原有成绩不会改变。保持此页面开启，或稍后用当前设备返回，系统会自动继续。")}</p><button type="button" className={buttonStyle} onClick={resume}>{t("Check status","检查状态")}</button></div>:<>
-      <div role="tablist" className="my-5 grid grid-cols-2 gap-2">{[["claim","Existing Player","已有玩家开通账号"],["new","New Player","新玩家注册"]].map(([key,en,cn])=><button type="button" role="tab" disabled={busy} aria-selected={mode===key} key={key} onClick={()=>{setMode(key);setMessage("");}} className={"rounded-xl border px-3 py-3 text-sm font-bold sm:text-base "+(mode===key?"bg-navy text-white":"bg-white")}>{t(en,cn)}</button>)}</div>
-      <p className="mb-5 text-sm text-zinc-600">{mode==="claim"?t("Already listed as a club player, even with no games yet? Find your name below and set a password. An administrator will verify your identity; your player record and any original results stay unchanged.","社团名单中已经有你的名字，即使还没有对局记录？请在下方选择原有姓名并设置密码。管理员核实身份后即可登录，玩家资料和原有成绩都将保留。"):t("Your name is not in the club player list yet? Create a player name for both login and display. No email or Discord account is required.","名字尚未录入社团名单？请设置一个用于登录和显示的玩家名称，无需邮箱或 Discord。")}</p>
-      <form onSubmit={submit} className="grid gap-4">
-        {mode==="claim"?<ExistingPlayerPicker language={language} value={player} onChange={setPlayer} disabled={busy}/>:<TournamentField label={t("Player name (for login and display)","玩家名称（用于登录和显示）")}><input name="username" required maxLength={128} autoComplete="username" disabled={busy} className={inputStyle}/></TournamentField>}
-        <TournamentField label={t("Password","密码")}><input name="password" type="password" required minLength={6} maxLength={1024} autoComplete="new-password" className={inputStyle}/></TournamentField>
-        <TournamentField label={t("Confirm password","确认密码")}><input name="confirm_password" type="password" required minLength={6} maxLength={1024} autoComplete="new-password" className={inputStyle}/></TournamentField>
-        <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={bind} onChange={e=>setBind(e.target.checked)}/>{t("Bind Discord Account (Optional)","绑定 Discord（可选）")}</label>
-        {!available&&<p className="text-sm text-zinc-500">{t("Discord is unavailable here. You can skip it and bind later.","此环境暂未启用 Discord，可以跳过并在以后绑定。")}</p>}
-        <button disabled={busy||!authReady||(mode==="claim"&&!player)} className="rounded-xl bg-navy px-4 py-3 font-bold text-white disabled:opacity-50">{busy?t("Submitting…","提交中…"):mode==="claim"?t("Submit for approval","提交审批"):t("Create account","创建账号")}</button>
-      </form>
-    </>}
+    <h1 className="my-3 text-3xl font-black">{t("New member registration","新成员注册")}</h1>
+    <p className="mb-5 text-sm text-zinc-600">{t("Already on the club player list? Go back to sign in and select your name. Register here only if you are a new player.","如果你已经在俱乐部玩家名单中，请返回登录并选择自己的姓名。只有新玩家才需要在这里注册。")}</p>
+    <form onSubmit={submit} className="grid gap-4">
+      <TournamentField label={t("Player name","玩家名称")}><input name="username" required maxLength={128} autoComplete="username" disabled={busy} className={inputStyle}/></TournamentField>
+      <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={bind} onChange={e=>setBind(e.target.checked)}/>{t("Bind Discord Account (Optional)","绑定 Discord（可选）")}</label>
+      <button disabled={busy||!authReady} className="rounded-xl bg-navy px-4 py-3 font-bold text-white disabled:opacity-50">{busy?t("Creating account…","正在创建账号……"):t("Create account","创建账号")}</button>
+    </form>
     {message&&<p role="alert" className="mt-4 text-sm text-red-700">{registrationMessage(language,message)}</p>}
-    <p className="mt-6 text-sm"><a className="underline" href={globalLoginUrl(target)}>{t("Already registered? Log In","已有账号？登录")}</a></p>
+    <p className="mt-6 text-sm"><a className="underline" href={globalLoginUrl(target)}>{t("Already a club member? Choose your name","已经是俱乐部成员？选择姓名登录")}</a></p>
   </Card></div>;
 }
 function DiscordOptional({language,target="/",complete=false}) {

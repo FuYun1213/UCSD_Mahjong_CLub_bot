@@ -1,16 +1,22 @@
 import os
 import re
 import sqlite3
+import threading
 from pathlib import Path
 
 from mmr import compute_one_table
 
 
 DEFAULT_DB_FILE = Path(__file__).resolve().parent / "mahjong.sqlite3"
+DISCORD_SCORE_PAUSED_KEY = "discord_score_paused"
 
 
 def normalize_name(value):
     return " ".join(str(value or "").casefold().split())
+
+
+_SCHEMA_VERSIONS = {}
+_SCHEMA_LOCK = threading.RLock()
 
 
 def connect(db_file=None):
@@ -18,8 +24,18 @@ def connect(db_file=None):
     connection = sqlite3.connect(str(path))
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA busy_timeout=5000")
-    init_db(connection)
-    return connection
+    try:
+        with _SCHEMA_LOCK:
+            stat = path.stat()
+            key = (str(path.resolve()), stat.st_ino)
+            version = connection.execute("PRAGMA schema_version").fetchone()[0]
+            if _SCHEMA_VERSIONS.get(key) != version:
+                init_db(connection)
+                _SCHEMA_VERSIONS[key] = connection.execute("PRAGMA schema_version").fetchone()[0]
+        return connection
+    except BaseException:
+        connection.close()
+        raise
 
 
 def init_db(connection):
@@ -74,6 +90,11 @@ def init_db(connection):
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS game_score_summaries (
+            game_id INTEGER PRIMARY KEY REFERENCES games(id),
+            payload_json TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS yakuman_records (
@@ -292,6 +313,19 @@ def set_config(connection, key, value):
     connection.commit()
 
 
+def discord_score_paused(connection):
+    # A missing setting keeps the existing Discord command enabled. An
+    # unexpected stored value fails closed until an administrator resets it.
+    return get_config(connection, DISCORD_SCORE_PAUSED_KEY, "0") != "0"
+
+
+def set_discord_score_paused(connection, paused):
+    if type(paused) is not bool:
+        raise ValueError("paused must be a boolean")
+    set_config(connection, DISCORD_SCORE_PAUSED_KEY, "1" if paused else "0")
+    return paused
+
+
 def set_current_quarter(connection, quarter):
     quarter = str(quarter or "").strip()
     if not quarter:
@@ -336,7 +370,7 @@ def quarters(connection):
     return values
 
 
-def import_game(connection, names, scores, played_at, source="sheet", sheet_row=None, created_by="sync", yakuman=None, quarter="", seat_winds=None, source_seat_order="unknown", nfc_match_id=None, started_at=None, ended_at=None, duration_seconds=None, authoritative_played_at=None, played_at_source=None):
+def import_game(connection, names, scores, played_at, source="sheet", sheet_row=None, created_by="sync", yakuman=None, quarter="", seat_winds=None, source_seat_order="unknown", nfc_match_id=None, started_at=None, ended_at=None, duration_seconds=None, authoritative_played_at=None, played_at_source=None, summary_time=None):
     if nfc_match_id:
         existing = connection.execute("SELECT id FROM games WHERE nfc_match_id = ?", (nfc_match_id,)).fetchone()
         if existing:
@@ -365,6 +399,7 @@ def import_game(connection, names, scores, played_at, source="sheet", sheet_row=
     except ValueError:
         actual_time = None  # Preserve legacy imports; unknown event time is not competition eligible.
 
+    pre_status = player_status_map(connection, names) if source != "sheet" else None
     players = [upsert_player(connection, name) for name in names]
     mmrs = [player["current_mmr"] for player in players]
     result = compute_one_table(scores, mmrs)
@@ -446,6 +481,14 @@ def import_game(connection, names, scores, played_at, source="sheet", sheet_row=
             (mmr_after, total_pt, history_highest_pt, history_highest_mmr, 1 if placement == 1 else 0, player["id"]),
         )
 
+    if pre_status is not None:
+        import json
+        from game_summary import build_game_summary
+        payload = build_game_summary(names, scores, summary_time or played_at, pre_status,
+            player_status_map(connection, names), yakuman.get("winner", ""),
+            yakuman.get("deal_in", ""), yakuman.get("text", ""))
+        connection.execute("INSERT INTO game_score_summaries(game_id, payload_json) VALUES (?, ?)",
+                           (game_id, json.dumps(payload, ensure_ascii=False)))
     connection.commit()
     yakuman_names = yakuman.get("names") if isinstance(yakuman.get("names"), list) else []
     if not yakuman_names and yakuman.get("text"):
@@ -619,7 +662,7 @@ def find_game_for_yakuman(connection, played_at, winner, players=None):
 
 def ranking(connection, kind="quarter_pt", limit=25, quarter=None):
     quarter = quarter or latest_quarter(connection)
-    if kind in {"quarter_pt", "quarter_mmr"} and quarter:
+    if kind in {"quarter_pt", "quarter_mmr", "quarter_games"} and quarter:
         return quarter_ranking(connection, kind=kind, quarter=quarter, limit=limit)
 
     column_by_kind = {
@@ -628,6 +671,8 @@ def ranking(connection, kind="quarter_pt", limit=25, quarter=None):
         "total_mmr": "current_mmr",
         "total_pt": "total_pt",
         "history_highest_mmr": "history_highest_mmr",
+        "quarter_games": "games_played",
+        "total_games": "games_played",
     }
     label_by_kind = {
         "quarter_pt": "Quarter PT",
@@ -635,11 +680,13 @@ def ranking(connection, kind="quarter_pt", limit=25, quarter=None):
         "total_mmr": "Total MMR",
         "total_pt": "Total PT",
         "history_highest_mmr": "History Highest MMR",
+        "quarter_games": "Quarter Games",
+        "total_games": "Total Games",
     }
     column = column_by_kind.get(kind, "total_pt")
     rows = connection.execute(
         f"""
-        SELECT name, {column} AS value, wins
+        SELECT name, {column} AS value, wins, games_played AS games
         FROM players
         WHERE games_played > 0
         ORDER BY {column} DESC, name COLLATE NOCASE ASC
@@ -653,6 +700,7 @@ def ranking(connection, kind="quarter_pt", limit=25, quarter=None):
             "value": format_number(row["value"]),
             "label": label_by_kind.get(kind, "Quarter PT"),
             "wins": row["wins"],
+            "games": row["games"],
             "rank": index,
         }
         for index, row in enumerate(rows, 1)
@@ -671,7 +719,7 @@ def quarter_ranking(connection, kind="quarter_pt", quarter="", limit=25):
                 GROUP BY gp.player_id
             ),
             wins AS (
-                SELECT gp.player_id, SUM(CASE WHEN gp.placement = 1 THEN 1 ELSE 0 END) AS wins
+                SELECT gp.player_id, SUM(CASE WHEN gp.placement = 1 THEN 1 ELSE 0 END) AS wins, COUNT(*) AS games
                 FROM game_players gp
                 JOIN games g ON g.id = gp.game_id
                 WHERE g.quarter = ?
@@ -679,7 +727,7 @@ def quarter_ranking(connection, kind="quarter_pt", quarter="", limit=25):
             )
             SELECT p.name,
                    gp.mmr_after AS value,
-                   COALESCE(wins.wins, 0) AS wins
+                   COALESCE(wins.wins, 0) AS wins, wins.games AS games
             FROM latest
             JOIN game_players gp ON gp.player_id = latest.player_id AND gp.game_id = latest.latest_game_id
             JOIN players p ON p.id = latest.player_id
@@ -695,19 +743,20 @@ def quarter_ranking(connection, kind="quarter_pt", quarter="", limit=25):
                 "value": format_number(row["value"]),
                 "label": "Quarter MMR",
                 "wins": row["wins"],
+                "games": row["games"],
                 "rank": index,
             }
             for index, row in enumerate(rows, 1)
         ]
     else:
-        metric_expr = "SUM(gp.pt_delta)"
-        label = "Quarter PT"
+        metric_expr = "COUNT(*)" if kind == "quarter_games" else "SUM(gp.pt_delta)"
+        label = "Quarter Games" if kind == "quarter_games" else "Quarter PT"
 
     rows = connection.execute(
         f"""
         SELECT p.name,
                {metric_expr} AS value,
-               SUM(CASE WHEN gp.placement = 1 THEN 1 ELSE 0 END) AS wins
+               SUM(CASE WHEN gp.placement = 1 THEN 1 ELSE 0 END) AS wins, COUNT(*) AS games
         FROM game_players gp
         JOIN players p ON p.id = gp.player_id
         JOIN games g ON g.id = gp.game_id
@@ -725,6 +774,7 @@ def quarter_ranking(connection, kind="quarter_pt", quarter="", limit=25):
             "value": format_number(row["value"]),
             "label": label,
             "wins": row["wins"],
+            "games": row["games"],
             "rank": index,
         }
         for index, row in enumerate(rows, 1)
@@ -820,15 +870,29 @@ def replace_name_list_text(value, old_name, new_name):
     return " / ".join(output), changed
 
 
-def update_name_references(connection, old_name, new_name):
+def replace_delimited_name_text(value, old_name, new_name):
+    """Replace exact name tokens while preserving comma/slash list formatting."""
     old_key = normalize_name(old_name)
+    pieces = re.split(r"([/,，])", str(value or ""))
+    changed = False
+    for index in range(0, len(pieces), 2):
+        token = pieces[index]
+        match = re.fullmatch(r"(\s*)(.*?)(\s*)", token, flags=re.DOTALL)
+        if match and normalize_name(match.group(2)) == old_key:
+            pieces[index] = match.group(1) + new_name + match.group(3)
+            changed = True
+    return "".join(pieces), changed
+
+
+def update_name_references(connection, old_name, new_name):
     for table_name, column_name in [("games", "yakuman_winner"), ("games", "yakuman_deal_in"), ("yakuman_records", "deal_in")]:
         rows = connection.execute(f"SELECT id, {column_name} AS value FROM {table_name}").fetchall()
         for row in rows:
-            if normalize_name(row["value"]) == old_key:
+            updated, changed = replace_delimited_name_text(row["value"], old_name, new_name)
+            if changed:
                 connection.execute(
                     f"UPDATE {table_name} SET {column_name} = ? WHERE id = ?",
-                    (new_name, row["id"]),
+                    (updated, row["id"]),
                 )
 
     rows = connection.execute("SELECT id, players_text FROM yakuman_records").fetchall()
@@ -864,19 +928,13 @@ def rename_player(connection, old_name, new_name, *, commit=True):
     return {"old_name": source["name"], "new_name": new_name}
 
 
-def merge_players(connection, source_name, target_name):
-    source_key = normalize_name(source_name)
-    target_key = normalize_name(target_name)
-    if not source_key or not target_key:
-        raise ValueError("Both source and target player names are required.")
-    if source_key == target_key:
-        raise ValueError("Source and target are the same player.")
-    source = connection.execute("SELECT * FROM players WHERE name_key = ?", (source_key,)).fetchone()
-    target = connection.execute("SELECT * FROM players WHERE name_key = ?", (target_key,)).fetchone()
+def _merge_player_rows(connection, source, target):
     if not source:
         raise ValueError("Source player was not found in SQL.")
     if not target:
         raise ValueError("Target player was not found in SQL.")
+    if int(source["id"]) == int(target["id"]):
+        raise ValueError("Source and target are the same player.")
 
     conflicts = connection.execute(
         """
@@ -897,10 +955,45 @@ def merge_players(connection, source_name, target_name):
     connection.execute("UPDATE game_players SET player_id = ? WHERE player_id = ?", (target["id"], source["id"]))
     connection.execute("UPDATE yakuman_records SET winner_id = ? WHERE winner_id = ?", (target["id"], source["id"]))
     update_name_references(connection, source["name"], target["name"])
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='account_creation_intents'").fetchone():
+        # Creation intents are recovery journals, not historical score data. A
+        # merged source can no longer be published as a separate player.
+        connection.execute("DELETE FROM account_creation_intents WHERE player_id = ?", (source["id"],))
     connection.execute("DELETE FROM players WHERE id = ?", (source["id"],))
     recompute_all_games(connection)
     connection.commit()
-    return {"source": source["name"], "target": target["name"]}
+    return {"source": source["name"], "target": target["name"],
+            "source_player_id": int(source["id"]), "target_player_id": int(target["id"])}
+
+
+def merge_player_ids(connection, source_player_id, target_player_id):
+    try:
+        source_id, target_id = int(source_player_id), int(target_player_id)
+    except (TypeError, ValueError):
+        raise ValueError("Both source and target player IDs are required.") from None
+    if source_id <= 0 or target_id <= 0:
+        raise ValueError("Both source and target player IDs are required.")
+    source = connection.execute("SELECT * FROM players WHERE id = ?", (source_id,)).fetchone()
+    target = connection.execute("SELECT * FROM players WHERE id = ?", (target_id,)).fetchone()
+    if not source:
+        raise ValueError("Source player was not found in SQL.")
+    if not target:
+        raise ValueError("Target player was not found in SQL.")
+    return _merge_player_rows(connection, source, target)
+
+
+def merge_players(connection, source_name, target_name):
+    source_key = normalize_name(source_name)
+    target_key = normalize_name(target_name)
+    if not source_key or not target_key:
+        raise ValueError("Both source and target player names are required.")
+    source = connection.execute("SELECT * FROM players WHERE name_key = ?", (source_key,)).fetchone()
+    target = connection.execute("SELECT * FROM players WHERE name_key = ?", (target_key,)).fetchone()
+    if not source:
+        raise ValueError("Source player was not found in SQL.")
+    if not target:
+        raise ValueError("Target player was not found in SQL.")
+    return _merge_player_rows(connection, source, target)
 
 
 def game_mmr_deltas(connection, game_id):
@@ -969,7 +1062,7 @@ def recompute_all_games(connection):
     for game in game_rows:
         player_rows = connection.execute(
             """
-            SELECT p.name, gp.final_score
+            SELECT p.name, gp.*
             FROM game_players gp
             JOIN players p ON p.id = gp.player_id
             WHERE gp.game_id = ?
@@ -977,11 +1070,10 @@ def recompute_all_games(connection):
             """,
             (game["id"],),
         ).fetchall()
-        if len(player_rows) != 4:
-            continue
         snapshots.append(
             {
                 "game": game,
+                "rows": player_rows,
                 "names": [row["name"] for row in player_rows],
                 "scores": [row["final_score"] for row in player_rows],
             }
@@ -1004,6 +1096,27 @@ def recompute_all_games(connection):
     for item in snapshots:
         game = item["game"]
         players = [upsert_player(connection, name) for name in item["names"]]
+        if len(item["rows"]) != 4:
+            # Preserve uncommon imported rows verbatim. Older rebuilds silently
+            # dropped them merely because they were not four-player games.
+            for player, row in zip(players, item["rows"]):
+                connection.execute(
+                    """INSERT INTO game_players (
+                           game_id,player_id,rank_order,final_score,placement,
+                           mmr_before,mmr_delta,mmr_after,pt_delta,seat_wind,source_position
+                       ) VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    (game["id"], player["id"], row["rank_order"], row["final_score"], row["placement"],
+                     row["mmr_before"], row["mmr_delta"], row["mmr_after"], row["pt_delta"],
+                     row["seat_wind"], row["source_position"]),
+                )
+                total_pt = float(player["total_pt"]) + float(row["pt_delta"] or 0)
+                connection.execute("""UPDATE players SET current_mmr=?,total_pt=?,
+                    history_highest_pt=MAX(history_highest_pt,?),
+                    history_highest_mmr=MAX(history_highest_mmr,?,1500),
+                    games_played=games_played+1,wins=wins+?,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                    (row["mmr_after"], total_pt, total_pt, row["mmr_after"],
+                     1 if int(row["placement"]) == 1 else 0, player["id"]))
+            continue
         mmrs = [player["current_mmr"] for player in players]
         result = compute_one_table(item["scores"], mmrs)
         placements = placements_from_scores(item["scores"])
@@ -1019,11 +1132,13 @@ def recompute_all_games(connection):
                 """
                 INSERT INTO game_players (
                     game_id, player_id, rank_order, final_score, placement,
-                    mmr_before, mmr_delta, mmr_after, pt_delta
+                    mmr_before, mmr_delta, mmr_after, pt_delta, seat_wind, source_position
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (game["id"], player["id"], index, int(item["scores"][index]), placement, float(player["current_mmr"]), delta, mmr_after, point_delta),
+                (game["id"], player["id"], index, int(item["scores"][index]), placement,
+                 float(player["current_mmr"]), delta, mmr_after, point_delta,
+                 item["rows"][index]["seat_wind"], item["rows"][index]["source_position"]),
             )
             connection.execute(
                 """
@@ -1043,32 +1158,45 @@ def recompute_all_games(connection):
 
 
 def revert_game(connection, game_id, recompute_following=True):
-    rows = connection.execute(
-        """
-        SELECT gp.player_id, p.name
-        FROM game_players gp
-        JOIN players p ON p.id = gp.player_id
-        WHERE gp.game_id = ?
-        ORDER BY gp.rank_order ASC
-        """,
-        (game_id,),
-    ).fetchall()
-    if not rows:
-        raise ValueError("Could not find that SQL game record.")
+    # Every caller, including Discord and maintenance scripts, must honor the
+    # NFC score ledger and reservation accounting boundary. Lock before the
+    # lookup so a projected row cannot change identity before deletion.
+    started_here = not connection.in_transaction
+    if started_here:
+        connection.execute("BEGIN IMMEDIATE")
+    try:
+        original = connection.execute(
+            "SELECT nfc_match_id FROM games WHERE id=?", (game_id,)).fetchone()
+        if original and original["nfc_match_id"]:
+            raise ValueError("NFC scores cannot be reverted here. Contact an administrator for coordinated score correction.")
+        rows = connection.execute(
+            """
+            SELECT gp.player_id, p.name
+            FROM game_players gp
+            JOIN players p ON p.id = gp.player_id
+            WHERE gp.game_id = ?
+            ORDER BY gp.rank_order ASC
+            """,
+            (game_id,),
+        ).fetchall()
+        if not rows:
+            raise ValueError("Could not find that SQL game record.")
 
-    original = connection.execute("SELECT nfc_match_id FROM games WHERE id=?", (game_id,)).fetchone()
-    key = "match:" + original["nfc_match_id"] if original and original["nfc_match_id"] else "club:" + str(game_id)
-    connection.execute("INSERT OR IGNORE INTO competition_game_tombstones VALUES(?,?,CURRENT_TIMESTAMP)", (key,"game_record_reverted"))
-    connection.execute("DELETE FROM yakuman_records WHERE game_id = ?", (game_id,))
-    connection.execute("DELETE FROM game_players WHERE game_id = ?", (game_id,))
-    connection.execute("DELETE FROM games WHERE id = ?", (game_id,))
-    if recompute_following:
-        recompute_all_games(connection)
-    else:
-        recompute_player_aggregates(connection, [row["player_id"] for row in rows])
-        connection.commit()
-
-    return [row["name"] for row in rows]
+        key = "club:" + str(game_id)
+        connection.execute("INSERT OR IGNORE INTO competition_game_tombstones VALUES(?,?,CURRENT_TIMESTAMP)", (key,"game_record_reverted"))
+        connection.execute("DELETE FROM yakuman_records WHERE game_id = ?", (game_id,))
+        connection.execute("DELETE FROM game_players WHERE game_id = ?", (game_id,))
+        connection.execute("DELETE FROM games WHERE id = ?", (game_id,))
+        if recompute_following:
+            recompute_all_games(connection)
+        else:
+            recompute_player_aggregates(connection, [row["player_id"] for row in rows])
+            connection.commit()
+        return [row["name"] for row in rows]
+    except BaseException:
+        if started_here and connection.in_transaction:
+            connection.rollback()
+        raise
 
 
 def recent_revert_candidates(connection, limit=12):
@@ -1129,8 +1257,16 @@ def admin_game_rows(connection, page=1, per_page=10, played_at="", player_names=
     filters = []
     params = []
     if target_date:
-        filters.append("substr(g.played_at, 1, 10) = ?")
-        params.append(target_date)
+        try:
+            from competition_time import local_day_utc_bounds
+            start_at, end_at = local_day_utc_bounds(target_date, zone="America/Los_Angeles")
+            # NFC game times are stored in UTC. Keep the date-prefix clause for
+            # older rows whose timestamps were stored as local, timezone-free text.
+            filters.append("((g.played_at >= ? AND g.played_at < ?) OR substr(g.played_at, 1, 10) = ?)")
+            params.extend((start_at, end_at, target_date))
+        except ValueError:
+            filters.append("substr(g.played_at, 1, 10) = ?")
+            params.append(target_date)
     where = f"WHERE {' AND '.join(filters)}" if filters else ""
     player_join = ""
     player_having = ""
@@ -1161,7 +1297,7 @@ def admin_game_rows(connection, page=1, per_page=10, played_at="", player_names=
     total = total_row["count"] if total_row else 0
     games = connection.execute(
         f"""
-        SELECT id, played_at, sheet_row, created_by, quarter, yakuman_winner, yakuman_deal_in, yakuman_text
+        SELECT id, played_at, sheet_row, created_by, quarter, yakuman_winner, yakuman_deal_in, yakuman_text, nfc_match_id
         FROM (
             SELECT g.*
             FROM games g
@@ -1205,6 +1341,7 @@ def admin_game_rows(connection, page=1, per_page=10, played_at="", player_names=
                 "sheet_row": game["sheet_row"],
                 "created_by": game["created_by"] or "",
                 "quarter": game["quarter"] or "",
+                "can_revert": not bool(game["nfc_match_id"]),
                 "yakuman_winner": game["yakuman_winner"] or "",
                 "yakuman_deal_in": game["yakuman_deal_in"] or "",
                 "yakuman_text": game["yakuman_text"] or "",

@@ -206,7 +206,7 @@ def test_real_http_permissions_origin_cookie_revocation_and_secret_projection(re
 
 def test_recovery_flow_and_admin_notification_link_in_browser(recovery_website):
     url,messages,_=recovery_website
-    env={**os.environ,"NFC_TEST_URL":url,"NODE_PATH":str(Path('.venv-api/browser-tests/node_modules').resolve())}
+    env={**os.environ,"NFC_TEST_URL":url,"NODE_PATH":str(Path(os.environ.get('NODE_PATH') or '.venv-api/browser-tests/node_modules').resolve())}
     result=subprocess.run(['node','tests/browser_password_reset.cjs'],env=env,capture_output=True,text=True,encoding='utf-8',timeout=160)
     assert result.returncode==0,result.stdout+result.stderr
     assert len(messages)==1 and messages[0][1]=="/channels/1488771447915544586/messages"

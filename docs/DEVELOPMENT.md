@@ -11,7 +11,7 @@ python -m pip install -r requirements-api-vision.txt
 python scripts/run_web_with_scores.py --port 8000 --api-port 8001
 ```
 
-它启动网页和私有 FastAPI，不启动 Discord bot；普通前端需要访问 React、Babel、Tailwind CDN。空数据库没有线上玩家或成绩。公开 demo 密码不用于此模式；实际管理角色须通过可信的数据初始化流程设置。旧系统有按姓名识别历史管理员的兼容逻辑，自建站点前应审阅 `web_server.py` 中的 `DEFAULT_ADMINS` / `DEFAULT_SUPER_ADMINS`，并改为自己的管理策略。
+它启动网页和私有 FastAPI，不启动 Discord bot；普通前端使用仓库内已构建资源；重新构建使用 `npm ci --prefix scripts/web-build` 和 `npm run build:web`（Node.js 24.11+）。空数据库没有线上玩家或成绩。公开 demo 密码不用于此模式；实际管理角色须通过可信的数据初始化流程设置。旧系统有按姓名识别历史管理员的兼容逻辑，自建站点前应审阅 `web_server.py` 中的 `DEFAULT_ADMINS` / `DEFAULT_SUPER_ADMINS`，并改为自己的管理策略。
 
 ## 数据与配置
 

@@ -74,6 +74,7 @@ class RelativeSubmission(BaseModel):
     table: TableId
     scores: RelativeScores
     match_id: str | None = Field(default=None, min_length=1, max_length=64)
+    viewpoint_seat: Seat | None = None
 
     @field_validator("table", mode="before")
     @classmethod

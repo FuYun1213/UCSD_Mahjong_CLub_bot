@@ -390,3 +390,38 @@ def test_sync_warning_hides_provider_error_but_business_validation_stays_readabl
     audit = {"recent_actions":[{"payload":{"sheet_error":secret,"sheet_errors":[secret]}}]}
     assert secret not in json.dumps(web_server.public_response_body(audit))
     assert audit["recent_actions"][0]["payload"]["sheet_error"] == secret
+
+
+@pytest.mark.parametrize("new_name", ["Updated Person", "Player"])
+def test_rename_rebuilds_actual_substring_index_including_shorter_names(directory, new_name):
+    path, _ = directory
+    uid = account(path, "Original Player")
+    account(path, "Admin", role="admin")
+    assert names.search_accounts(path, "Original Player")["users"] == [{"id":uid,"name":"Original Player","avatar":""}]
+    web_server.admin_registered_name({"user_id":uid,"expected_name":"Original Player",
+        "new_name":new_name,"confirm":True}, "Admin")
+    expected = [{"id":uid,"name":new_name,"avatar":""}]
+    assert names.search_accounts(path, new_name)["users"] == expected
+    assert names.search_accounts(path, "Original Player")["users"] == []
+    assert names.search_accounts(path, new_name[-4:])["users"] == expected
+    with sqlite3.connect(names.database_path(path)) as db:
+        indexed = {row[0] for row in db.execute("SELECT suffix FROM registered_name_suffixes WHERE account_id=?", (uid,))}
+    normalized = names.normalize_name(new_name)
+    assert indexed == {normalized[index:] for index in range(len(normalized))}
+
+
+def test_directory_restart_repairs_preexisting_rename_suffix_mismatch(directory):
+    path, _ = directory
+    uid = account(path, "Current Name")
+    names.ensure_directory(path)
+    # Older builds reserved the new directory name before syncing the suffixes;
+    # simulate the resulting durable mismatch and a fresh process cache.
+    previous = "previous player"
+    with sqlite3.connect(names.database_path(path)) as db:
+        db.execute("DELETE FROM registered_name_suffixes WHERE account_id=?", (uid,))
+        db.executemany("INSERT INTO registered_name_suffixes(suffix,account_id) VALUES(?,?)",
+                       [(previous[index:], uid) for index in range(len(previous))])
+    names._DIRECTORY_VERSIONS.pop(str(path.resolve()), None)
+    assert names.search_accounts(path, "Current Name")["users"] == [{"id":uid,"name":"Current Name","avatar":""}]
+    assert names.search_accounts(path, previous)["users"] == []
+    assert names.read_accounts(path)["users"]["current name"]["password_hash"] == "private-hash"

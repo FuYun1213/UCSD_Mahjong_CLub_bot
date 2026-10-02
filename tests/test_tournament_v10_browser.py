@@ -19,7 +19,7 @@ def test_placement_guest_tournament_browser(website, tmp_path, monkeypatch):
     accounts = registered_names.read_accounts(web_server.USERS_FILE)
     accounts["users"]["photo1"]["role"] = "admin"
     registered_names.write_accounts(web_server.USERS_FILE, accounts)
-    env = {**os.environ, "NFC_TEST_URL": url, "NODE_PATH": str(Path(".venv-api/browser-tests/node_modules").resolve())}
+    env = {**os.environ, "NFC_TEST_URL": url, "NODE_PATH": str(Path(os.environ.get("NODE_PATH") or ".venv-api/browser-tests/node_modules").resolve())}
     result = subprocess.run(["node", "tests/browser_tournament_v10.cjs"], env=env, capture_output=True,
                             text=True, encoding="utf-8", timeout=240)
     assert result.returncode == 0, result.stdout + result.stderr

@@ -1,6 +1,6 @@
 """One transactional membership policy for ordinary seats and tournament check-ins."""
 import json
-import threading
+from request_performance import TimedRLock
 from uuid import uuid4, uuid5, NAMESPACE_URL
 from sqlalchemy import select, func, update
 from sqlalchemy.exc import IntegrityError
@@ -10,7 +10,7 @@ from .tournament_models import Tournament, TournamentTableSession
 from .models import SEATS
 from .store import Conflict, now
 
-membership_lock = threading.RLock()
+membership_lock = TimedRLock('memberLockWaitMs')
 
 
 def check(condition, code):
@@ -138,10 +138,10 @@ def claim_member(db, table, match_id, user, actor, method, timestamp=None, seat=
     return row, True
 
 
-def release_member(db, row, actor, reason, timestamp=None):
+def release_member(db, row, actor, reason, timestamp=None, action="left"):
     from .seat_swap_state import invalidate_swaps
     invalidate_swaps(db, row.table_id, user_ids=[row.user_id], reason="member_left", actor=actor, timestamp=timestamp)
-    event(db, row.table_id, row.match_id, row.user_id, actor, "left", row.join_method, timestamp or now(), reason, seat=row.seat)
+    event(db, row.table_id, row.match_id, row.user_id, actor, action, row.join_method, timestamp or now(), reason, seat=row.seat)
     db.delete(row)
     db.flush()
 
@@ -186,11 +186,14 @@ def ordinary_join(db, score_table, user, actor, method, seat=None):
         db.flush()
     db.add(SeatRecord(table_id=score_table.table_id, seat=seat, user_id=str(user.id), user_name=user.name))
     db.flush()
-    score_table.updated_at, score_table.dirty = now(), 1
+    score_table.updated_at, score_table.dirty = now(), 0
     if db.scalar(select(func.count()).select_from(SeatRecord).where(SeatRecord.table_id == score_table.table_id)) == 4:
         score_table.started_at = score_table.updated_at
         from .seat_swap_state import invalidate_swaps
         invalidate_swaps(db, table.id, reason="table_already_started", actor=actor, timestamp=score_table.updated_at)
+        from .game_flow import ensure_game_round
+        ensure_game_round(db, table, score_table,
+                          timestamp=score_table.started_at, actor_id=actor)
     return seat
 
 
@@ -244,7 +247,7 @@ def ordinary_set_my_seat(db, table, user, seat, expected_match_id=None, join_met
             db.flush()
     except IntegrityError:
         raise Conflict("seat_occupied", "seat_occupied") from None
-    score.updated_at, score.dirty = stamp, 1
+    score.updated_at, score.dirty = stamp, 0
     return "moved", old_seat
 
 
@@ -267,5 +270,5 @@ def ordinary_leave(db, table, user, reason="voluntary", expected_match_id=None):
     if seat:
         db.delete(seat)
     release_member(db, row, user.id, reason)
-    score.updated_at, score.dirty = now(), 1
+    score.updated_at, score.dirty = now(), 0
     return True

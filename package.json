@@ -4,10 +4,13 @@
   "private": true,
   "description": "Local web preview and browser regression tests",
   "license": "MIT",
-  "engines": { "node": ">=20" },
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "build:preview": "node scripts/build_challenge_preview.cjs",
-    "install:browsers": "playwright install chromium"
+    "install:browsers": "playwright install chromium",
+    "build:web": "node scripts/build_web.cjs"
   },
   "devDependencies": {
     "@babel/core": "^7.26.0",

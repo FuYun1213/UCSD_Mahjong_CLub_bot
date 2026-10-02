@@ -1,0 +1,6 @@
+heic-to 1.5.2, Copyright Hopper Gee and contributors; LGPL-3.0.
+Unmodified IIFE bundle, loaded only when native HEIC decoding is unavailable.
+Upstream and corresponding source/build instructions: https://github.com/hoppergee/heic-to/tree/v1.5.2
+Package source archive: https://registry.npmjs.org/heic-to/-/heic-to-1.5.2.tgz
+Uses libheif 1.22.2: https://github.com/strukturag/libheif/tree/v1.22.2
+License: /vendor/heic-to-LICENSE.txt

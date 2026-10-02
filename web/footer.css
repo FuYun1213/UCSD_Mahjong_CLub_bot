@@ -1,0 +1,4 @@
+/* Static legal content stays in document flow, including on small screens. */
+.club-footer{box-sizing:border-box;max-width:1280px;margin:24px auto 0;padding:24px max(20px,env(safe-area-inset-right)) max(28px,env(safe-area-inset-bottom)) max(20px,env(safe-area-inset-left));border-top:1px solid #dddcd4;color:#53605b;font:14px/1.65 system-ui,sans-serif;overflow-wrap:anywhere}
+.club-footer p{margin:0;max-width:100ch}
+.club-footer-embedded .club-footer{display:none}

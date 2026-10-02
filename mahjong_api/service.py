@@ -13,6 +13,7 @@ from .scoring import calculate_match_result
 from .sheets import SheetsSink
 from .store import Conflict, Store, now, elapsed
 from .score_mapping import display_units, map_and_normalize, relative_to_absolute
+from .discord_score_notify import schedule_score_notification
 
 
 logger = logging.getLogger(__name__)
@@ -27,64 +28,38 @@ class MatchService:
         self.settings = settings
         from .table_membership import membership_lock
         self.lock = membership_lock
-        target = json.dumps([settings.spreadsheet_id, settings.current_sheet, settings.history_sheet]) if sheets.enabled else "disabled"
-        store.configure_sync_target(target)
+        from .history_delivery import HistoryDispatcher
+        self.history = HistoryDispatcher(store, sheets)
+        store.recover_local_settlements()
 
     def flush(self):
-        """Serialize remote writes and seat changes to prevent stale clears.
-
-        main.py enforces one process per database. Pending records are committed
-        before network I/O so retries survive process restarts.
-        """
-        with self.lock:
-            for match in self.store.pending_matches():
-                try:
-                    self.sheets.write_history(match)
-                    self.store.finish_history(match["match_id"])
-                except Exception:
-                    logger.exception("History sync failed for match %s; retained for retry", match["match_id"])
-                    break
-            for table in self.store.dirty_tables():
-                try:
-                    self.sheets.write_current(table)
-                    self.store.finish_current(table["table_id"])
-                except Exception:
-                    logger.exception("Current table sync failed for table %s; retained for retry", table["table_id"])
-                    break
-            return self.store.pending_counts()
+        """Background-only historical delivery. Never acquire the membership lock."""
+        self.history.flush(limit=10)
+        remaining = self.store.pending_counts()
+        remaining["history_deliveries"] = self.history.pending_counts()["history_deliveries"]
+        return remaining
 
     def sit(self, table_id: str, seat: str, user: User):
         with self.lock:
-            affected = self.store.sit(table_id, seat, user)
-            self.flush()
+            self.store.sit(table_id, seat, user)
             table = self.store.table(table_id)
-            pending = any(self.store.table(item)["dirty"] for item in affected)
             return {
-                "status": "pending" if pending else "success",
-                "message": f"已就坐 {table_id}号桌 {SEAT_NAMES[seat]}风，等待 Google Sheets 同步" if pending else f"成功就坐 {table_id}号桌 {SEAT_NAMES[seat]}风",
-                "user": user.name,
-                "user_id": user.id,
+                "status": "success",
+                "message": f"成功就坐 {table_id}号桌 {SEAT_NAMES[seat]}风",
+                "user": user.name, "user_id": user.id,
                 "match_id": table["current_match_id"],
-                "sync_status": "pending" if pending else ("synced" if self.sheets.enabled else "disabled"),
-            }, 202 if pending else 200
+                "sync_status": "not_required",
+            }, 200
 
     def submit(self, payload: SubmitScores, request_key: str | None):
         with self.lock:
             scores = payload.scores.model_dump()
             points = calculate_match_result(scores, self.settings.initial_points)
             match_id, replayed = self.store.stage_match(payload.table, scores, points, payload.match_id, request_key)
-            self.flush()
-            external = self.external.send("nfc-" + match_id) if self.external.get("nfc-" + match_id) else None
-            match = self.store.match(match_id)
-            pending = not (match["history_synced"] and match["clear_synced"])
-            return {
-                "status": "pending" if pending else "success",
-                "message": "分数已保存，等待 Google Sheets 同步" if pending else ("该对局已结算，返回已有结果" if replayed else "结算完成，座位已清空"),
-                "sync_status": "pending" if pending else ("synced" if self.sheets.enabled else "disabled"),
-                "local_saved": True, "external_sync": external,
-                "replayed": replayed,
-                "result": match["result"],
-            }, 202 if pending else 200
+            response = self._match_response(match_id, replayed)
+            if not replayed:
+                schedule_score_notification(response[0]["result"])
+            return response
 
     def table(self, table_id: str):
         with self.lock:
@@ -120,31 +95,42 @@ class MatchService:
             row = db.get(Metadata, "table_names_v1")
             return (json.loads(row.value) if row else {}).get(str(table_id)) or DEFAULT_NAMES.get(str(table_id), str(table_id))
 
-    def capture_context(self, table_id, user, match_id=None):
+    def capture_context(self, table_id, user, match_id=None, viewpoint_seat=None):
         table = self.store.table(table_id)
         if table is None:
             raise Conflict("table_not_found", "该桌尚未有人入座")
         if match_id and match_id != table["current_match_id"]:
-            raise Conflict("stale_match", "对局编号已失效，请刷新桌状态")
-        uploader_seat = next((seat for seat, player in table["seats"].items()
-                              if player and player["id"] == str(user.id)), None)
-        if uploader_seat is None:
-            raise HTTPException(403, detail={"code": "uploader_not_seated", "message": "上传者不在该桌，无法推导风位"})
+            from .game_round_models import GameRound
+            from sqlalchemy import select
+            with self.store.connect() as db:
+                prior = db.get(GameRound, match_id)
+                if prior is None or prior.score_table_id != table_id or prior.status != "awaiting_score":
+                    raise Conflict("stale_match", "对局编号已失效，请刷新桌状态")
+                table = {**table, "current_match_id": prior.game_id, "round_no": prior.round_no,
+                         "started_at": prior.started_at, "pending_match_id": None,
+                         "seats": json.loads(prior.roster_json)}
+        # The photo's bottom position belongs to a player, not necessarily its uploader.
+        uploader_seat = viewpoint_seat or next((seat for seat, player in table["seats"].items()
+                              if player and str(player["id"]) == str(user.id)), None)
+        if uploader_seat not in SEAT_NAMES:
+            raise HTTPException(422, detail={"code": "photo_viewpoint_required", "message": "请选择照片下方对应的风位"})
         missing = [seat for seat, player in table["seats"].items() if player is None]
         if missing:
             raise Conflict("incomplete_table", "请等待四位玩家入座", missing_seats=missing)
         return table, uploader_seat
 
     def _match_response(self, match_id, replayed=False):
-        self.flush()
-        external = self.external.send("nfc-" + match_id) if self.external.get("nfc-" + match_id) else None
         match = self.store.match(match_id)
-        pending = not (match["history_synced"] and match["clear_synced"])
+        history = self.history.status(match_id)
+        external = self.external.get("nfc-" + match_id)
+        pending = history["status"] != "synced"
         return {
             "status": "pending" if pending else "success",
-            "message": "分数已保存，等待 Google Sheets 同步" if pending else ("返回已结算的对局" if replayed else "结算完成，座位已清空"),
+            "message": "本地结算完成，历史成绩正在同步" if pending else
+                       ("返回已结算的对局" if replayed else "结算完成，座位已清空"),
             "sync_status": "pending" if pending else ("synced" if self.sheets.enabled else "disabled"),
-            "local_saved": True, "external_sync": external,
+            "local_saved": True, "local_completed": bool(match["local_finalized"]),
+            "history_sync": history, "external_sync": external,
             "replayed": replayed, "result": match["result"],
         }, 202 if pending else 200
 
@@ -173,7 +159,7 @@ class MatchService:
             body, status = self._match_response(draft["match_id"], True)
             body["normalization"] = display_units(draft["raw"])
             return body, status
-        table, seat = self.capture_context(draft["table_id"], user, draft["match_id"])
+        table, seat = self.capture_context(draft["table_id"], user, draft["match_id"], draft["uploader_seat"])
         old_ids = {wind: player["id"] for wind, player in draft["roster"].items()}
         current_ids = {wind: player["id"] for wind, player in table["seats"].items()}
         if old_ids != current_ids or seat != draft["uploader_seat"]:
@@ -184,13 +170,18 @@ class MatchService:
             uploader_id=str(user.id), ended_at=draft["ended_at"], draft_id=draft["id"])
         body, status = self._match_response(match_id, replayed)
         body["normalization"] = display_units(draft["raw"])
+        if not replayed:
+            schedule_score_notification(body["result"])
         return body, status
 
     def submit_relative(self, payload, user, request_key=None, extra_issues=None, ended_at=None, expected_roster=None, photo_sha256=None):
         with self.lock:
             raw = payload.scores.model_dump()
+            identity = [payload.table, str(user.id), raw]
+            if payload.viewpoint_seat is not None:
+                identity.append(payload.viewpoint_seat.value)
             fingerprint = hashlib.sha256(json.dumps(
-                [payload.table, str(user.id), raw], sort_keys=True).encode()).hexdigest()
+                identity, sort_keys=True).encode()).hexdigest()
             previous = self.store.find_draft(payload.table, user.id, payload.match_id, request_key)
             if previous:
                 if previous["uploader_id"] != str(user.id) or previous["table_id"] != payload.table:
@@ -203,7 +194,7 @@ class MatchService:
                     return self._review_response(previous), 200
                 if request_key or previous["status"] == "submitted":
                     raise Conflict("submission_conflict", "同一上传任务已提交不同分数")
-            table, seat = self.capture_context(payload.table, user, payload.match_id)
+            table, seat = self.capture_context(payload.table, user, payload.match_id, payload.viewpoint_seat)
             if expected_roster is not None and table["seats"] != expected_roster:
                 raise Conflict("stale_roster", "识别过程中座位发生变化，请重新拍摄")
             if table["pending_match_id"]:
@@ -248,8 +239,8 @@ class MatchService:
             return self._settle_draft(draft, user)
 
 
-    def photo_context(self, table, match_id, user, request_key, photo_hash):
-        """Run synchronous DB/Sheets work in a worker thread, never the ASGI loop."""
+    def photo_context(self, table, match_id, user, request_key, photo_hash, viewpoint_seat=None):
+        """Run local draft checks in a worker thread, never the ASGI loop."""
         with self.lock:
             previous = self.store.find_draft(table, user.id, match_id, request_key)
             if previous and (request_key or previous.get("photo_sha256") == photo_hash):
@@ -259,5 +250,6 @@ class MatchService:
                 if previous["status"] == "submitted" or not previous["issues"]:
                     return None, self._settle_draft(previous, user)
                 return None, (self._review_response(previous), 200)
-            context, _ = self.capture_context(table, user, match_id)
-            return context, None
+            context, seat = self.capture_context(table, user, match_id, viewpoint_seat)
+            return {**context, "photo_viewpoint_seat": seat}, None
+

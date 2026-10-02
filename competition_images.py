@@ -38,10 +38,14 @@ def upload(service,data,actor):
             name="competition-"+key+"-"+str(width)+".webp";target=service.image_dir/name
             thumb=image.copy();thumb.thumbnail((width,width));thumb.save(target,"WEBP",quality=84)
             files.append(name)
+        original_name="competition-"+key+"-original."+{"image/jpeg":"jpg","image/png":"png","image/webp":"webp"}[match[1]]
+        (service.image_dir/original_name).write_bytes(content)
+        files.append(original_name)
         with FileLock(service.lock_path),closing(service.db()) as db,db:
-            db.execute("INSERT INTO competition_images VALUES(?,?,?,?,?,?)",(key,*files,alt,utc_now(),str(actor)))
+            db.execute("INSERT INTO competition_images VALUES(?,?,?,?,?,?)",(key,*files[:2],alt,utc_now(),str(actor)))
+            db.execute("INSERT INTO competition_image_originals VALUES(?,?,?,?)",(key,original_name,image.width,image.height))
             service.audit(db,None,actor,"image_uploaded",{"image":key})
-            return {"image":service.image(db,key)}
+            return {"image":service.image(db,key,original=True)}
     except Exception:
         for name in files:(service.image_dir/name).unlink(missing_ok=True)
         raise
@@ -56,13 +60,15 @@ def delete(service,key,actor):
                 if key==content.get("cover") or key in content.get("images",[]):raise ValueError("image_still_referenced")
         row=db.execute("SELECT * FROM competition_images WHERE id=?",(key,)).fetchone()
         if not row:raise ValueError("image_not_found")
+        original=db.execute("SELECT original_file FROM competition_image_originals WHERE image_id=?",(key,)).fetchone()
+        files=[row[field] for field in ("small_file","large_file")]+([original[0]] if original else [])
         # Only generated filenames inside the owned storage are eligible.
-        for field in ("small_file","large_file"):
-            path=(service.image_dir/row[field]).resolve()
+        for filename in files:
+            path=(service.image_dir/filename).resolve()
             if path.parent!=service.image_dir or not path.name.startswith("competition-"):raise ValueError("invalid_image_path")
         db.execute("DELETE FROM competition_images WHERE id=?",(key,))
         service.audit(db,None,actor,"image_deleted",{"image":key})
         # Keep the lock until both paths are removed, so a content publish cannot
         # acquire a deleted image reference between the check and unlink.
-        for field in ("small_file","large_file"):(service.image_dir/row[field]).unlink(missing_ok=True)
+        for filename in files:(service.image_dir/filename).unlink(missing_ok=True)
     return {"ok":True}

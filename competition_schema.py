@@ -46,9 +46,21 @@ CREATE TABLE IF NOT EXISTS competition_game_tombstones (
 CREATE TABLE IF NOT EXISTS competition_identity_links (
  alias TEXT PRIMARY KEY, identity_key TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS competition_jobs (
+ id TEXT PRIMARY KEY, competition_id TEXT NOT NULL REFERENCES competitions(id),
+ rebuild INTEGER NOT NULL, actor TEXT NOT NULL, reason TEXT NOT NULL,
+ request_key TEXT NOT NULL UNIQUE, status TEXT NOT NULL DEFAULT 'pending',
+ attempts INTEGER NOT NULL DEFAULT 0, available_at REAL NOT NULL DEFAULT 0,
+ lease_until REAL, error_code TEXT, created_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE INDEX IF NOT EXISTS competition_jobs_ready ON competition_jobs(status,available_at);
 CREATE TABLE IF NOT EXISTS competition_images (
  id TEXT PRIMARY KEY, small_file TEXT NOT NULL, large_file TEXT NOT NULL,
  alt TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, actor TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS competition_image_originals (
+ image_id TEXT PRIMARY KEY REFERENCES competition_images(id) ON DELETE CASCADE,
+ original_file TEXT NOT NULL, width INTEGER NOT NULL, height INTEGER NOT NULL
 );
 """
 

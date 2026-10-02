@@ -247,7 +247,7 @@ def test_failed_exchange_rolls_back_seats_revisions_audit_and_claims(swap, monke
         assert db.scalar(select(func.count()).select_from(TableMembershipEvent).where(TableMembershipEvent.action == "seat_swapped")) == 0
 
 
-def test_poll_is_private_bounded_dynamic_names_and_expires_durably(swap):
+def test_poll_is_private_bounded_dynamic_names_and_expiry_is_swept_separately(swap):
     swaps, tables, table, _ = swap
     base = datetime.now(timezone.utc)
     for i in range(23):
@@ -264,6 +264,9 @@ def test_poll_is_private_bounded_dynamic_names_and_expires_durably(swap):
     swaps.clock = lambda:(base+timedelta(minutes=10)).isoformat()
     expired = swaps.list(table["id"],USERS[0])
     assert len(expired["requests"]) == 1 and expired["requests"][0]["status"] == "expired"
+    assert_claims(tables,2)
+    assert swaps.sweep_due() == 1
+    assert swaps.sweep_due() == 0
     assert_claims(tables,0)
 
 
@@ -319,6 +322,9 @@ def _swap_process(arguments):
                 return tables.set_my_seat(table_id,{"seat":value},user)
             if operation == "reset":
                 return tables.reset(table_id,data(reason="concurrent reset"),user)
+            if operation == "sweep":
+                swaps.clock = lambda:value
+                return {"expired":swaps.sweep_due(limit=1)}
             return swaps.respond(value,operation,user)["request"]
         except Conflict as error:
             return {"error":error.detail["code"]}
@@ -409,3 +415,101 @@ def test_formal_migration_preserves_pre_swap_members_and_is_idempotent(swap,tmp_
             assert db.scalar(select(func.count()).select_from(SeatSwapRequest)) == 0
     finally:
         upgraded.close()
+
+
+@pytest.mark.parametrize("expired", [False, True])
+def test_polling_issues_no_sql_writes_and_never_reconciles_rows(swap, expired, monkeypatch):
+    from sqlalchemy import event
+    swaps, tables, table, app = swap
+    # Isolate the GET from the app's independent scheduled workers. A reminder
+    # tick can legitimately update queue rows while this SQL trace is active.
+    monkeypatch.setattr(swaps, "sweep_due", lambda limit=50: 0)
+    monkeypatch.setattr(app.state.discord_reminders, "tick", lambda limit=10: 0)
+    monkeypatch.setattr(app.state.manual_scores, "flush", lambda: None)
+    monkeypatch.setattr(app.state.service.external, "flush", lambda: None)
+    base = datetime.now(timezone.utc)
+    swaps.clock = lambda:base.isoformat()
+    row = request(swaps, table)
+    if expired:
+        swaps.clock = lambda:(base + timedelta(seconds=61)).isoformat()
+    statements = []
+    def trace(conn, cursor, statement, parameters, context, many):
+        statements.append(statement.strip().split(None, 1)[0].upper())
+    event.listen(tables.store.engine, "before_cursor_execute", trace)
+    try:
+        app.dependency_overrides[get_current_user] = lambda:USERS[1]
+        result = TestClient(app).get("/api/tables/" + table["score_table_id"] + "/seat-swap-requests")
+    finally:
+        event.remove(tables.store.engine, "before_cursor_execute", trace)
+    assert result.status_code == 200, result.text
+    assert statements and not set(statements) & {"UPDATE", "INSERT", "DELETE", "REPLACE"}
+    projected = result.json()["requests"][0]
+    assert projected["status"] == ("expired" if expired else "pending")
+    assert projected["can_accept"] is not expired
+    with tables.store.connect() as db:
+        assert db.get(SeatSwapRequest, row["id"]).status == "pending"
+    assert_claims(tables, 2)
+    if expired:
+        before = seats(tables, table)
+        with pytest.raises(Conflict, match="swap_expired"):
+            swaps.respond(row["id"], "accept", USERS[1])
+        assert seats(tables, table) == before
+        assert_claims(tables, 0)
+
+
+def test_background_expiry_is_bounded_and_cannot_undo_accepted_swaps(swap):
+    swaps, tables, table, _ = swap
+    base = datetime.now(timezone.utc)
+    swaps.clock = lambda:base.isoformat()
+    accepted = request(swaps, table)
+    swaps.respond(accepted["id"], "accept", USERS[1])
+    pending = request(swaps, table)
+    other = make(tables, 42)
+    tables.set_my_seat(other["id"], {"seat":"east"}, USERS[2])
+    tables.set_my_seat(other["id"], {"seat":"south"}, USERS[3])
+    second = request(swaps, other, USERS[2], USERS[3])
+    swaps.clock = lambda:(base + timedelta(seconds=61)).isoformat()
+    before = seats(tables, table)
+    assert swaps.sweep_due(limit=0) == 0
+    assert swaps.sweep_due(limit=1) == 1
+    assert_claims(tables, 2)
+    assert swaps.sweep_due(limit=1) == 1
+    assert swaps.sweep_due(limit=1) == 0
+    assert seats(tables, table) == before
+    assert_claims(tables, 0)
+    with tables.store.connect() as db:
+        assert db.get(SeatSwapRequest, accepted["id"]).status == "accepted"
+        assert all(db.get(SeatSwapRequest, rid).status == "expired" for rid in (pending["id"], second["id"]))
+
+
+def test_swap_accept_does_not_invoke_history_or_current_sync(swap, monkeypatch):
+    swaps, tables, table, _ = swap
+    row = request(swaps, table)
+    def forbidden_sync():
+        raise AssertionError("Seat swaps must not wait for historical deliveries")
+    monkeypatch.setattr(tables.matches, "flush", forbidden_sync)
+    result = swaps.respond(row["id"], "accept", USERS[1])
+    assert result["request"]["status"] == "accepted"
+    with tables.store.connect() as db:
+        state = db.scalar(select(TableState).where(TableState.table_id == table["score_table_id"]))
+        assert state.dirty == 0
+
+
+
+def test_independent_expiry_worker_and_accept_have_one_terminal_result(swap):
+    swaps, tables, table, _ = swap
+    row = request(swaps, table)
+    later = (datetime.fromisoformat(row["expires_at"]) + timedelta(seconds=1)).isoformat()
+    results = race(tables, table, [(USERS[1], "accept", row["id"]), (ADMIN, "sweep", later)])
+    with tables.store.connect() as db:
+        terminal = db.get(SeatSwapRequest, row["id"]).status
+        assert terminal in {"accepted", "expired"}
+        assert db.scalar(select(func.count()).select_from(TournamentAudit).where(
+            TournamentAudit.action.in_(["seat_swap_accepted", "seat_swap_expired"]))) == 1
+    assert_claims(tables, 0)
+    if terminal == "accepted":
+        assert results[0]["status"] == "accepted" and results[1]["expired"] == 0
+        assert seats(tables, table)["east"] == USERS[1].id
+    else:
+        assert results[0]["error"] == "swap_expired" and results[1]["expired"] == 1
+        assert seats(tables, table)["east"] == USERS[0].id

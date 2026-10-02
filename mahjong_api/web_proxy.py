@@ -15,8 +15,10 @@ from .http_security import request_scheme
 MAX_BODY = 9 * 1024 * 1024  # 8 MiB image plus multipart form overhead.
 GET_PATHS = {"/api/club-tables", "/api/admin/club-tables", "/sit", "/score", "/score-i18n.js", "/api/sit", "/api/statistics", "/api/tournaments", "/api/tournament-players", "/api/external-config", "/api/external-deliveries", "/api/table-labels", "/api/qr.png"}
 POST_PATHS = {"/api/admin/club-tables", "/api/sit", "/api/recognize_photo", "/api/submit_scores", "/api/confirm_scores", "/api/tournaments", "/api/external-config", "/api/external-test", "/api/table-labels"}
-TABLE_GET = re.compile(r"/api/(?:club-tables/[A-Za-z0-9_-]{1,64}(?:/players|/seat-map|/reservation-default|/reservation-reminders|/reservation-candidates)?|table-join-tokens/[A-Za-z0-9_.-]{20,180}|admin/table-tokens/[A-Za-z0-9-]{1,64}/(?:qr.png|ndef.json))\Z")
-TABLE_POST = re.compile(r"/api/(?:admin/club-tables/[A-Za-z0-9-]{1,64}(?:/tokens|/reset)?|admin/table-tokens/[A-Za-z0-9-]{1,64}/revoke|table-join-tokens/[A-Za-z0-9_.-]{20,180}/join|club-tables/[A-Za-z0-9-]{1,64}/(?:join|leave|players(?:/preview)?|reservations)|table-reservations/[A-Za-z0-9-]{1,64})\Z")
+TABLE_GET = re.compile(r"/api/(?:club-tables/[A-Za-z0-9_-]{1,64}(?:/players|/seat-map|/reservation-default|/reservation-reminders|/reservation-candidates|/queue|/game-flow)?|table-join-tokens/[A-Za-z0-9_.-]{20,180}|admin/table-tokens/[A-Za-z0-9-]{1,64}/(?:qr.png|ndef.json))\Z")
+TABLE_POST = re.compile(r"/api/(?:admin/club-tables/[A-Za-z0-9-]{1,64}(?:/tokens|/reset)?|admin/table-tokens/[A-Za-z0-9-]{1,64}/revoke|table-join-tokens/[A-Za-z0-9_.-]{20,180}/join|club-tables/[A-Za-z0-9-]{1,64}/(?:join|leave|all-last|cancel-game|queue/reorder|players(?:/preview)?|reservations)|table-reservations/[A-Za-z0-9-]{1,64})\Z")
+REMOVE_POST = re.compile(r"/api/club-tables/[A-Za-z0-9_-]{1,64}/seats/[^/?#]{1,200}/remove\Z")
+GAME_POST = re.compile(r"/api/club-tables/[A-Za-z0-9_-]{1,64}/games/[A-Za-z0-9-]{1,64}/end\Z")
 TABLE_PUT = re.compile(r"/api/club-tables/[A-Za-z0-9_-]{1,64}/my-seat\Z")
 SWAP_GET = re.compile(r"/api/tables/[A-Za-z0-9_-]{1,64}/seat-swap-requests\Z")
 SWAP_POST = re.compile(r"/api/(?:tables/[A-Za-z0-9_-]{1,64}/seat-swap-requests|seat-swap-requests/[A-Za-z0-9-]{1,64}/(?:accept|decline|cancel))\Z")
@@ -25,7 +27,7 @@ TOURNAMENT_POST = re.compile(r"/api/(?:tournaments/[A-Za-z0-9-]{1,64}/(?:actions
 GET_PATTERN = re.compile(r"/api/(?:tables/[A-Za-z0-9_-]{1,64}|score_drafts/[A-Za-z0-9-]{1,64})\Z")
 GUEST_GET = re.compile(r"/api/guest/tournaments/[A-Za-z0-9-]{1,64}\Z")
 GUEST_POST = re.compile(r"/api/guest/tournaments/[A-Za-z0-9-]{1,64}/(?:join|leave|recover)\Z")
-GET_PATHS.update({"/api/player-lookup", "/api/manual-score/context"})
+GET_PATHS.update({"/api/player-lookup", "/api/manual-score/context", "/api/scoring-table", "/api/scoring/current-table-context"})
 POST_PATHS.update({"/api/player-lookup", "/api/manual-score/preview", "/api/manual-score/confirm", "/api/manual-score/upload"})
 MANUAL_POST = re.compile(r"/api/manual-score/drafts/[A-Za-z0-9-]{1,64}/retry\Z")
 MANUAL_GET = re.compile(r"/api/manual-score/drafts/[A-Za-z0-9-]{1,64}\Z")
@@ -48,11 +50,11 @@ def _error(handler, status, code, message):
 def proxy_nfc_request(handler):
     """Return False for unrelated routes, True after handling an NFC request."""
     path = urlsplit(handler.path).path
-    known = GUEST_GET.fullmatch(path) or GUEST_POST.fullmatch(path) or path in GET_PATHS | POST_PATHS or GET_PATTERN.fullmatch(path) or MANUAL_GET.fullmatch(path) or MANUAL_POST.fullmatch(path) or TOURNAMENT_GET.fullmatch(path) or TOURNAMENT_POST.fullmatch(path) or TABLE_GET.fullmatch(path) or TABLE_POST.fullmatch(path) or TABLE_PUT.fullmatch(path) or SWAP_GET.fullmatch(path) or SWAP_POST.fullmatch(path)
+    known = GUEST_GET.fullmatch(path) or GUEST_POST.fullmatch(path) or path in GET_PATHS | POST_PATHS or GET_PATTERN.fullmatch(path) or MANUAL_GET.fullmatch(path) or MANUAL_POST.fullmatch(path) or TOURNAMENT_GET.fullmatch(path) or TOURNAMENT_POST.fullmatch(path) or TABLE_GET.fullmatch(path) or TABLE_POST.fullmatch(path) or GAME_POST.fullmatch(path) or REMOVE_POST.fullmatch(path) or TABLE_PUT.fullmatch(path) or SWAP_GET.fullmatch(path) or SWAP_POST.fullmatch(path)
     if not known:
         return False
     allowed = (handler.command == "GET" and (path in GET_PATHS or GUEST_GET.fullmatch(path) or GET_PATTERN.fullmatch(path) or MANUAL_GET.fullmatch(path) or TOURNAMENT_GET.fullmatch(path) or TABLE_GET.fullmatch(path) or SWAP_GET.fullmatch(path))
-               or handler.command == "POST" and (path in POST_PATHS or GUEST_POST.fullmatch(path) or MANUAL_POST.fullmatch(path) or TOURNAMENT_POST.fullmatch(path) or TABLE_POST.fullmatch(path) or SWAP_POST.fullmatch(path))
+               or handler.command == "POST" and (path in POST_PATHS or GUEST_POST.fullmatch(path) or MANUAL_POST.fullmatch(path) or TOURNAMENT_POST.fullmatch(path) or TABLE_POST.fullmatch(path) or GAME_POST.fullmatch(path) or REMOVE_POST.fullmatch(path) or SWAP_POST.fullmatch(path))
                or handler.command == "PUT" and TABLE_PUT.fullmatch(path))
     if not allowed:
         _error(handler, 405, "method_not_allowed", "请求方法不支持")
